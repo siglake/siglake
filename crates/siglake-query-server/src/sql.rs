@@ -1301,6 +1301,7 @@ async fn rewrite_search_if_needed(
     Ok(Statement::Query(sql_query.clone()).to_string())
 }
 
+#[cfg(test)]
 async fn apply_query_rewrites(
     ice: &siglake_storage::iceberg::IcebergContext,
     query: &str,
@@ -1308,41 +1309,58 @@ async fn apply_query_rewrites(
     priority: Priority,
     max_rows: usize,
 ) -> Result<RewrittenQuery, ApiError> {
+    apply_query_rewrites_for_serving(ice, query, default_order, priority, max_rows, false).await
+}
+
+async fn apply_query_rewrites_for_serving(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    query: &str,
+    default_order: bool,
+    priority: Priority,
+    max_rows: usize,
+    wal_buffer_enabled: bool,
+) -> Result<RewrittenQuery, ApiError> {
     let search_rewritten = rewrite_search_if_needed(ice, query).await?;
+    // #6982: committed backfill provenance does not cover WAL batches, whose
+    // promoted fields are NULL-filled during schema alignment. Even an empty
+    // buffer can gain rows between planning and scan, so do not rewrite on a
+    // WAL-enabled serving route. Preserve the ordinary residual expression and
+    // its existing bounded buffer-admission behavior instead.
     // WS-7: `attr_get(attributes, 'key')` → promoted column, gated on the
     // backfill-complete property (unsound before it: pre-promotion files
     // read the column as NULL while their JSON still holds the key). The
     // substituted text flows everywhere downstream — the Tier-1 group-count
     // battery sees a plain `GROUP BY <column>` (~3ms metadata answer), the
     // provider prunes natively, shard fan-out ships the rewritten SQL.
-    let (search_rewritten, attr_rewrite_bindings) = if search_rewritten.contains("attr_get") {
-        // The gate is table-local: a promoted column is sound only after that
-        // table's backfill property matches its promotion list. Load every
-        // referenced table's independently gated map, then let the AST scope
-        // resolver apply a map only where the column owner is proven.
-        let mut mappings = HashMap::new();
-        let mut bindings = HashMap::new();
-        for name in referenced_tables(&search_rewritten).unwrap_or_default() {
-            if name == "query_audit" {
-                continue;
+    let (search_rewritten, attr_rewrite_bindings) =
+        if !wal_buffer_enabled && search_rewritten.contains("attr_get") {
+            // The gate is table-local: a promoted column is sound only after that
+            // table's backfill property matches its promotion list. Load every
+            // referenced table's independently gated map, then let the AST scope
+            // resolver apply a map only where the column owner is proven.
+            let mut mappings = HashMap::new();
+            let mut bindings = HashMap::new();
+            for name in referenced_tables(&search_rewritten).unwrap_or_default() {
+                if name == "query_audit" {
+                    continue;
+                }
+                let ident = if name == "events" {
+                    ice.events_table_ident().clone()
+                } else {
+                    ice.index_table_ident(&name)
+                };
+                if let Ok(Some(qualified)) = ice.qualified_attr_rewrite_for(&ident).await {
+                    mappings.insert(name.clone(), qualified.mapping.clone());
+                    bindings.insert(name, qualified);
+                }
             }
-            let ident = if name == "events" {
-                ice.events_table_ident().clone()
-            } else {
-                ice.index_table_ident(&name)
-            };
-            if let Ok(Some(qualified)) = ice.qualified_attr_rewrite_for(&ident).await {
-                mappings.insert(name.clone(), qualified.mapping.clone());
-                bindings.insert(name, qualified);
+            match rewrite_attr_get_to_columns(&search_rewritten, &mappings) {
+                Some(rewritten) => (rewritten, bindings),
+                None => (search_rewritten, HashMap::new()),
             }
-        }
-        match rewrite_attr_get_to_columns(&search_rewritten, &mappings) {
-            Some(rewritten) => (rewritten, bindings),
-            None => (search_rewritten, HashMap::new()),
-        }
-    } else {
-        (search_rewritten, HashMap::new())
-    };
+        } else {
+            (search_rewritten, HashMap::new())
+        };
     // The table whose event-time field this query's order contract turns on.
     // The implicit rewrite needs it to inject an order; a query that ALREADY
     // orders by a non-canonical column needs it to decide whether that column
@@ -4386,12 +4404,13 @@ async fn handle_scoped(
     )
     .await?;
     let effective_query = apply_timeout(
-        apply_query_rewrites(
+        apply_query_rewrites_for_serving(
             &ice,
             &req.query,
             req.default_order,
             req.priority,
             resolved.max_rows_returned,
+            state.wal_buffer_dir.is_some(),
         ),
         &resolved,
         &unknown_cost,
@@ -4592,12 +4611,13 @@ async fn handle_local_inner(
         match pre_rewritten_query {
             Some(query) => Ok(query),
             None => {
-                apply_query_rewrites(
+                apply_query_rewrites_for_serving(
                     &ice,
                     &req.query,
                     req.default_order,
                     req.priority,
                     resolved.max_rows_returned,
+                    state.wal_buffer_dir.is_some(),
                 )
                 .await
             }
@@ -18219,12 +18239,13 @@ async fn distributed_inner(
     let effective_query = match pre_rewritten_query {
         Some(query) => query,
         None => {
-            apply_query_rewrites(
+            apply_query_rewrites_for_serving(
                 &ice,
                 &req.query,
                 req.default_order,
                 req.priority,
                 resolved.max_rows_returned,
+                state.wal_buffer_dir.is_some(),
             )
             .await?
         }
