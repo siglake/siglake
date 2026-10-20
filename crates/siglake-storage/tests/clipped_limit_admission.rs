@@ -23,7 +23,7 @@
 //! defined row selection, so they check qualifying membership and cardinality,
 //! never a particular set of rows.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -199,6 +199,70 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
             bytes_scanned: sum("bytes_scanned"),
         },
     }
+}
+
+/// Which files the rows came from. `payload` stamps `file={file:04}` into
+/// every row, so a drained stream names its own file set.
+fn files_of(rows: &[String]) -> BTreeSet<usize> {
+    rows.iter()
+        .map(|row| {
+            let at = row.find("file=").expect("every row carries its file");
+            row[at + 5..at + 9]
+                .parse()
+                .expect("a four-digit file number")
+        })
+        .collect()
+}
+
+/// Plan the clipped query and hand back the scan leaf with its own task
+/// context, for tests that drive partition streams directly instead of going
+/// through the coalesce that normally spawns them.
+async fn clipped_scan(
+    ctx: &SessionContext,
+    sql: &str,
+) -> (
+    Arc<dyn ExecutionPlan>,
+    Arc<dyn ExecutionPlan>,
+    Arc<datafusion::execution::TaskContext>,
+    usize,
+) {
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let scan = scan_nodes(&plan).pop().expect("one scan leaf");
+    let partitions = scan.properties().output_partitioning().partition_count();
+    // The session's own context, so the partition streams execute under the
+    // same config the plan was built from (#2251).
+    let task_ctx = siglake_storage::bounded_task_context_from(
+        datafusion::execution::TaskContext::from(&ctx.state()),
+    );
+    (plan, scan, task_ctx, partitions)
+}
+
+/// Drain one scan partition to exhaustion; the rows are raw source rows, the
+/// residual filter lives above the scan.
+async fn drain_scan_partition(
+    scan: &Arc<dyn ExecutionPlan>,
+    partition: usize,
+    task_ctx: Arc<datafusion::execution::TaskContext>,
+) -> Vec<String> {
+    let mut stream = scan.execute(partition, task_ctx).expect("execute");
+    let mut rows = Vec::new();
+    while let Some(batch) = stream.next().await {
+        let batch = batch.unwrap();
+        let col = batch
+            .column_by_name("raw")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap();
+        rows.extend(col.iter().map(|v| v.unwrap().to_string()));
+    }
+    rows
 }
 
 fn assert_all_qualify(rows: &[String], sql: &str) {
@@ -583,4 +647,179 @@ async fn an_aggregate_under_the_hint_still_counts_every_row() {
         .unwrap()
         .value(0);
     assert_eq!(n as usize, FILES.div_ceil(2) * 3);
+}
+
+/// #6979: WHICH files the ramp opens first must not be a race between pumps.
+///
+/// `CoalescePartitionsExec::execute` calls the scan's `execute` inside the task
+/// it spawns per partition, so the order tickets are taken in is the order the
+/// scheduler happens to run those tasks. The test stands in for the scheduler
+/// directly: each arm starts a different partition index FIRST on its own
+/// freshly planned scan, which is exactly the freedom the runtime has, and the
+/// file set that first stream reads has to come out the same every time.
+///
+/// The second half is the correctness side of the same change: with every
+/// partition started in reverse order, the groups still partition the file set
+/// — each file read by exactly one stream, every row accounted for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_group_opened_first_does_not_depend_on_which_partition_starts() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    table_with(&ice, |_| MATCHES_PER_FILE).await;
+
+    const LIMIT: usize = 20;
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context(LIMIT, 2);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+
+    let (_, _, _, partitions) = clipped_scan(&ctx, &sql).await;
+    assert!(partitions > 4, "need a wide scan, got {partitions}");
+
+    let mut head: Option<BTreeSet<usize>> = None;
+    for start in [0, partitions - 1, partitions / 2, 1] {
+        // A fresh plan per arm, so each arm hands ticket 0 to a different
+        // partition index.
+        let (plan, scan, task_ctx, _) = clipped_scan(&ctx, &sql).await;
+        let files = files_of(&drain_scan_partition(&scan, start, task_ctx).await);
+        assert!(
+            !files.is_empty(),
+            "the first admitted stream read nothing starting at partition {start}"
+        );
+        eprintln!("CLIPPED-ADMISSION first-group start={start} files={files:?}");
+        match &head {
+            None => head = Some(files),
+            Some(expected) => assert_eq!(
+                &files, expected,
+                "the first admitted stream read a different file set when partition {start} \
+                 registered first"
+            ),
+        }
+        let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(30)).await;
+        assert!(settle.complete, "{settle:?}");
+    }
+
+    // Every partition, started in the most adverse order there is. Draining
+    // them one at a time is enough to widen the ramp: a stream that ends pays
+    // a credit, so the ticket behind it is admitted.
+    let (plan, scan, task_ctx, _) = clipped_scan(&ctx, &sql).await;
+    let mut covered: BTreeSet<usize> = BTreeSet::new();
+    let mut rows_read = 0usize;
+    for partition in (0..partitions).rev() {
+        let rows = tokio::time::timeout(
+            Duration::from_secs(60),
+            drain_scan_partition(&scan, partition, task_ctx.clone()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("partition {partition} never reached the front of the ramp"));
+        rows_read += rows.len();
+        for file in files_of(&rows) {
+            assert!(
+                covered.insert(file),
+                "file {file} was read by two partitions"
+            );
+        }
+    }
+    assert_eq!(
+        covered,
+        (0..FILES).collect::<BTreeSet<_>>(),
+        "ticket-ordered groups must still cover every file exactly once"
+    );
+    assert_eq!(rows_read, FILES * ROWS_PER_FILE, "every source row once");
+    let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(30)).await;
+    assert!(settle.complete, "{settle:?}");
+}
+
+/// The first group holds nothing the query wants: its files are pruned, it
+/// ends having emitted no row, and the limit has to be filled from further up
+/// the ramp. The target file is CHOSEN from the first group's own file set, so
+/// the test keeps testing the exhausted-head case whatever the split is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exhausted_first_group_still_fills_the_limit() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    table_with(&ice, |_| MATCHES_PER_FILE).await;
+
+    const LIMIT: usize = 20;
+    let probe_sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context(LIMIT, 2);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+
+    let (probe_plan, scan, task_ctx, partitions) = clipped_scan(&ctx, &probe_sql).await;
+    assert!(partitions > 4, "need a wide scan, got {partitions}");
+    let head = files_of(&drain_scan_partition(&scan, 0, task_ctx).await);
+    let settle =
+        siglake_storage::settle_scan_partitions(&probe_plan, Duration::from_secs(30)).await;
+    assert!(settle.complete, "{settle:?}");
+    let target = (0..FILES)
+        .find(|file| !head.contains(file))
+        .expect("the first group cannot hold every file in a wide scan");
+    eprintln!("CLIPPED-ADMISSION exhausted-head head={head:?} target={target}");
+
+    let marker = format!("file={target:04}");
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{marker}%' LIMIT {LIMIT}");
+    let run = tokio::time::timeout(Duration::from_secs(60), run_arm(&ctx, &sql, "raw"))
+        .await
+        .expect("an empty first group must not stall the ramp");
+    eprintln!("CLIPPED-ADMISSION exhausted-head={:?}", run.work);
+    assert_eq!(
+        run.rows.len(),
+        LIMIT,
+        "the limit must fill from behind an empty first group"
+    );
+    for row in &run.rows {
+        assert!(row.contains(&marker), "a row from the wrong file: {row}");
+    }
+}
+
+/// Cancellation with streams still parked behind the ramp: the caller drops the
+/// root stream after one batch, and every partition that began must still end.
+/// A waiting stream owns a `begin` on the partition tracker, so one that was
+/// dropped while parked without ending would leave the settle incomplete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_clipped_scan_ends_the_streams_behind_the_ramp() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    table_with(&ice, |_| MATCHES_PER_FILE).await;
+
+    const LIMIT: usize = 20;
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context(LIMIT, 2);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+
+    {
+        #[allow(clippy::disallowed_methods)]
+        let mut stream = execute_stream(plan.clone(), siglake_storage::bounded_task_context())
+            .expect("execute the scan");
+        let first = tokio::time::timeout(Duration::from_secs(60), stream.next())
+            .await
+            .expect("the first batch must arrive before the cancel")
+            .expect("a first batch")
+            .unwrap();
+        assert!(first.num_rows() > 0, "the fixture must match the needle");
+        // The caller walks away mid-answer.
+    }
+
+    let settle = tokio::time::timeout(
+        Duration::from_secs(90),
+        siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(60)),
+    )
+    .await
+    .expect("a cancelled clipped scan must settle, not hang");
+    assert!(
+        settle.complete,
+        "a stream parked behind the ramp was dropped without ending: {settle:?}"
+    );
 }
