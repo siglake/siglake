@@ -16,7 +16,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 - **The clipped-text 10 ms / 25 ms goals remain unmet.** The retained run
   measured about 386 ms for the keyword query and 27 ms for the last-25 query,
   while exact results and policy checks passed. This performance work is
-  tracked for 0.4.0; it is not a speed claim for 0.3.0.
+  tracked for 0.4.0; it is not a speed claim for 0.3.0. Since then the clipped
+  scan's first admission has been made deterministic (#6979) — which file the
+  ramp opens first no longer varies run to run — but that fixes the spread,
+  not the level: the same retained runs took 379–508 ms whenever the file they
+  opened had to be read. No matched round has been run against the ceilings.
 - **The persistent ingest lane cap has no timed reclamation.** Once
   `ingester.maxLanes` admits a `(tenant, index)` lane, an empty queue does not
   release its slot; only process shutdown drains the map. A novel key past the
