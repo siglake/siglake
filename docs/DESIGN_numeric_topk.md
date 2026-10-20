@@ -51,8 +51,9 @@ future. Limits are 256 files, 4096 groups, 8 MiB serialized footers in total,
 and yields between files/batches. These are conservative admitted workspace
 limits, not a hard process RSS guarantee for parser/allocator overhead.
 
-Before IO, twice the manifest file sizes plus eight trailer bytes per file must
-fit the request byte allowance. Object lengths are checked against that manifest.
+Before Parquet-file IO, twice the manifest file sizes plus eight trailer bytes
+per file must fit the request byte allowance. Existing snapshot manifest planning
+precedes this range budget. Object lengths are checked against that manifest.
 A shared range-reader budget then charges every requested range before metadata
 prefetch or data reads, including overlaps and coalesced ranges. Budget exhaustion
 is an error, never partial success or an uncharged retry. Backend-internal retries
