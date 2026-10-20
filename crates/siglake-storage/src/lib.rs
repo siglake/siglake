@@ -15,6 +15,7 @@ pub mod consumed_proof;
 pub mod iceberg;
 pub mod index_manager;
 pub mod merge;
+pub mod numeric_topk;
 mod query_provider;
 mod rebuild_spool;
 pub mod schema_version;

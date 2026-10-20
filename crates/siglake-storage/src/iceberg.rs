@@ -27680,6 +27680,85 @@ impl IcebergContext {
             .map(|totals| GroupCounts::owned(totals.into_iter().collect(), OwnedCounts::FooterSum)))
     }
 
+    /// Exact value-only TopK over the same immutable promoted generation used
+    /// for rewrite and provider registration. No current-cache lookup is allowed.
+    pub async fn qualified_numeric_topk(
+        &self,
+        qualified: &QualifiedAttrRewrite,
+        column: &str,
+        limit: usize,
+        ascending: bool,
+        pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+        max_bytes: u64,
+    ) -> Result<Option<crate::numeric_topk::NumericTopKAttempt>> {
+        if !qualified
+            .mapping
+            .values()
+            .any(|(name, ty)| name == column && *ty == siglake_core::PromotedType::Int64)
+        {
+            return Ok(None);
+        }
+        let cached = &qualified.aggregate_entry;
+        let Some(id) = cached
+            .table
+            .metadata()
+            .current_schema()
+            .field_id_by_name(column)
+        else {
+            return Ok(None);
+        };
+        let tasks = self
+            .live_file_scan_tasks_cached(cached.table.identifier(), cached)
+            .await?;
+        // Conservatively honor the request byte ceiling before opening any
+        // file. A too-small ceiling falls back to the original limited scan.
+        let total_bytes = tasks.iter().try_fold(0u64, |n, t| {
+            n.checked_add(t.file_size_in_bytes.checked_mul(2)?)
+        });
+        if total_bytes
+            .is_none_or(|n| n > max_bytes.saturating_sub((tasks.len() as u64).saturating_mul(8)))
+        {
+            return Ok(None);
+        }
+        let mut paths = Vec::with_capacity(tasks.len());
+        for task in tasks.iter() {
+            if task.data_file_format != DataFileFormat::Parquet
+                || !task.deletes.is_empty()
+                || task.start != 0
+                || task.length != task.file_size_in_bytes
+                || task.predicate.is_some()
+            {
+                return Ok(None);
+            }
+            let Some(rows) = task.record_count else {
+                return Ok(None);
+            };
+            paths.push((
+                task.data_file_path().to_string(),
+                rows,
+                task.file_size_in_bytes,
+            ));
+        }
+        if paths
+            .iter()
+            .try_fold(0u64, |sum, (_, rows, _)| sum.checked_add(*rows))
+            != qualified.snapshot.manifest_rows
+        {
+            return Ok(None);
+        }
+        crate::numeric_topk::read(
+            cached.table.file_io(),
+            &paths,
+            column,
+            id,
+            limit,
+            ascending,
+            pool,
+        )
+        .await
+        .map(Some)
+    }
+
     /// Snapshot-bound unwindowed group counts for a qualified promoted-column
     /// rewrite. Windowed aggregate helpers have their own table-name cache
     /// lookups, so the query layer conservatively declines those shapes while
