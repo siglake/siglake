@@ -4980,6 +4980,9 @@ impl ScanPartitionTracker {
 /// that executes a single partition takes ticket 0 and is admitted at once, and
 /// a plan executed a second time finds the ramp already open (it degrades to
 /// the ungated behavior rather than blocking).
+///
+/// #6979: the ticket also NAMES the file group the stream reads, so which
+/// files the ramp opens first is fixed rather than raced. See `execute`.
 #[derive(Debug)]
 struct ScanAdmission {
     /// Ticket counter; a ticket is `fetch_add % partitions`.
@@ -5962,15 +5965,35 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let tasks = self
-            .task_partitions
-            .get(partition)
-            .cloned()
-            .ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "partition {partition} out of bounds for SiglakeIcebergTableScan"
-                ))
-            })?;
+        if partition >= self.task_partitions.len() {
+            return Err(DataFusionError::Execution(format!(
+                "partition {partition} out of bounds for SiglakeIcebergTableScan"
+            )));
+        }
+        // #6979: under the clipped-LIMIT ramp the FILE GROUP a stream reads is
+        // chosen by its admission ticket, not by its DataFusion partition
+        // index. `CoalescePartitionsExec::execute` spawns one task per
+        // partition and calls `execute` INSIDE it
+        // (`datafusion-physical-plan`'s `stream.rs::run_input`), so tickets are
+        // handed out in whatever order the scheduler runs those tasks — which
+        // made "the group the ramp opens first" a race between pumps. Reading
+        // group `ticket` instead pins it: the first stream to register always
+        // reads group 0, the heaviest group of the deterministic split above,
+        // and the ramp then opens the groups in that order whatever the
+        // scheduler does. Correctness is unaffected because the groups are a
+        // partition of the same file set and this shape advertises no ordering
+        // (`preserve_task_order` is false wherever `admission` is `Some`), so
+        // the union the parent coalesce + `GlobalLimitExec` truncates is the
+        // same multiset of rows. Ticket allocation keeps its wrap, so the
+        // liveness contract in [`ScanAdmission`] is untouched.
+        let admission_ticket = self
+            .admission
+            .as_ref()
+            .map(|admission| admission.register());
+        let group = admission_ticket
+            .filter(|ticket| *ticket < self.task_partitions.len())
+            .unwrap_or(partition);
+        let tasks = self.task_partitions[group].clone();
         let metrics = self.metrics.clone();
         let schema = self.schema();
         let file_io = self.table.file_io().clone();
@@ -6109,7 +6132,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         // of files through one wide L2, but its depth is ~the level count.
         let cluster_plan = self
             .partition_clusters
-            .get(partition)
+            .get(group)
             .filter(|plan| {
                 self.preserve_task_order
                     && plan.iter().any(|c| !matches!(c, OrderedCluster::Run(_)))
@@ -6336,14 +6359,13 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 .duration_since(reader_build_started)
                 .as_secs_f64(),
         );
-        // #4865: take this partition's ticket HERE, while `execute` is still
-        // running for the whole plan, so tickets follow execution order rather
-        // than the order the pumps happen to be scheduled in. Nothing below the
-        // gate has been polled yet, so a partition that waits has fetched
-        // nothing.
-        let gate = match &self.admission {
-            Some(admission) => {
-                let ticket = admission.register();
+        // #4865: the ticket was taken at the top of `execute` — it selects this
+        // stream's file group as well as its place in the ramp — and nothing
+        // below this gate has been polled yet, so a stream that waits has
+        // fetched nothing. Building the reader above does no IO; the first
+        // fetch happens on the first poll of the stream the gate guards.
+        let gate = match (&self.admission, admission_ticket) {
+            (Some(admission), Some(ticket)) => {
                 let immediate = admission.is_admitted(ticket);
                 metrics::counter!(
                     "siglake_query_scan_clipped_admission_total",
@@ -6361,7 +6383,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                     }
                 }
             }
-            None => AdmissionGate::Open,
+            _ => AdmissionGate::Open,
         };
         // Counted from here: the stream below owns the matching `end` (in
         // `finish`, reached by end-of-input, error, or drop).
@@ -6424,6 +6446,12 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         }
         let tasks: Vec<&FileScanTask> = match partition {
             None => self.task_partitions.iter().flatten().collect(),
+            // #6979: under the clipped-LIMIT ramp a stream reads the group its
+            // admission ticket names, so no exact row count belongs to a
+            // single partition index. The table-wide answer above is still
+            // exact — it is the same file set either way — and that is the one
+            // `AggregateStatistics` uses to answer `count(*)` without IO.
+            Some(_) if self.admission.is_some() => return Ok(stats),
             Some(p) => match self.task_partitions.get(p) {
                 Some(part) => part.iter().collect(),
                 None => return Ok(stats),
@@ -7162,7 +7190,23 @@ fn partition_file_tasks(
         return vec![tasks];
     }
 
-    tasks.sort_by_key(|task| Reverse(task.record_count.unwrap_or(task.length)));
+    // Heaviest first, then a TOTAL tie-break on the data file's identity. The
+    // weight alone is not a total order and `sort_by_key` is stable, so equal
+    // weights kept the order `plan_files` happened to finish its manifest
+    // entries in (`third_party/iceberg/src/scan/mod.rs` fans the manifests out
+    // concurrently) — on a compacted table every file has the same
+    // `record_count`, so which file landed in partition 0 was a race. The
+    // greedy fill below is a pure function of this sequence, so making the
+    // sequence total makes the whole split reproducible for the same snapshot
+    // and predicate. Path, then byte range: a split file appears once per
+    // range.
+    tasks.sort_by(|a, b| {
+        Reverse(a.record_count.unwrap_or(a.length))
+            .cmp(&Reverse(b.record_count.unwrap_or(b.length)))
+            .then_with(|| a.data_file_path().cmp(b.data_file_path()))
+            .then_with(|| a.start.cmp(&b.start))
+            .then_with(|| a.length.cmp(&b.length))
+    });
     let partition_count = adaptive_partition_count(&tasks, target_partitions, tuning)
         .min(tasks.len())
         .max(1);
@@ -8616,6 +8660,72 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(weights, vec![110, 100]);
+    }
+
+    /// #6979: the split is a pure function of the file SET, not of the order
+    /// `plan_files` returned it in. A compacted table is the hard case — every
+    /// file carries the same `record_count`, so before the path tie-break the
+    /// stable sort left the planner's manifest-completion order in place and
+    /// group 0 (the group the clipped-LIMIT ramp opens first) was whichever
+    /// file won that race. A split file contributes one task per byte range,
+    /// so the ranges of one path must not collapse either.
+    #[test]
+    fn partition_file_tasks_splits_the_same_way_whatever_order_the_planner_returns() {
+        let equal_weights: Vec<FileScanTask> = ["e", "b", "d", "a", "c", "f"]
+            .into_iter()
+            .map(|path| task(path, 100))
+            .collect();
+        let mut split_ranges = vec![task("x", 50), task("y", 50)];
+        split_ranges[1].start = 50;
+        let mut one_path_two_ranges = vec![task("z", 50), task("z", 50)];
+        one_path_two_ranges[1].start = 50;
+
+        for tasks in [equal_weights, split_ranges, one_path_two_ranges] {
+            let paths = |parts: &[Vec<FileScanTask>]| -> Vec<Vec<(String, u64)>> {
+                parts
+                    .iter()
+                    .map(|part| {
+                        part.iter()
+                            .map(|t| (t.data_file_path().to_string(), t.start))
+                            .collect()
+                    })
+                    .collect()
+            };
+            let expected = paths(&partition_file_tasks(
+                tasks.clone(),
+                None,
+                4,
+                crate::QueryScanTuning::default(),
+            ));
+            assert!(
+                expected.iter().any(|part| !part.is_empty()),
+                "the fixture must produce a non-empty split"
+            );
+            // Every rotation of the planner's completion order, plus its
+            // reverse: all of them are orders `plan_files` may hand back.
+            for rotation in 0..tasks.len() {
+                let mut permuted = tasks.clone();
+                permuted.rotate_left(rotation);
+                let rotated = paths(&partition_file_tasks(
+                    permuted.clone(),
+                    None,
+                    4,
+                    crate::QueryScanTuning::default(),
+                ));
+                assert_eq!(rotated, expected, "rotation {rotation} split differently");
+                permuted.reverse();
+                let reversed = paths(&partition_file_tasks(
+                    permuted,
+                    None,
+                    4,
+                    crate::QueryScanTuning::default(),
+                ));
+                assert_eq!(
+                    reversed, expected,
+                    "reversed rotation {rotation} split differently"
+                );
+            }
+        }
     }
 
     /// WS-3 cluster arrangement: ASC and DESC orderings, equal boundary

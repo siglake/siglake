@@ -97,6 +97,69 @@ count, so a caller that executes a single partition takes ticket 0 and runs at
 once, and a plan executed a second time finds the ramp already open — it
 degrades to the ungated behavior rather than blocking.
 
+## Which group starts first (#6979)
+
+The ramp decides how many streams run; until #6979 nothing decided WHICH files
+the first one read. Two races picked it:
+
+* `CoalescePartitionsExec::execute` iterates partitions in index order, but
+  `run_input` (datafusion-physical-plan 53.1.0, `stream.rs`) spawns a task and
+  calls `execute` inside it. Tickets were therefore handed out in whatever
+  order the runtime ran those tasks, so ticket 0 went to an arbitrary
+  partition.
+* `partition_file_tasks` sorted by `Reverse(record_count)` with a stable sort
+  over the order `plan_files` finished its manifest entries in, and that
+  planner fans its manifests out concurrently. On a compacted table every file
+  has the same record count, so the tie was decided by the planner's race.
+
+Five warmed runs of one `keyword` query opened three different first files in
+the retained 2026-10-19 n10 reader capture (`latency-details.json`, held with
+the round rather than in this tree): three fetched about 6.09 MB over three
+object-store reads and collected 379–508 ms, two fetched nothing and collected
+in 11.5 ms.
+
+Both are now pinned:
+
+* the task sort is a total order — weight, then data file path, then byte range
+  — so the split is a pure function of the file set for a given snapshot and
+  predicate;
+* a stream reads the file group its admission TICKET names, not the one its
+  partition index names. The first stream to register reads group 0 whatever
+  the scheduler does, and the ramp then opens the groups in weight order.
+
+Reading by ticket is safe here because the groups partition one file set and
+this shape advertises no ordering: `admission` is only built where
+`preserve_task_order` is false, so the union the parent coalesce and
+`GlobalLimitExec` truncate is the same multiset of rows whichever stream reads
+which group. No sort key is advertised and none is implied — group 0 is first
+by weight, not by time. Ticket allocation still wraps, so the liveness
+argument above is unchanged, and a caller that executes one partition still
+takes ticket 0, runs at once, and now reads a known group.
+
+The cost is that a partition INDEX no longer names a file set. Per-partition
+scan counters describe whichever group ran there (their sums are unchanged),
+and `partition_statistics(Some(p))` reports unknown while a ramp is active —
+the table-wide answer, which is the one `AggregateStatistics` uses to answer
+`count(*)` without IO, stays exact.
+
+Determinism is all this buys. It does not make the first group the cheapest
+one, and the retained spread above is not a latency claim: the two fast runs
+were fast because the file they opened was pruned, and pinning the choice
+fixes which of those two outcomes a query gets, not which is faster.
+
+Evidence: `the_group_opened_first_does_not_depend_on_which_partition_starts`
+starts a different partition index first on four freshly planned scans and
+requires the same file set each time, then starts every partition in reverse
+order and requires the groups to still cover every file exactly once and every
+source row once. `an_exhausted_first_group_still_fills_the_limit` picks a
+target file the first group does not hold, so the head of the ramp ends having
+emitted nothing and the limit fills from behind it.
+`cancelling_a_clipped_scan_ends_the_streams_behind_the_ramp` drops the root
+stream after one batch and requires every stream that began to end.
+`partition_file_tasks_splits_the_same_way_whatever_order_the_planner_returns`
+holds the sort. Both halves fail on the pre-#6979 code: the first-group
+assertion reads `{15}` where it expects `{0}`.
+
 ## Local measurement
 
 `the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit`: 16

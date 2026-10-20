@@ -1607,7 +1607,17 @@ full fan-out after 64 batches. Scheduling only — a partition that waits still
 reads every row it would have read, and the limit still lives above the residual
 filter, so no qualifying row can be lost. Scoped to the shape whose rows the
 limit clips one for one (the same test that gates the index decline above), so
-ordered drains and aggregates are untouched. Observable via
+ordered drains and aggregates are untouched. WHICH files the first wave reads
+is fixed rather than raced (#6979): the file split is a total order on weight,
+then data file path, then byte range — a stable sort left equal-weight files in
+the concurrent manifest planner's completion order — and a stream reads the
+file group its admission ticket names rather than the one its partition index
+names, because `CoalescePartitionsExec` calls `execute` inside the task it
+spawns per partition. The groups partition one file set and the shape
+advertises no ordering, so the union is unchanged; the price is that a
+partition index no longer names a file set, and `partition_statistics` reports
+unknown per partition (table-wide stays exact) while a ramp is active.
+Observable via
 `siglake_query_scan_clipped_admission_total{outcome}` and
 `siglake_query_scan_clipped_admission_wait_seconds`; `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE=0`
 turns it off. Measured in
