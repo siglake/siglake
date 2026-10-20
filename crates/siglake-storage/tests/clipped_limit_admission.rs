@@ -78,6 +78,15 @@ async fn table_with(ice: &IcebergContext, needles: impl Fn(usize) -> usize) {
 /// `ORDER BY`: `ClippedScanLimit` and neither ordering extension. `wave` is the
 /// admission ramp factor under test; `0` is the pre-#4865 scan.
 fn clipped_context(limit: usize, wave: usize) -> SessionContext {
+    clipped_context_with_group_order(limit, wave, None, false)
+}
+
+fn clipped_context_with_group_order(
+    limit: usize,
+    wave: usize,
+    group_order: Option<siglake_storage::ClippedGroupOrder>,
+    bypass_reader_caches: bool,
+) -> SessionContext {
     let base = siglake_storage::session_context_with_target_partitions(Some(PARTITIONS));
     let mut state = base.state();
     state
@@ -87,6 +96,15 @@ fn clipped_context(limit: usize, wave: usize) -> SessionContext {
         .config_mut()
         .set_extension(Arc::new(siglake_storage::ClippedAdmissionWave {
             factor: wave,
+        }));
+    if let Some(group_order) = group_order {
+        state.config_mut().set_extension(Arc::new(group_order));
+    }
+    state
+        .config_mut()
+        .set_extension(Arc::new(siglake_storage::OrderedScanTuning {
+            bypass_reader_caches,
+            ..Default::default()
         }));
     SessionContext::new_with_state(state)
 }
@@ -113,7 +131,9 @@ fn scan_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
 struct Work {
     partitions: usize,
     files_read: usize,
+    files_pruned_bloom: usize,
     row_groups_read: usize,
+    object_store_reads: usize,
     decoded_bytes: usize,
     /// NOT S3 traffic: the vendored reader's fetched-byte counter over a
     /// `file://` store. Reported because the card asks for it, compared only
@@ -124,6 +144,9 @@ struct Work {
 struct Run {
     rows: Vec<String>,
     work: Work,
+    /// SQL-to-physical-plan wall time. The #7000 candidate performs no
+    /// metadata or index probe, so this captures its CPU-only sorting cost.
+    planning: Duration,
     /// Wall time to drain the root stream, i.e. what the caller waits for —
     /// measured BEFORE the settle, which waits on cancelled partitions the
     /// caller never sees. Reported because the card asks both arms' latency to
@@ -139,6 +162,7 @@ struct Run {
 /// stream leaves the cancelled partitions folding on their own workers, and a
 /// snapshot taken before they land reads a partial fold (#274).
 async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
+    let planning_started = std::time::Instant::now();
     let plan = ctx
         .sql(sql)
         .await
@@ -146,6 +170,7 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
         .create_physical_plan()
         .await
         .unwrap();
+    let planning = planning_started.elapsed();
     let scans = scan_nodes(&plan);
     assert_eq!(scans.len(), 1, "one scan leaf expected in {plan:?}");
     let partitions = scans[0]
@@ -190,11 +215,78 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
     };
     Run {
         rows,
+        planning,
         drain,
         work: Work {
             partitions,
             files_read: sum("files_read"),
+            files_pruned_bloom: sum("files_pruned_bloom"),
             row_groups_read: sum("row_groups_read"),
+            object_store_reads: sum("object_store_reads"),
+            decoded_bytes: sum("decoded_bytes"),
+            bytes_scanned: sum("bytes_scanned"),
+        },
+    }
+}
+
+/// Scheduler-free #7000 arm: visit ticket-ordered groups one at a time until
+/// the residual predicate has supplied the clip. This keeps the snapshot,
+/// predicate and group membership fixed while isolating group ORDER from the
+/// coalesce task race that an end-to-end LIMIT intentionally permits.
+async fn run_sequential_groups(ctx: &SessionContext, sql: &str, limit: usize) -> Run {
+    let planning_started = std::time::Instant::now();
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let planning = planning_started.elapsed();
+    let scan = scan_nodes(&plan).pop().expect("one scan leaf");
+    let partitions = scan.properties().output_partitioning().partition_count();
+    let task_ctx = siglake_storage::bounded_task_context_from(
+        datafusion::execution::TaskContext::from(&ctx.state()),
+    );
+
+    let drain_started = std::time::Instant::now();
+    let mut rows = Vec::new();
+    for partition in 0..partitions {
+        let source = drain_scan_partition(&scan, partition, task_ctx.clone()).await;
+        rows.extend(
+            source
+                .into_iter()
+                .filter(|row| row.contains(NEEDLE))
+                .take(limit - rows.len()),
+        );
+        if rows.len() == limit {
+            break;
+        }
+    }
+    let drain = drain_started.elapsed();
+    let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(30)).await;
+    assert!(
+        settle.complete,
+        "arm must settle before counters: {settle:?}"
+    );
+
+    let metrics = scan.metrics().unwrap().aggregate_by_name();
+    let sum = |name: &str| {
+        metrics
+            .sum_by_name(name)
+            .map(|metric| metric.as_usize())
+            .unwrap_or_default()
+    };
+    Run {
+        rows,
+        planning,
+        drain,
+        work: Work {
+            partitions,
+            files_read: sum("files_read"),
+            files_pruned_bloom: sum("files_pruned_bloom"),
+            row_groups_read: sum("row_groups_read"),
+            object_store_reads: sum("object_store_reads"),
             decoded_bytes: sum("decoded_bytes"),
             bytes_scanned: sum("bytes_scanned"),
         },
@@ -412,6 +504,103 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
          the median of {PAIRS} pairs: gated {gated_median} ungated {ungated_median}, \
          decoded bytes (gated, ungated) {decoded:?} \
          (files gated {gated_files} ungated {ungated_files})"
+    );
+}
+
+/// #7000 local A/B. Group 0 under the shipped weight-first split is one of the
+/// 12,000-row matching files. The 6,000-row non-matching file is deliberately
+/// smaller and more compressible, so the metadata-only cost candidate moves it
+/// to the head even though its whole-file trigram bloom then prunes it.
+///
+/// Reader caches are bypassed in both arms. The candidate performs no
+/// metadata/index probe during planning; every object-store read below is
+/// charged by the same execution counters. Sequential ticket draining removes
+/// scheduler fan-out from the comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn estimated_cost_order_measures_a_non_head_prunable_file() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    for file in 0..4 {
+        let rows = if file == 0 { 6_000 } else { 12_000 };
+        let events: Vec<Event> = (0..rows)
+            .map(|row| {
+                let raw = if file == 0 {
+                    "file=0000 outcome=pawn fixed=fixed fixed=fixed fixed=fixed".to_string()
+                } else {
+                    format!(
+                        "file={file:04} row={row:06} outcome={NEEDLE} unique-a={:016x} \
+                         unique-b={:016x} unique-c={:016x}",
+                        (row as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                        (row as u64).wrapping_mul(0xd6e8_feb8_6659_fd93),
+                        (row as u64).wrapping_mul(0xa076_1d64_78bd_642f),
+                    )
+                };
+                Event::now(raw)
+            })
+            .collect();
+        ice.append_events(&events).await.unwrap();
+    }
+
+    const LIMIT: usize = 20;
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let weight_ctx = clipped_context_with_group_order(
+        LIMIT,
+        2,
+        Some(siglake_storage::ClippedGroupOrder::WeightFirst),
+        true,
+    );
+    ice.register_with_datafusion(&weight_ctx).await.unwrap();
+    let cost_ctx = clipped_context_with_group_order(
+        LIMIT,
+        2,
+        Some(siglake_storage::ClippedGroupOrder::EstimatedBytesToLimit),
+        true,
+    );
+    ice.register_with_datafusion(&cost_ctx).await.unwrap();
+
+    // Warm the shared table/manifest planning caches for both timed arms. The
+    // group-order candidate itself is CPU-only; cold catalog work must not be
+    // attributed to whichever arm happens to plan first.
+    for ctx in [&weight_ctx, &cost_ctx] {
+        ctx.sql(&sql)
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+    }
+    let weight = run_sequential_groups(&weight_ctx, &sql, LIMIT).await;
+    let cost = run_sequential_groups(&cost_ctx, &sql, LIMIT).await;
+    eprintln!(
+        "CLIPPED-GROUP-COST weight={:?} planning={:?} drain={:?} \
+         cost={:?} planning={:?} drain={:?} planning_probe_reads=0",
+        weight.work, weight.planning, weight.drain, cost.work, cost.planning, cost.drain
+    );
+
+    assert_eq!(weight.work.partitions, cost.work.partitions);
+    assert_eq!(weight.rows.len(), LIMIT);
+    assert_eq!(cost.rows.len(), LIMIT);
+    assert_all_qualify(&weight.rows, &sql);
+    assert_all_qualify(&cost.rows, &sql);
+    assert_eq!(
+        weight.work.files_pruned_bloom, 0,
+        "the prunable file must not be group 0 under weight-first"
+    );
+    assert_eq!(
+        cost.work.files_pruned_bloom, 1,
+        "the cost candidate must move the cheap prunable file to group 0"
+    );
+    assert_eq!(
+        cost.work.decoded_bytes, weight.work.decoded_bytes,
+        "probing no metadata cannot reduce the readable group's decode"
+    );
+    assert!(
+        cost.work.object_store_reads > weight.work.object_store_reads,
+        "opening the prunable group must be charged: weight={:?} cost={:?}",
+        weight.work,
+        cost.work
     );
 }
 
