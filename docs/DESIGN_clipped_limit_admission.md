@@ -112,10 +112,11 @@ the first one read. Two races picked it:
   planner fans its manifests out concurrently. On a compacted table every file
   has the same record count, so the tie was decided by the planner's race.
 
-Five warmed runs of one retained `keyword` query opened three different first
-files (`/home/todd/workspace/loglake-manager/var/investigations/20261019-n10-retained-readers/latency-details.json`):
-three fetched about 6.09 MB over three object-store reads and collected
-379–508 ms, two fetched nothing and collected in 11.5 ms.
+Five warmed runs of one `keyword` query opened three different first files in
+the retained 2026-10-19 n10 reader capture (`latency-details.json`, held with
+the round rather than in this tree): three fetched about 6.09 MB over three
+object-store reads and collected 379–508 ms, two fetched nothing and collected
+in 11.5 ms.
 
 Both are now pinned:
 
