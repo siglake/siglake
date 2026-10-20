@@ -115,8 +115,11 @@ the first one read. Two races picked it:
 Five warmed runs of one `keyword` query opened three different first files in
 the retained 2026-10-19 n10 reader capture (`latency-details.json`, held with
 the round rather than in this tree): three fetched about 6.09 MB over three
-object-store reads and collected 379–508 ms, two fetched nothing and collected
-in 11.5 ms.
+object-store reads and collected 379–508 ms. The other two fetched nothing and
+collected in 11.5 ms, but they still scanned 4,096 rows, decoded 251,760 and
+310,128 bytes, and reported zero bloom/statistics pruning. The capture proves
+variable fetched work, not that either file was prunable; cache state was not
+controlled.
 
 Both are now pinned:
 
@@ -143,9 +146,9 @@ the table-wide answer, which is the one `AggregateStatistics` uses to answer
 `count(*)` without IO, stays exact.
 
 Determinism is all this buys. It does not make the first group the cheapest
-one, and the retained spread above is not a latency claim: the two fast runs
-were fast because the file they opened was pruned, and pinning the choice
-fixes which of those two outcomes a query gets, not which is faster.
+one, and the retained spread above is not a latency claim. Pinning the choice
+fixes which observed work profile the query gets; that capture does not
+establish why the profiles differed.
 
 Evidence: `the_group_opened_first_does_not_depend_on_which_partition_starts`
 starts a different partition index first on four freshly planned scans and
@@ -159,6 +162,45 @@ stream after one batch and requires every stream that began to end.
 `partition_file_tasks_splits_the_same_way_whatever_order_the_planner_returns`
 holds the sort. Both halves fail on the pre-#6979 code: the first-group
 assertion reads `{15}` where it expects `{0}`.
+
+## Cost-order candidate (#7000)
+
+The measured rule was metadata-only: after the existing greedy split, rank
+groups that contain at least the clipped source-row count ahead of groups that
+do not, then sort by
+`ceil(compressed_file_bytes * clipped_limit / record_count)`. File path and
+byte range are the total tie-break. If any group lacks a record count, retain
+the weight-first order for the whole scan. Group membership never changes.
+The query server does not select this rule; `ClippedGroupOrder` is a
+per-session test control.
+
+This rule uses the file length and record count already present in Iceberg scan
+tasks. It performs zero metadata or index probes. `raw_prune_spec` says which
+predicate hints a reader may apply, not whether one file will prune, so it is
+not a cost signal. Probing every Parquet footer would charge at least one read
+per candidate before the scan knew which group to start; this candidate did not
+hide that cost behind planning.
+
+The local fixture holds one snapshot, predicate and four singleton groups. The
+weight-first head is a 12,000-row readable file. A smaller, highly compressible
+6,000-row file is not group 0 and its whole-file trigram bloom rejects the
+predicate. The candidate's bytes-per-row estimate moves that prunable file to
+the head. Both arms bypass reader caches and drain ticket-ordered groups
+sequentially until 20 exact matches have been collected, so task scheduling
+cannot add speculative readers. Shared planning caches are warmed before both
+timed arms.
+
+| order | planning probes | planning | files read | bloom-pruned files | object-store reads | fetched bytes | decoded bytes | drain |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| weight first | 0 | 3.60 ms | 1 | 0 | 4 | 2,817,594 | 1,426,896 | 14.46 ms |
+| estimated bytes to limit | 0 | 5.13 ms | 2 | 1 | 6 | 2,904,984 | 1,426,896 | 17.64 ms |
+
+The candidate decoded the same bytes and added two object-store reads plus
+87,390 fetched bytes. One local timing pair is descriptive; decoded bytes and
+read counts are the acceptance evidence. The production choice therefore
+remains deterministic weight-first. The fixture is retained as
+`estimated_cost_order_measures_a_non_head_prunable_file`; a later policy needs
+a per-file signal whose acquisition cost is part of its comparison.
 
 ## Local measurement
 

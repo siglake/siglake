@@ -721,6 +721,22 @@ pub struct ClippedAdmissionWave {
     pub factor: usize,
 }
 
+/// Experimental per-session ordering for the deterministic groups behind an
+/// unordered clipped-LIMIT admission ramp.
+///
+/// The query server does not install this extension. It exists so a matched
+/// local comparison can exercise a metadata-only candidate without a public
+/// knob or process-global environment mutation. When the extension is absent,
+/// the shipped weight-first order is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClippedGroupOrder {
+    /// Keep [`partition_file_tasks`]'s heaviest-first greedy group order.
+    WeightFirst,
+    /// Prefer the group with the lowest compressed bytes per potential result
+    /// row, provided it contains enough source rows to fill the clip.
+    EstimatedBytesToLimit,
+}
+
 /// Per-request preferred output order for an event-time-ordered scan: the
 /// exact field the query orders by, and the direction. Injected through
 /// `SessionConfig` so the scan can serve the opposite of the declared on-disk
@@ -3009,6 +3025,27 @@ impl SiglakeIcebergTableScan {
                 None,
                 state.config().target_partitions(),
                 tuning,
+            );
+        }
+        // #7000 measurement candidate. This uses only record counts and file
+        // lengths already carried by the Iceberg scan tasks: `raw_prune_spec`
+        // describes the predicate but cannot predict a particular file's
+        // bloom outcome without opening that file's Parquet metadata. The
+        // candidate therefore charges no metadata/index probes and makes no
+        // pruning claim. It estimates the compressed bytes needed to expose
+        // `limit` source rows, ranks groups that can fill the clip ahead of
+        // groups that cannot, and uses the task identity as a total tie-break.
+        // Missing record counts preserve the weight-first order whole.
+        if !preserve_task_order
+            && state.config().get_extension::<ClippedScanLimit>().is_some()
+            && state
+                .config()
+                .get_extension::<ClippedGroupOrder>()
+                .is_some_and(|order| *order == ClippedGroupOrder::EstimatedBytesToLimit)
+        {
+            order_clipped_groups_by_estimated_cost(
+                &mut task_partitions,
+                clipped_limit.unwrap_or_default(),
             );
         }
         let partition_count = task_partitions.len().max(1);
@@ -7227,6 +7264,52 @@ fn partition_file_tasks(
     partitions
 }
 
+/// Reorder an existing split without changing group membership.
+///
+/// Returns `false` and leaves `groups` byte-for-byte alone when a usable cost
+/// cannot be derived for every group. The score is deliberately conservative:
+/// a group that cannot contain `limit` source rows follows every group that
+/// can, then the latter are ordered by `ceil(compressed_bytes * limit / rows)`.
+/// The file identity makes the order total for a fixed snapshot.
+fn order_clipped_groups_by_estimated_cost(groups: &mut [Vec<FileScanTask>], limit: usize) -> bool {
+    if groups.len() < 2 || limit == 0 {
+        return false;
+    }
+    let score = |group: &[FileScanTask]| -> Option<(bool, u128, u64)> {
+        let rows = group
+            .iter()
+            .try_fold(0u64, |total, task| total.checked_add(task.record_count?))?;
+        if rows == 0 {
+            return None;
+        }
+        let bytes = group
+            .iter()
+            .try_fold(0u64, |total, task| total.checked_add(task.length))?;
+        let can_fill = rows >= limit as u64;
+        let estimated_bytes = if can_fill {
+            (u128::from(bytes) * limit as u128).div_ceil(u128::from(rows))
+        } else {
+            u128::from(bytes)
+        };
+        Some((!can_fill, estimated_bytes, bytes))
+    };
+    if groups.iter().any(|group| score(group).is_none()) {
+        return false;
+    }
+    groups.sort_by(|left, right| {
+        score(left).cmp(&score(right)).then_with(|| {
+            left.iter()
+                .map(|task| (task.data_file_path(), task.start, task.length))
+                .cmp(
+                    right
+                        .iter()
+                        .map(|task| (task.data_file_path(), task.start, task.length)),
+                )
+        })
+    });
+    true
+}
+
 fn adaptive_partition_count(
     tasks: &[FileScanTask],
     target_partitions: usize,
@@ -8660,6 +8743,53 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(weights, vec![110, 100]);
+    }
+
+    #[test]
+    fn clipped_cost_order_changes_order_without_changing_groups() {
+        let mut dense = task("dense", 100);
+        dense.length = 100;
+        let mut sparse = task("sparse", 200);
+        sparse.length = 1_000;
+        let too_small = task("too-small", 5);
+        let mut groups = vec![vec![sparse], vec![too_small], vec![dense]];
+        let members = groups
+            .iter()
+            .flatten()
+            .map(|task| task.data_file_path().to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert!(order_clipped_groups_by_estimated_cost(&mut groups, 20));
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group[0].data_file_path())
+                .collect::<Vec<_>>(),
+            vec!["dense", "sparse", "too-small"]
+        );
+        assert_eq!(
+            groups
+                .iter()
+                .flatten()
+                .map(|task| task.data_file_path().to_string())
+                .collect::<std::collections::BTreeSet<_>>(),
+            members
+        );
+
+        let mut unavailable = vec![vec![task("kept-first", 10)], vec![task("kept-last", 20)]];
+        unavailable[1][0].record_count = None;
+        let before = unavailable
+            .iter()
+            .map(|group| group[0].data_file_path().to_string())
+            .collect::<Vec<_>>();
+        assert!(!order_clipped_groups_by_estimated_cost(&mut unavailable, 5));
+        assert_eq!(
+            unavailable
+                .iter()
+                .map(|group| group[0].data_file_path().to_string())
+                .collect::<Vec<_>>(),
+            before
+        );
     }
 
     /// #6979: the split is a pure function of the file SET, not of the order
