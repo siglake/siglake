@@ -137,6 +137,34 @@ async fn production_population_bound_covers_turnover_fanout_handoff_and_cancella
     );
     assert!(first_footprint.priced_bytes <= budget);
 
+    // The nonblocking population path may discard concurrent populations on
+    // contention. The fanout above proves the bound, not that residents fill
+    // it. Prime serially under the same production budget so the following
+    // turnover assertion actually starts under pressure, on every schedule.
+    siglake_storage::clear_decoded_file_cache();
+    siglake_storage::configure_query_scan_tuning(tuning(budget, 1, Admission::Production));
+    let prime_ctx = siglake_storage::session_context_with_target_partitions(Some(1));
+    ice.register_with_datafusion(&prime_ctx).await.unwrap();
+    assert_eq!(row_count(&prime_ctx, SCAN_SQL).await, rows);
+    settle().await;
+    let primed = siglake_storage::decoded_file_cache_footprint();
+    assert_eq!(primed.entries, 4, "serial priming did not retain four files");
+    assert_eq!(
+        primed.priced_bytes, budget,
+        "turnover must start with a full resident budget: {primed:?}"
+    );
+    let primed_stats = siglake_storage::decoded_file_cache_population_stats();
+    assert_eq!(
+        (
+            primed_stats.inflight_extent_bytes,
+            primed_stats.inflight_retained_bytes
+        ),
+        (0, 0),
+        "serial priming left an unfinished population: {primed_stats:?}"
+    );
+    assert!(primed_stats.peak_accounted_bytes <= budget);
+    siglake_storage::configure_query_scan_tuning(tuning(budget, FILES, Admission::Production));
+
     // Keep those resident entries and change the projection, hence every cache
     // key. Production admission must make room and install replacements rather
     // than freezing the first scheduler-selected residents as #5074 did.
