@@ -46,7 +46,7 @@ Timestamp-sorted files are never advertised as physically sorted by this number.
 Execution follows normal admission and the original request deadline. A 128 MiB
 reservation comes from the query's existing DataFusion pool and drops with the
 future. Limits are 256 files, 4096 groups, 8 MiB serialized footers in total,
-256 KiB per serialized footer, 32 MiB retained decoded Parquet metadata, and
+512 KiB per serialized footer, 32 MiB retained decoded Parquet metadata, and
 32 MiB per compressed/uncompressed target chunk. Decoding uses 8192-row batches
 and yields between files/batches. These are conservative admitted workspace
 limits, not a hard process RSS guarantee for parser/allocator overhead.
@@ -97,3 +97,17 @@ route/counter proof on a qualified full snapshot. Retain raw HTTP results,
 physical rows/groups/bytes, source/image/provenance and cleanup evidence. Existing
 historical footer audits are not new measurements or current snapshot proof.
 No cloud timing or speedup is established by these source tests.
+
+### Canonical footer admission follow-up (#7079)
+
+The original 32-file snapshot has 15 serialized footers above the initial 256 KiB
+per-file limit (maximum 498,994 bytes). The exact local Parquet 58.4.0 probe
+measured 8,296,285 serialized bytes total and 10,985,491 bytes of retained decoded
+metadata. The single-footer cap is therefore 512 KiB; the 8 MiB aggregate,
+32 MiB decoded-metadata cap and 128 MiB reservation are unchanged. The aggregate
+margin on that snapshot is only 92,323 bytes; other layouts may still refuse.
+Persisted regression fixtures cover the observed maximum, the exact per-file
+boundary and its one-byte overflow, plus cumulative footer overflow before data
+reads. This is admission compatibility, not a performance result or a production
+RSS guarantee. Exact original ASC/DESC SQL must still prove the numeric route
+on the restored catalog/snapshot/current provenance before field timing.
