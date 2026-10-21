@@ -546,8 +546,8 @@ mod tests {
         let paths = (0..17)
             .map(|i| write_sized_footer(dir.path(), &format!("{i}.parquet"), 498_994))
             .collect::<Vec<_>>();
-        assert!(16 * 498_994 < 8 * 1024 * 1024);
-        assert!(17 * 498_994 > 8 * 1024 * 1024);
+        assert!((paths.len() - 1) * 498_994 < 8 * 1024 * 1024);
+        assert!(paths.len() * 498_994 > 8 * 1024 * 1024);
         let memory = pool(RESERVATION_BYTES);
         let metrics = ScanMetrics::default();
         let result = read_inner(
