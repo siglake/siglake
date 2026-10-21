@@ -148,7 +148,10 @@ async fn production_population_bound_covers_turnover_fanout_handoff_and_cancella
     assert_eq!(row_count(&prime_ctx, SCAN_SQL).await, rows);
     settle().await;
     let primed = siglake_storage::decoded_file_cache_footprint();
-    assert_eq!(primed.entries, 4, "serial priming did not retain four files");
+    assert_eq!(
+        primed.entries, 4,
+        "serial priming did not retain four files"
+    );
     assert_eq!(
         primed.priced_bytes, budget,
         "turnover must start with a full resident budget: {primed:?}"
