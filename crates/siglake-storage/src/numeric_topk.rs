@@ -45,7 +45,7 @@ pub struct NumericTopK {
 }
 
 fn refuse(reason: &'static str) -> Option<NumericTopK> {
-    metrics::counter!("siglake_numeric_topk_fallback_total", "reason" => reason).increment(1);
+    tracing::debug!(reason, "numeric TopK declined");
     None
 }
 
@@ -124,7 +124,6 @@ pub(crate) async fn read(
     let probe_bytes = metrics.bytes_read();
     let probe_reads = metrics.scan_counters().object_store_reads.load(Relaxed);
     if result.is_none() {
-        metrics::counter!("siglake_numeric_topk_fallback_bytes_total").increment(probe_bytes);
         tracing::debug!(
             probe_bytes,
             probe_reads,

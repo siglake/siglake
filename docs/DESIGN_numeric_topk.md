@@ -67,9 +67,8 @@ outcomes. `files_read` includes footer-opened files, even where data groups are
 pruned. Group pruning includes all-null groups. A metadata refusal returns no
 partial output and runs the original plan once; its probe bytes/reads are added
 to the fallback Records statistics and its cost warnings, including row-breaker
-errors. Metadata refusal reasons and bytes have bounded-label counters
-`siglake_numeric_topk_fallback_total{reason}` and
-`siglake_numeric_topk_fallback_bytes_total`.
+errors. Debug diagnostics record the bounded refusal reason and the probe bytes
+and reads; no public metric series is emitted without a named reader.
 
 `SIGLAKE_NUMERIC_TOPK=0` disables the candidate at process startup. A fresh process
 also avoids carrying candidate result-cache bodies into a disabled control.
