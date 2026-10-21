@@ -83,7 +83,7 @@ const VALUE: &str = "CAST(attr_get(attributes, 'metrics.size') AS BIGINT)";
 async fn replace_with_sized_footers(ice: &IcebergContext, target: usize) {
     use iceberg::{
         spec::DataFileBuilder,
-        transaction::{Transaction, TransactionAction},
+        transaction::{ApplyTransactionAction, Transaction},
     };
     use parquet::{
         arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter},
@@ -172,7 +172,8 @@ async fn replace_with_sized_footers(ice: &IcebergContext, target: usize) {
                 (id, size)
             })
             .collect::<std::collections::HashMap<_, _>>();
-        let new = DataFileBuilder::default()
+        let mut builder = DataFileBuilder::default();
+        builder
             .content(old.content_type())
             .file_path(path.to_string_lossy().into_owned())
             .file_format(old.file_format())
@@ -185,11 +186,11 @@ async fn replace_with_sized_footers(ice: &IcebergContext, target: usize) {
             .nan_value_counts(old.nan_value_counts().clone())
             .lower_bounds(old.lower_bounds().clone())
             .upper_bounds(old.upper_bounds().clone())
-            .key_metadata(old.key_metadata().map(<[u8]>::to_vec))
-            .sort_order_id(old.sort_order_id())
-            .build()
-            .unwrap();
-        new_files.push(new);
+            .key_metadata(old.key_metadata().map(<[u8]>::to_vec));
+        if let Some(sort_order) = old.sort_order_id() {
+            builder.sort_order_id(sort_order);
+        }
+        new_files.push(builder.build().unwrap());
     }
     let tx = Transaction::new(&table);
     tx.rewrite_files()
