@@ -798,7 +798,7 @@ if command -v cargo-deny >/dev/null 2>&1; then
   # while a fetched advisory or any license/source violation remains a FAIL.
   if ! cargo deny fetch db >"$dlog" 2>&1; then
     report deny "skipped (advisory db unreachable)"
-  elif cargo deny check advisories licenses sources >>"$dlog" 2>&1; then
+  elif cargo deny check advisories bans licenses sources >>"$dlog" 2>&1; then
     report deny ok
   else
     report deny FAIL

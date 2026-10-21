@@ -820,7 +820,7 @@ jobs:
       # this job red even when neither the code nor Cargo.lock changed.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories licenses sources
+          command: check advisories bans licenses sources
 
   # Builds both images on every run; pushes them to ECR only where there is an
   # ECR to push to. The public repo has no AWS account behind it, so every

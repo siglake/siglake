@@ -40,10 +40,18 @@ ignore = [
     # rustls-pemfile 2.2.0: unmaintained, no patched release. Sole parent is
     # axum-server 0.7.3; object_store 0.13.2 no longer pulls it in.
     "RUSTSEC-2025-0134",
+    # webpki-roots 0.26.11 is a semver shim used by sqlx-core 0.8.6. It
+    # reexports TLS_SERVER_ROOTS from its webpki-roots 1.x dependency, which is
+    # locked to patched 1.0.10. The bans check below rejects vulnerable 1.x.
+    # Remove this exception with the sqlx 0.9 migration tracked by #7067.
+    { id = "RUSTSEC-2026-0381", reason = "0.26.11 reexports patched webpki-roots 1.0.10; vulnerable 1.x is denied" },
 ]
 
 [bans]
 multiple-versions = "allow"
+deny = [
+    { crate = "webpki-roots:>=1.0.0,<1.0.10", reason = "RUSTSEC-2026-0381 is ignored only for the 0.26.11 semver shim" },
+]
 
 [sources]
 unknown-registry = "deny"
