@@ -1301,6 +1301,7 @@ async fn rewrite_search_if_needed(
     Ok(Statement::Query(sql_query.clone()).to_string())
 }
 
+#[cfg(test)]
 async fn apply_query_rewrites(
     ice: &siglake_storage::iceberg::IcebergContext,
     query: &str,
@@ -1308,41 +1309,58 @@ async fn apply_query_rewrites(
     priority: Priority,
     max_rows: usize,
 ) -> Result<RewrittenQuery, ApiError> {
+    apply_query_rewrites_for_serving(ice, query, default_order, priority, max_rows, false).await
+}
+
+async fn apply_query_rewrites_for_serving(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    query: &str,
+    default_order: bool,
+    priority: Priority,
+    max_rows: usize,
+    wal_buffer_enabled: bool,
+) -> Result<RewrittenQuery, ApiError> {
     let search_rewritten = rewrite_search_if_needed(ice, query).await?;
+    // #6982: committed backfill provenance does not cover WAL batches, whose
+    // promoted fields are NULL-filled during schema alignment. Even an empty
+    // buffer can gain rows between planning and scan, so do not rewrite on a
+    // WAL-enabled serving route. Preserve the ordinary residual expression and
+    // its existing bounded buffer-admission behavior instead.
     // WS-7: `attr_get(attributes, 'key')` → promoted column, gated on the
     // backfill-complete property (unsound before it: pre-promotion files
     // read the column as NULL while their JSON still holds the key). The
     // substituted text flows everywhere downstream — the Tier-1 group-count
     // battery sees a plain `GROUP BY <column>` (~3ms metadata answer), the
     // provider prunes natively, shard fan-out ships the rewritten SQL.
-    let (search_rewritten, attr_rewrite_bindings) = if search_rewritten.contains("attr_get") {
-        // The gate is table-local: a promoted column is sound only after that
-        // table's backfill property matches its promotion list. Load every
-        // referenced table's independently gated map, then let the AST scope
-        // resolver apply a map only where the column owner is proven.
-        let mut mappings = HashMap::new();
-        let mut bindings = HashMap::new();
-        for name in referenced_tables(&search_rewritten).unwrap_or_default() {
-            if name == "query_audit" {
-                continue;
+    let (search_rewritten, attr_rewrite_bindings) =
+        if !wal_buffer_enabled && search_rewritten.contains("attr_get") {
+            // The gate is table-local: a promoted column is sound only after that
+            // table's backfill property matches its promotion list. Load every
+            // referenced table's independently gated map, then let the AST scope
+            // resolver apply a map only where the column owner is proven.
+            let mut mappings = HashMap::new();
+            let mut bindings = HashMap::new();
+            for name in referenced_tables(&search_rewritten).unwrap_or_default() {
+                if name == "query_audit" {
+                    continue;
+                }
+                let ident = if name == "events" {
+                    ice.events_table_ident().clone()
+                } else {
+                    ice.index_table_ident(&name)
+                };
+                if let Ok(Some(qualified)) = ice.qualified_attr_rewrite_for(&ident).await {
+                    mappings.insert(name.clone(), qualified.mapping.clone());
+                    bindings.insert(name, qualified);
+                }
             }
-            let ident = if name == "events" {
-                ice.events_table_ident().clone()
-            } else {
-                ice.index_table_ident(&name)
-            };
-            if let Ok(Some(qualified)) = ice.qualified_attr_rewrite_for(&ident).await {
-                mappings.insert(name.clone(), qualified.mapping.clone());
-                bindings.insert(name, qualified);
+            match rewrite_attr_get_to_columns(&search_rewritten, &mappings) {
+                Some(rewritten) => (rewritten, bindings),
+                None => (search_rewritten, HashMap::new()),
             }
-        }
-        match rewrite_attr_get_to_columns(&search_rewritten, &mappings) {
-            Some(rewritten) => (rewritten, bindings),
-            None => (search_rewritten, HashMap::new()),
-        }
-    } else {
-        (search_rewritten, HashMap::new())
-    };
+        } else {
+            (search_rewritten, HashMap::new())
+        };
     // The table whose event-time field this query's order contract turns on.
     // The implicit rewrite needs it to inject an order; a query that ALREADY
     // orders by a non-canonical column needs it to decide whether that column
@@ -1947,10 +1965,13 @@ fn attr_get_rewrite_target(
     let (first_key, outer_keys) = keys.split_first()?;
     let source = (carrier, first_key.clone(), outer_keys.to_vec());
     let (column, ty) = mapping.get(&source)?.clone();
+    // Mappings preserve exact physical names, including case and SQL syntax.
+    // Quote the injected leaf; retain the original qualifier identifiers.
+    let column = Ident::with_quote('"', column);
     let column = match qualifier {
-        None => SqlAstExpr::Identifier(column.as_str().into()),
+        None => SqlAstExpr::Identifier(column),
         Some(mut parts) => {
-            parts.push(column.as_str().into());
+            parts.push(column);
             SqlAstExpr::CompoundIdentifier(parts)
         }
     };
@@ -4386,12 +4407,13 @@ async fn handle_scoped(
     )
     .await?;
     let effective_query = apply_timeout(
-        apply_query_rewrites(
+        apply_query_rewrites_for_serving(
             &ice,
             &req.query,
             req.default_order,
             req.priority,
             resolved.max_rows_returned,
+            state.wal_buffer_dir.is_some(),
         ),
         &resolved,
         &unknown_cost,
@@ -4592,12 +4614,13 @@ async fn handle_local_inner(
         match pre_rewritten_query {
             Some(query) => Ok(query),
             None => {
-                apply_query_rewrites(
+                apply_query_rewrites_for_serving(
                     &ice,
                     &req.query,
                     req.default_order,
                     req.priority,
                     resolved.max_rows_returned,
+                    state.wal_buffer_dir.is_some(),
                 )
                 .await
             }
@@ -4933,7 +4956,7 @@ async fn handle_local_inner(
     let logical_elapsed = logical_started.elapsed();
     record_phase_metric("sql", "logical_plan", logical_elapsed);
     let estimate_started = Instant::now();
-    let cost =
+    let mut cost =
         under_request_deadline!(async { estimate(&df, &ice).await.map_err(ApiError::internal) });
     let estimate_elapsed = estimate_started.elapsed();
     record_phase_metric("sql", "estimate", estimate_elapsed);
@@ -5397,6 +5420,61 @@ async fn handle_local_inner(
         }
     };
 
+    // This path reads data, unlike the metadata battery. It runs only AFTER
+    // normal admission, under the same request deadline and memory pool.
+    // NDJSON, batch and shard routes deliberately retain their original plan.
+    let mut numeric_probe = NumericTopKProbe::default();
+    if !req.dry_run
+        && format == QueryFormat::Records
+        && fast_path_safe
+        && delta.is_none()
+        && req.shard.is_none()
+        && state.peers.is_none()
+        && numeric_topk_enabled()
+    {
+        if let Some(mut body) = under_request_deadline!(siglake_storage::with_query_execution_id(
+            execution_id,
+            try_numeric_topk_records(
+                &df,
+                &ice,
+                shard,
+                &mut cost,
+                &effective_query.attr_rewrite_bindings,
+                &resolved,
+                &mut numeric_probe
+            ),
+        )) {
+            attach_fast_path_phases(
+                &mut body,
+                fast_path_plan_micros,
+                buffer_delta_micros,
+                battery_started,
+                None,
+            );
+            let body = Arc::new(body);
+            if let Some(cache_ctx) = cache_ctx.clone() {
+                finish_result_cache(
+                    cache_ctx,
+                    CacheEligibility::SQL,
+                    Some(CachedBody::Records(Arc::clone(&body))),
+                )
+                .await;
+            }
+            let result = Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+            emit_terminal_audit(
+                state.audit.as_ref(),
+                &identity,
+                "sql",
+                &req,
+                start,
+                &result,
+                &cost,
+            );
+            record_metrics("sql", start, &result, &cost);
+            return result;
+        }
+    }
+
     let result = if req.dry_run {
         Ok((StatusCode::OK, Json(cost.clone())).into_response())
     } else {
@@ -5411,6 +5489,7 @@ async fn handle_local_inner(
             buffer_delta_micros,
             residual_fallback,
             execution_id,
+            numeric_probe,
             // Ownership moves out of this scope: for NDJSON it travels into the
             // response body, for Records it is held across the collect. Taking
             // it here is what stops the handler's own guard cancelling a stream
@@ -7932,6 +8011,266 @@ async fn try_windowed_count_fast_path_records(
         cost: Some(cost),
         // Core from the snapshot aggregate; only ≤2 small boundary ranges touch files.
         stats: Some(crate::format::ScanStats::default()),
+        approximation: None,
+    }))
+}
+
+/// Startup-only control for same-binary qualification and operational fallback.
+/// A fresh process also starts with an empty result cache.
+fn numeric_topk_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        group_count_fast_path_enabled_from(std::env::var("SIGLAKE_NUMERIC_TOPK").ok().as_deref())
+    })
+}
+
+/// IO spent rejecting a metadata candidate belongs to the same request as its
+/// ordinary fallback. Do not charge decoded rows or invent data-phase reads.
+#[derive(Clone, Copy, Default)]
+struct NumericTopKProbe {
+    bytes: u64,
+    reads: u64,
+}
+impl NumericTopKProbe {
+    fn add_to(self, stats: &mut crate::format::ScanStats) {
+        if self.bytes == 0 && self.reads == 0 {
+            return;
+        }
+        stats.bytes_scanned = stats.bytes_scanned.saturating_add(self.bytes);
+        let scan = stats.scan.get_or_insert_with(Default::default);
+        scan.bytes_footer = scan.bytes_footer.saturating_add(self.bytes);
+        scan.fetched_bytes = scan.fetched_bytes.saturating_add(self.bytes);
+        scan.object_store_reads = scan.object_store_reads.saturating_add(self.reads);
+    }
+}
+
+struct NumericTopKFastPath {
+    table: String,
+    column: String,
+    output: String,
+    limit: usize,
+    ascending: bool,
+}
+
+/// Only identity Int64 casts may disappear. In particular a string-to-Int64
+/// cast can fail or change NULL semantics and never qualifies here.
+fn numeric_topk_column<'a>(
+    expr: &'a Expr,
+    schema: &datafusion::common::DFSchema,
+) -> Option<&'a datafusion::common::Column> {
+    use datafusion::logical_expr::ExprSchemable;
+    match expr {
+        Expr::Alias(alias) => numeric_topk_column(&alias.expr, schema),
+        Expr::Cast(cast)
+            if cast.data_type == DataType::Int64
+                && cast.expr.get_type(schema).ok()? == DataType::Int64 =>
+        {
+            numeric_topk_column(&cast.expr, schema)
+        }
+        Expr::Cast(cast) if cast.data_type == DataType::Int64 => {
+            // The existing proven promotion rewrite preserves attr_get's
+            // string result as CAST(Int64 AS VARCHAR). The registered Big5
+            // outer BIGINT cast is exactly this lossless round-trip, including
+            // MIN/MAX and NULL. Arbitrary string/float casts remain unsupported.
+            let Expr::Cast(text) = cast.expr.as_ref() else {
+                return None;
+            };
+            if !matches!(text.data_type, DataType::Utf8 | DataType::Utf8View)
+                || text.expr.get_type(schema).ok()? != DataType::Int64
+            {
+                return None;
+            }
+            numeric_topk_column(&text.expr, schema)
+        }
+        Expr::Column(column) => Some(column),
+        _ => None,
+    }
+}
+
+/// Match the resolved, unoptimized plan, not SQL text or physical ordering.
+/// Aliases are output names only; filter and projected input must be identical.
+fn detect_numeric_topk(plan: &LogicalPlan) -> Option<NumericTopKFastPath> {
+    let output = single_output_name(plan.schema().as_ref())?;
+    if plan.schema().field(0).data_type() != &DataType::Int64 {
+        return None;
+    }
+    let LogicalPlan::Limit(Limit {
+        skip, fetch, input, ..
+    }) = plan
+    else {
+        return None;
+    };
+    if skip.as_deref().is_some_and(
+        |e| !matches!(e, Expr::Literal(v, _) if literal_nonnegative_usize(v) == Some(0)),
+    ) {
+        return None;
+    }
+    let Some(Expr::Literal(fetch, _)) = fetch.as_deref() else {
+        return None;
+    };
+    let limit = literal_nonnegative_usize(fetch)?;
+    if !(1..=1000).contains(&limit) {
+        return None;
+    }
+    // DataFusion carries a hidden input column through the sort when ORDER BY
+    // repeats an expression instead of the output alias, then projects it away.
+    // Accept only that exact one-value final projection, never extra outputs.
+    let (sort_input, final_projection) = match input.as_ref() {
+        LogicalPlan::Projection(p) if p.expr.len() == 1 => (p.input.as_ref(), Some(p)),
+        other => (other, None),
+    };
+    let LogicalPlan::Sort(sort) = sort_input else {
+        return None;
+    };
+    if sort.expr.len() != 1 || sort.fetch.is_some() {
+        return None;
+    }
+    let LogicalPlan::Projection(projection) = sort.input.as_ref() else {
+        return None;
+    };
+    if projection.expr.is_empty() || projection.expr.len() > 2 {
+        return None;
+    }
+    let column = numeric_topk_column(&projection.expr[0], projection.input.schema().as_ref())?;
+    if projection
+        .expr
+        .iter()
+        .skip(1)
+        .any(|expr| !matches!(expr, Expr::Column(c) if c == column))
+    {
+        return None;
+    }
+    if let Some(final_projection) = final_projection {
+        let Expr::Column(output_column) = &final_projection.expr[0] else {
+            return None;
+        };
+        if output_column.relation.is_some()
+            || output_column.name != output
+            || projection.schema.field(0).name() != &output
+        {
+            return None;
+        }
+    } else if projection.expr.len() != 1 {
+        return None;
+    }
+    let order = numeric_topk_column(&sort.expr[0].expr, projection.schema.as_ref())?;
+    if order != column && !(order.relation.is_none() && order.name == output) {
+        return None;
+    }
+    let LogicalPlan::Filter(filter) = projection.input.as_ref() else {
+        return None;
+    };
+    let Expr::IsNotNull(predicate) = &filter.predicate else {
+        return None;
+    };
+    if numeric_topk_column(predicate, filter.input.schema().as_ref())? != column {
+        return None;
+    }
+    let LogicalPlan::TableScan(scan) = filter.input.as_ref() else {
+        return None;
+    };
+    if !scan.filters.is_empty()
+        || scan.fetch.is_some()
+        || column.relation.as_ref() != Some(&scan.table_name)
+    {
+        return None;
+    }
+    Some(NumericTopKFastPath {
+        table: scan.table_name.table().to_string(),
+        column: column.name.clone(),
+        output,
+        limit,
+        ascending: sort.expr[0].asc,
+    })
+}
+
+async fn try_numeric_topk_records(
+    df: &DataFrame,
+    ice: &siglake_storage::iceberg::IcebergContext,
+    shard: Option<siglake_storage::ScanShard>,
+    cost: &mut CostReport,
+    bindings: &AttrRewriteBindings,
+    resolved: &ResolvedLimits,
+    probe: &mut NumericTopKProbe,
+) -> Result<Option<crate::format::RecordsResponse>, ApiError> {
+    if shard.is_some() {
+        return Ok(None);
+    }
+    let Some(fp) = detect_numeric_topk(df.logical_plan()) else {
+        return Ok(None);
+    };
+    // A typed name alone is not proof. Consume the exact carrier/path/type and
+    // extractor-qualified snapshot captured by the existing rewrite pipeline.
+    let Some(qualified) = bindings.get(&fp.table) else {
+        return Ok(None);
+    };
+    if fp.limit > resolved.max_rows_returned
+        || qualified
+            .snapshot
+            .manifest_rows
+            .is_none_or(|n| n > resolved.max_rows_scanned as u64)
+    {
+        return Ok(None);
+    }
+    let Some(attempt) = ice
+        .qualified_numeric_topk(
+            qualified,
+            &fp.column,
+            fp.limit,
+            fp.ascending,
+            df.task_ctx().memory_pool(),
+            resolved.max_bytes_scanned,
+        )
+        .await
+        .map_err(ApiError::internal)?
+    else {
+        return Ok(None);
+    };
+    let Some(rows) = attempt.result else {
+        *probe = NumericTopKProbe {
+            bytes: attempt.probe_bytes,
+            reads: attempt.probe_reads,
+        };
+        if attempt.probe_bytes != 0 {
+            cost.warnings.push(format!(
+                "numeric_topk metadata fallback: {} bytes in {} reads before the ordinary scan",
+                attempt.probe_bytes, attempt.probe_reads
+            ));
+        }
+        return Ok(None);
+    };
+    let stats = crate::format::ScanStats {
+        rows_scanned: rows.rows_read,
+        bytes_scanned: rows.fetched_bytes,
+        served_by: Some("numeric_topk".into()),
+        scan: Some(Box::new(crate::format::ScanDetail {
+            files_planned: rows.files_planned,
+            files_read: rows.files_read,
+            row_groups_considered: rows.groups_considered,
+            row_groups_read: rows.groups_read,
+            row_groups_pruned_stats: rows.groups_considered - rows.groups_read,
+            object_store_reads: rows.reads,
+            fetched_bytes: rows.fetched_bytes,
+            decoded_bytes: rows.decoded_bytes,
+            bytes_footer: rows.footer_bytes,
+            bytes_data: rows.data_bytes,
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let json = rows
+        .values
+        .into_iter()
+        .map(|v| serde_json::json!({ fp.output.clone(): v }))
+        .collect::<Vec<_>>();
+    Ok(Some(crate::format::RecordsResponse {
+        columns: vec![fp.output],
+        row_count: json.len(),
+        rows: serde_json::Value::Array(json),
+        truncated: false,
+        max_rows: None,
+        cost: Some(cost.clone()),
+        stats: Some(stats),
         approximation: None,
     }))
 }
@@ -11041,6 +11380,7 @@ async fn execute_with_limits(
     buffer_delta_micros: u64,
     residual_fallback: Option<DataFrame>,
     execution_id: siglake_storage::QueryExecutionId,
+    numeric_probe: NumericTopKProbe,
     cancel: Option<siglake_storage::CancelOnDrop>,
     deadline: tokio::time::Instant,
     started: Instant,
@@ -11060,6 +11400,7 @@ async fn execute_with_limits(
                     buffer_delta_micros,
                     residual_fallback,
                     execution_id,
+                    numeric_probe,
                 )
                 .await
             }
@@ -11171,6 +11512,7 @@ fn shard_timeout_error(resolved: &ResolvedLimits) -> ApiError {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn render_records(
     df: DataFrame,
     resolved: &ResolvedLimits,
@@ -11179,6 +11521,7 @@ async fn render_records(
     buffer_delta_micros: u64,
     residual_fallback: Option<DataFrame>,
     execution_id: siglake_storage::QueryExecutionId,
+    numeric_probe: NumericTopKProbe,
 ) -> Result<Response, ApiError> {
     let plan_started = Instant::now();
     // Before `create_physical_plan`, which consumes the DataFrame: execution
@@ -11243,6 +11586,7 @@ async fn render_records(
                         buffer_delta_micros,
                         None,
                         execution_id,
+                        numeric_probe,
                     ))
                     .await;
                 }
@@ -11258,13 +11602,16 @@ async fn render_records(
                 // counters can't isolate one request): attach the same scan
                 // accounting a success response carries.
                 let runtime = crate::midflight::summarize_plan_runtime(&plan);
-                err.context = Some(serde_json::json!({
-                    "cost": cost,
-                    "stats": {
-                        "rows_scanned": runtime.leaf_output_rows,
-                        "scan": scan_detail_from_runtime(&runtime),
-                    },
-                }));
+                let mut stats = crate::format::ScanStats {
+                    rows_scanned: runtime.leaf_output_rows,
+                    bytes_scanned: runtime.bytes_scanned,
+                    spill_bytes: runtime.spilled_bytes,
+                    scan: scan_detail_from_runtime(&runtime),
+                    served_by: Some("scan".into()),
+                    ..Default::default()
+                };
+                numeric_probe.add_to(&mut stats);
+                err.context = Some(serde_json::json!({ "cost": cost, "stats": stats }));
                 if let Some(cache_ctx) = cache_ctx.clone() {
                     finish_result_cache(cache_ctx, CacheEligibility::SQL, None).await;
                 }
@@ -11317,6 +11664,9 @@ async fn render_records(
         // The full SQL plan ran: whatever this cost, it is not a fast path.
         served_by: Some("scan".to_string()),
     });
+    if let Some(stats) = body.stats.as_mut() {
+        numeric_probe.add_to(stats);
+    }
     let status = if body.truncated {
         StatusCode::PAYLOAD_TOO_LARGE
     } else {
@@ -11593,6 +11943,87 @@ mod tests {
         );
         drop(detached_child);
         assert_eq!(used(), 0);
+    }
+
+    #[tokio::test]
+    async fn numeric_topk_matcher_preserves_numeric_cast_and_order_semantics() {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("n", DataType::Int64, true),
+            arrow_schema::Field::new("text", DataType::Utf8, true),
+            arrow_schema::Field::new("fraction", DataType::Float64, true),
+        ]));
+        ctx.register_batch("t", arrow_array::RecordBatch::new_empty(schema))
+            .unwrap();
+        for (expr, order, expected) in [
+            ("n", "n", true),
+            ("CAST(n AS BIGINT)", "CAST(n AS BIGINT)", true),
+            (
+                "CAST(CAST(n AS VARCHAR) AS BIGINT)",
+                "CAST(CAST(n AS VARCHAR) AS BIGINT)",
+                true,
+            ),
+            ("CAST(CAST(n AS VARCHAR) AS BIGINT)", "value", true),
+            ("n", "CAST(n AS VARCHAR)", false),
+            ("CAST(text AS BIGINT)", "CAST(text AS BIGINT)", false),
+            (
+                "CAST(fraction AS BIGINT)",
+                "CAST(fraction AS BIGINT)",
+                false,
+            ),
+            (
+                "TRY_CAST(text AS BIGINT)",
+                "TRY_CAST(text AS BIGINT)",
+                false,
+            ),
+        ] {
+            let sql=format!("SELECT {expr} AS value FROM t WHERE {expr} IS NOT NULL ORDER BY {order} DESC LIMIT 10");
+            let df = ctx.sql(&sql).await.unwrap();
+            assert_eq!(
+                detect_numeric_topk(df.logical_plan()).is_some(),
+                expected,
+                "{sql}: {}",
+                df.logical_plan().display_indent()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_topk_probe_cost_survives_actual_fallback_rendering() {
+        let ctx = SessionContext::new();
+        let df = ctx.sql("SELECT CAST(7 AS BIGINT) AS value").await.unwrap();
+        let resolved = ResolvedLimits::resolve(
+            &RequestLimits::default(),
+            Priority::Interactive,
+            &crate::limits::TierLimits::interactive_defaults(),
+        );
+        let response = render_records(
+            df,
+            &resolved,
+            None,
+            None,
+            0,
+            None,
+            siglake_storage::QueryExecutionId::next(),
+            NumericTopKProbe {
+                bytes: 1234,
+                reads: 3,
+            },
+        )
+        .await
+        .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["rows"], serde_json::json!([{"value":7}]));
+        assert_eq!(body["stats"]["served_by"], "scan");
+        assert_eq!(body["stats"]["rows_scanned"], 0);
+        for key in ["bytes_footer", "fetched_bytes"] {
+            assert_eq!(body["stats"]["scan"][key], 1234);
+        }
+        assert_eq!(body["stats"]["bytes_scanned"], 1234);
+        assert_eq!(body["stats"]["scan"]["object_store_reads"], 3);
     }
 
     #[test]
@@ -13411,6 +13842,58 @@ mod tests {
         maps
     }
 
+    #[tokio::test]
+    async fn attr_rewrite_quotes_exact_physical_identifiers() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        for name in ["Size Metric", "MixedCase", "select", "a\"b"] {
+            let ctx = SessionContext::new();
+            crate::udfs::register_udfs(&ctx);
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("attributes", DataType::Utf8, false),
+                    Field::new(name, DataType::Int64, true),
+                    Field::new("decoy", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec![r#"{"k":"9223372036854775807"}"#])),
+                    Arc::new(Int64Array::from(vec![i64::MAX])),
+                    Arc::new(Int64Array::from(vec![0])),
+                ],
+            )
+            .unwrap();
+            ctx.register_batch("events", batch).unwrap();
+            let maps = HashMap::from([(
+                "events".into(),
+                HashMap::from([(
+                    (
+                        siglake_core::PromotionCarrier::Attributes,
+                        "k".into(),
+                        Vec::new(),
+                    ),
+                    (name.into(), siglake_core::PromotedType::Int64),
+                )]),
+            )]);
+            for carrier in ["attributes", "e.attributes"] {
+                let sql = format!("SELECT CAST(attr_get({carrier}, 'k') AS BIGINT) AS value FROM events e WHERE attr_get({carrier}, 'k') = '9223372036854775807'");
+                let rewritten = rewrite_attr_get_to_columns(&sql, &maps).unwrap();
+                let expected = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+                let actual = ctx.sql(&rewritten).await.unwrap().collect().await.unwrap();
+                assert_eq!(actual, expected, "{name}: {rewritten}");
+                assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+                assert_eq!(
+                    actual[0]
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0),
+                    i64::MAX
+                );
+            }
+        }
+    }
+
     #[test]
     fn raw_carrier_rewrite_requires_exact_carrier_and_preserves_scope() {
         use siglake_core::{PromotedType, PromotionCarrier};
@@ -13433,9 +13916,9 @@ mod tests {
         )]);
         let result = rewrite_attr_get_to_columns("SELECT attr_get(e.raw, 'value'), attr_get(e.attributes, 'value'), attr_get(attr_get(e.raw, 'obj'), 'leaf') FROM events e", &maps).unwrap();
         assert!(
-            result.contains("e.raw_value")
-                && result.contains("e.attr_value")
-                && result.contains("e.raw_leaf"),
+            result.contains("e.\"raw_value\"")
+                && result.contains("e.\"attr_value\"")
+                && result.contains("e.\"raw_leaf\""),
             "{result}"
         );
         assert!(!result.contains("attr_get"), "{result}");
@@ -13512,7 +13995,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            rewritten.contains("metrics_size >= 9007199254740993"),
+            rewritten.contains("\"metrics_size\" >= 9007199254740993"),
             "{rewritten}"
         );
         assert!(!rewritten.contains("CAST"), "{rewritten}");
@@ -13523,7 +14006,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            projected.contains("CAST(metrics_size AS VARCHAR)"),
+            projected.contains("CAST(\"metrics_size\" AS VARCHAR)"),
             "{projected}"
         );
     }
@@ -13538,7 +14021,7 @@ mod tests {
         let rewritten =
             rewrite_attr_get_to_columns(sql, &attr_rewrite_maps(&[("events", "k", "event_k")]))
                 .expect("outer events attr_get rewrites");
-        assert!(rewritten.contains("SELECT event_k AS value FROM events"));
+        assert!(rewritten.contains("SELECT \"event_k\" AS value FROM events"));
         assert!(rewritten.contains("EXISTS (SELECT 1 FROM idx)"));
     }
 
@@ -13572,7 +14055,7 @@ mod tests {
         assert!(
             rewritten
                 .sql
-                .contains("SELECT event_k AS value FROM events"),
+                .contains("SELECT \"event_k\" AS value FROM events"),
             "{}",
             rewritten.sql
         );
@@ -13858,7 +14341,7 @@ mod tests {
         let rewritten =
             rewrite_attr_get_to_columns(sql, &attr_rewrite_maps(&[("events", "k", "event_k")]))
                 .expect("the gated events table rewrites");
-        assert!(rewritten.contains("e.event_k"), "{rewritten}");
+        assert!(rewritten.contains("e.\"event_k\""), "{rewritten}");
         assert!(
             rewritten.contains("attr_get(i.attributes, 'k')"),
             "ungated idx expression changed: {rewritten}"
@@ -13882,7 +14365,7 @@ mod tests {
             &maps,
         )
         .expect("the alias proves idx owns the qualified column");
-        assert!(aliased.contains("events.idx_k"), "{aliased}");
+        assert!(aliased.contains("events.\"idx_k\""), "{aliased}");
         assert!(!aliased.contains("event_k"), "alias shadow lost: {aliased}");
 
         assert!(
@@ -18219,12 +18702,13 @@ async fn distributed_inner(
     let effective_query = match pre_rewritten_query {
         Some(query) => query,
         None => {
-            apply_query_rewrites(
+            apply_query_rewrites_for_serving(
                 &ice,
                 &req.query,
                 req.default_order,
                 req.priority,
                 resolved.max_rows_returned,
+                state.wal_buffer_dir.is_some(),
             )
             .await?
         }

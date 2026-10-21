@@ -21,6 +21,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ramp opens first no longer varies run to run — but that fixes the spread,
   not the level: the same retained runs took 379–508 ms whenever the file they
   opened had to be read. No matched round has been run against the ceilings.
+- **The numeric TopK route is unmeasured.** Snapshot-qualified value-only Int64
+  `ORDER BY … LIMIT` reads can prune row groups by exact Parquet bounds
+  (#6978), and the focused suite proves the route is taken and the answers are
+  exact, including NULL, ties and signed extremes. No timing exists: nothing
+  compares it against the ordinary scan on one image and one snapshot, so the
+  retained Big5 numbers it targets stay historical cross-system observations.
+  The qualification protocol is in
+  [`DESIGN_numeric_topk.md`](DESIGN_numeric_topk.md) and `SIGLAKE_NUMERIC_TOPK=0`
+  turns the route off at process startup.
 - **The persistent ingest lane cap has no timed reclamation.** Once
   `ingester.maxLanes` admits a `(tenant, index)` lane, an empty queue does not
   release its slot; only process shutdown drains the map. A novel key past the

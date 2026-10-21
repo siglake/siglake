@@ -675,6 +675,13 @@ reclustering completes (`docs/DESIGN_time_ordered_storage.md`).
   (`siglake-g<N>-…`), so compaction policy is computable from the manifest
   alone — nothing lifecycle-like is persisted that could disagree with policy.
 
+Snapshot-qualified, value-only Int64 TopK can use exact Parquet bounds to avoid
+decoding irrelevant row groups without claiming physical numeric ordering. It
+retains ordinary fallback for unsupported shapes, WAL and distributed routes;
+`SIGLAKE_NUMERIC_TOPK=0` disables it at process startup. Its provenance, budgets
+and remaining performance qualification are described in
+[DESIGN_numeric_topk.md](DESIGN_numeric_topk.md).
+
 Parquet-native per-column blooms are an opt-in, write-only knob:
 `SIGLAKE_PARQUET_NATIVE_BLOOMS=on`. They have been off by default since
 2026-08-06 because time-sorted files spread every tag value across every row
