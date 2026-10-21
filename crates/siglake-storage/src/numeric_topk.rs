@@ -24,7 +24,9 @@ use parquet::file::statistics::Statistics;
 /// chunk, Arrow batches and the bounded heap. Refusal leaves the normal plan.
 pub const RESERVATION_BYTES: usize = 128 * 1024 * 1024;
 const MAX_FOOTER_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SINGLE_FOOTER_BYTES: usize = 256 * 1024;
+// The canonical Big5 snapshot has serialized footers up to 498,994 bytes.
+// Keep aggregate and decoded metadata bounds independent of this per-file cap.
+const MAX_SINGLE_FOOTER_BYTES: usize = 512 * 1024;
 const MAX_RETAINED_METADATA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CHUNK_BYTES: i64 = 32 * 1024 * 1024;
 const MAX_GROUPS: usize = 4096;
@@ -430,6 +432,141 @@ mod tests {
             rows.len() as u64,
             std::fs::metadata(&path).unwrap().len(),
         )
+    }
+
+    fn write_sized_footer(dir: &std::path::Path, name: &str, target: usize) -> (String, u64, u64) {
+        use parquet::file::metadata::KeyValue;
+        let path = dir.join(name);
+        let rows = vec![Some(i64::MIN), None, Some(7), Some(7), Some(i64::MAX)];
+        let field = Field::new("value", DataType::Int64, true)
+            .with_metadata([("PARQUET:field_id".to_string(), "42".to_string())].into());
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(rows.clone())) as ArrayRef],
+        )
+        .unwrap();
+        let mut padding = target;
+        for _ in 0..4 {
+            let props = WriterProperties::builder()
+                .set_max_row_group_row_count(Some(3))
+                .set_statistics_enabled(EnabledStatistics::Chunk)
+                .set_key_value_metadata(Some(vec![KeyValue::new(
+                    "footer-bound-regression".into(),
+                    Some("x".repeat(padding)),
+                )]))
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(&path).unwrap(),
+                schema.clone(),
+                Some(props),
+            )
+            .unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let actual =
+                u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                    as usize;
+            if actual == target {
+                return (
+                    path.to_string_lossy().into_owned(),
+                    rows.len() as u64,
+                    bytes.len() as u64,
+                );
+            }
+            padding = padding
+                .checked_add(target)
+                .unwrap()
+                .checked_sub(actual)
+                .unwrap();
+        }
+        panic!("failed to construct exact persisted footer length");
+    }
+
+    #[tokio::test]
+    async fn numeric_topk_canonical_sized_footer_and_single_boundary_preserve_exact_values() {
+        let dir = tempfile::tempdir().unwrap();
+        // Actual frozen 32-file Big5 maximum, and the inclusive new boundary.
+        // Padding models non-target metadata; all returned values still come
+        // from real persisted data pages with NULLs, ties and signed extrema.
+        for bytes in [498_994, 512 * 1024] {
+            let path = write_sized_footer(dir.path(), &format!("{bytes}.parquet"), bytes);
+            for ascending in [true, false] {
+                for k in [1, 2, 20] {
+                    let memory = pool(RESERVATION_BYTES);
+                    let result = read(
+                        &io(),
+                        std::slice::from_ref(&path),
+                        "value",
+                        42,
+                        k,
+                        ascending,
+                        &memory,
+                    )
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                    let mut expected = vec![i64::MIN, 7, 7, i64::MAX];
+                    if !ascending {
+                        expected.reverse();
+                    }
+                    expected.truncate(k);
+                    assert_eq!(result.values, expected);
+                    assert!(result.data_bytes > 0);
+                    assert_eq!(memory.reserved(), 0);
+                }
+            }
+        }
+        let large = write_sized_footer(dir.path(), "over.parquet", 512 * 1024 + 1);
+        let metrics = ScanMetrics::default();
+        let memory = pool(RESERVATION_BYTES);
+        assert!(read_inner(
+            &io(),
+            &[large],
+            "value",
+            42,
+            1,
+            true,
+            &memory,
+            &metrics,
+            MAX_RETAINED_METADATA_BYTES
+        )
+        .await
+        .unwrap()
+        .is_none());
+        assert_eq!(metrics.scan_counters().bytes_data.load(Relaxed), 0);
+        assert_eq!(memory.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn numeric_topk_canonical_sized_footers_still_refuse_aggregate_overflow_before_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = (0..17)
+            .map(|i| write_sized_footer(dir.path(), &format!("{i}.parquet"), 498_994))
+            .collect::<Vec<_>>();
+        assert!((paths.len() - 1) * 498_994 < 8 * 1024 * 1024);
+        assert!(paths.len() * 498_994 > 8 * 1024 * 1024);
+        let memory = pool(RESERVATION_BYTES);
+        let metrics = ScanMetrics::default();
+        let result = read_inner(
+            &io(),
+            &paths,
+            "value",
+            42,
+            1,
+            true,
+            &memory,
+            &metrics,
+            MAX_RETAINED_METADATA_BYTES,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert!(metrics.bytes_read() > 16 * 498_994);
+        assert_eq!(metrics.scan_counters().bytes_data.load(Relaxed), 0);
+        assert_eq!(memory.reserved(), 0);
     }
 
     #[tokio::test]

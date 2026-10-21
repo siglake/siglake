@@ -77,6 +77,185 @@ async fn fixture_with_promotion(
 }
 const VALUE: &str = "CAST(attr_get(attributes, 'metrics.size') AS BIGINT)";
 
+// Replace files only through a catalog transaction, using new immutable paths.
+// Keep every row, Arrow field ID and original footer property. The unrelated
+// metadata padding recreates the canonical footer size without a large dataset.
+async fn replace_with_sized_footers(ice: &IcebergContext, target: usize) {
+    use iceberg::{
+        spec::DataFileBuilder,
+        transaction::{ApplyTransactionAction, Transaction},
+    };
+    use parquet::{
+        arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter},
+        file::{
+            metadata::KeyValue,
+            properties::{EnabledStatistics, WriterProperties},
+        },
+    };
+    let ident = ice.events_table_ident();
+    let table = ice.catalog().load_table(ident).await.unwrap();
+    let old_files = ice.live_data_files(ident).await.unwrap();
+    let mut new_files = Vec::new();
+    for old in &old_files {
+        let source = old
+            .file_path()
+            .strip_prefix("file://")
+            .unwrap_or(old.file_path());
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(source).unwrap()).unwrap();
+        let schema = reader.schema().clone();
+        let kv = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .cloned()
+            .unwrap_or_default();
+        let batches = reader
+            .build()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let path = std::path::Path::new(source).with_extension("footer-sized.parquet");
+        let mut padding = target;
+        let mut actual = 0;
+        for _ in 0..4 {
+            let mut properties = kv.clone();
+            properties.push(KeyValue::new(
+                "footer-bound-regression".into(),
+                Some("x".repeat(padding)),
+            ));
+            let properties = WriterProperties::builder()
+                .set_statistics_enabled(EnabledStatistics::Chunk)
+                .set_key_value_metadata(Some(properties))
+                .build();
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(&path).unwrap(),
+                schema.clone(),
+                Some(properties),
+            )
+            .unwrap();
+            for batch in &batches {
+                writer.write(batch).unwrap();
+            }
+            writer.close().unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            actual = u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                as usize;
+            if actual == target {
+                break;
+            }
+            padding = padding
+                .checked_add(target)
+                .unwrap()
+                .checked_sub(actual)
+                .unwrap();
+        }
+        assert_eq!(actual, target);
+        // Column bounds/counts are unchanged. Derive encoded column sizes
+        // from the new file, so qualification uses genuine manifest evidence.
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap()).unwrap();
+        let metadata = reader.metadata();
+        let column_sizes = metadata
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                let id = column.self_type().get_basic_info().id();
+                let size = metadata
+                    .row_groups()
+                    .iter()
+                    .map(|group| u64::try_from(group.column(index).compressed_size()).unwrap())
+                    .sum();
+                (id, size)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(old.content_type())
+            .file_path(path.to_string_lossy().into_owned())
+            .file_format(old.file_format())
+            .partition(old.partition().clone())
+            .record_count(old.record_count())
+            .file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .column_sizes(column_sizes)
+            .value_counts(old.value_counts().clone())
+            .null_value_counts(old.null_value_counts().clone())
+            .nan_value_counts(old.nan_value_counts().clone())
+            .lower_bounds(old.lower_bounds().clone())
+            .upper_bounds(old.upper_bounds().clone())
+            .key_metadata(old.key_metadata().map(<[u8]>::to_vec));
+        if let Some(sort_order) = old.sort_order_id() {
+            builder.sort_order_id(sort_order);
+        }
+        new_files.push(builder.build().unwrap());
+    }
+    let tx = Transaction::new(&table);
+    tx.rewrite_files()
+        .delete_files(old_files)
+        .add_data_files(new_files)
+        .apply(tx)
+        .unwrap()
+        .commit(ice.catalog().as_ref())
+        .await
+        .unwrap();
+    ice.invalidate_cached_table(ident).await;
+}
+
+#[tokio::test]
+async fn numeric_topk_http_canonical_sized_footer_routes_and_over_cap_falls_back_exactly() {
+    for (footer_bytes, expected_route) in [(498_994, "numeric_topk"), (512 * 1024 + 1, "fallback")]
+    {
+        let (_dir, ice, _app) = fixture().await;
+        replace_with_sized_footers(&ice, footer_bytes).await;
+        // Require the same captured promotion binding as a real served query.
+        assert!(ice
+            .qualified_attr_rewrite_for(ice.events_table_ident())
+            .await
+            .unwrap()
+            .is_some());
+        let app = router(AppState::new(ice, AuthConfig::open()));
+        for direction in ["ASC", "DESC"] {
+            let sql = format!("SELECT {VALUE} AS value FROM events WHERE {VALUE} IS NOT NULL ORDER BY {VALUE} {direction} LIMIT 20");
+            let (status, bytes) = request(&app, json!({"query":sql,"format":"records"})).await;
+            let records: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::OK, "{records}");
+            if expected_route == "numeric_topk" {
+                assert_eq!(records["stats"]["served_by"], expected_route, "{records}");
+            } else {
+                assert_ne!(records["stats"]["served_by"], "numeric_topk", "{records}");
+            }
+            let (status, bytes) = request(&app, json!({"query":sql,"format":"ndjson"})).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let rows = String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .filter(|row| row.get("value").is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(records["rows"], json!(rows));
+            let mut values = vec![i64::MIN, 5, 7, 7, 8, i64::MAX, i64::MAX];
+            if direction == "DESC" {
+                values.reverse();
+            }
+            assert_eq!(
+                records["rows"],
+                json!(values
+                    .into_iter()
+                    .map(|value| json!({"value":value}))
+                    .collect::<Vec<_>>())
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn numeric_topk_http_registered_sql_matches_generic_ndjson_and_prunes() {
     let (_dir, _ice, app) = fixture().await;
