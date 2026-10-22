@@ -13106,6 +13106,8 @@ pub struct IcebergContext {
     /// only). Shared via `Arc` so per-tenant clones reuse it (the keyspace is file
     /// paths, globally unique).
     footer_cache: Arc<std::sync::Mutex<FooterCache>>,
+    /// Decoded Parquet footers reused by the numeric TopK route across requests.
+    numeric_topk_metadata: Arc<crate::numeric_topk::MetadataCache>,
     /// Phase 2 — snapshot-keyed unwindowed group-count aggregate cache, keyed by
     /// `(table, snapshot_id, column)`. Invalidated on commit via
     /// `invalidate_cached_table`. Shared via `Arc`.
@@ -13392,7 +13394,7 @@ impl FooterCache {
     fn new(cap: usize) -> Self {
         Self {
             // Hot path for every windowed aggregate, so the largest share.
-            group_counts: LruMap::with_limits(cap, cache_budget(0.30), "footer_group_counts"),
+            group_counts: LruMap::with_limits(cap, cache_budget(0.27), "footer_group_counts"),
             grouped_numeric: LruMap::with_limits(cap, cache_budget(0.05), "footer_grouped_numeric"),
             time_buckets: LruMap::with_limits(cap, cache_budget(0.05), "footer_time_buckets"),
         }
@@ -13478,7 +13480,7 @@ fn snapshot_agg_cache_cap() -> usize {
 /// APPROXIMATE on purpose: it counts the heap a value owns (allocations and
 /// their contents) and ignores allocator overhead and padding. Exactness is not
 /// what makes the difference between 4 MB and 4 GB legible.
-trait ApproxHeapBytes {
+pub(crate) trait ApproxHeapBytes {
     fn approx_heap_bytes(&self) -> usize;
 }
 
@@ -13649,7 +13651,7 @@ impl ApproxHeapBytes for FileScanTask {
 }
 
 #[derive(Debug)]
-struct LruMap<K, V> {
+pub(crate) struct LruMap<K, V> {
     cap: usize,
     /// Byte budget for the VALUES. `usize::MAX` = entry-capped only.
     ///
@@ -13670,14 +13672,14 @@ struct LruMap<K, V> {
 
 impl<K: std::hash::Hash + Eq + Clone, V: Clone + ApproxHeapBytes> LruMap<K, V> {
     /// Approximate heap bytes held by the cached VALUES.
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         self.bytes
     }
 
     /// Entry cap AND byte budget. `label` names the cache on its eviction
     /// counter, so a cache thrashing against its budget is visible rather than
     /// merely slow.
-    fn with_limits(cap: usize, max_bytes: usize, label: &'static str) -> Self {
+    pub(crate) fn with_limits(cap: usize, max_bytes: usize, label: &'static str) -> Self {
         Self {
             cap: cap.max(1),
             max_bytes,
@@ -13692,7 +13694,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone + ApproxHeapBytes> LruMap<K, V> {
         Self::with_limits(cap, usize::MAX, "unnamed")
     }
 
-    fn get(&mut self, key: &K) -> Option<V> {
+    pub(crate) fn get(&mut self, key: &K) -> Option<V> {
         self.tick += 1;
         let tick = self.tick;
         let entry = self.map.get_mut(key)?;
@@ -13713,7 +13715,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone + ApproxHeapBytes> LruMap<K, V> {
         });
     }
 
-    fn put(&mut self, key: K, value: V) {
+    pub(crate) fn put(&mut self, key: K, value: V) {
         self.tick += 1;
         let tick = self.tick;
         let value_bytes = value.approx_heap_bytes();
@@ -14475,6 +14477,7 @@ impl IcebergContext {
             table_cache_epochs: self.table_cache_epochs.clone(),
             scan_cost_cache: self.scan_cost_cache.clone(),
             footer_cache: self.footer_cache.clone(),
+            numeric_topk_metadata: self.numeric_topk_metadata.clone(),
             snapshot_agg_cache: self.snapshot_agg_cache.clone(),
             agg_result_cache: self.agg_result_cache.clone(),
             side_agg_lock: self.side_agg_lock.clone(),
@@ -14556,6 +14559,12 @@ impl IcebergContext {
                 "scan_cost",
             ))),
             footer_cache: Arc::new(std::sync::Mutex::new(FooterCache::new(footer_cache_cap()))),
+            // Per-file DECODED footers for the numeric TopK route, sized by the
+            // same derived metadata budget as its sibling footer caches.
+            numeric_topk_metadata: Arc::new(crate::numeric_topk::MetadataCache::with_limits(
+                footer_cache_cap(),
+                cache_budget(0.03),
+            )),
             // A whole column's group-count map per entry; 256 of them at 1TB
             // is GB-scale unbounded.
             snapshot_agg_cache: Arc::new(std::sync::Mutex::new(LruMap::with_limits(
@@ -27754,6 +27763,7 @@ impl IcebergContext {
             limit,
             ascending,
             pool,
+            &self.numeric_topk_metadata,
         )
         .await
         .map(Some)
@@ -35812,7 +35822,9 @@ mod cache_byte_bound_tests {
              cached just because it can"
         );
         // The shares must not over-commit the budget they divide.
-        let total: f64 = [0.35, 0.05, 0.15, 0.05, 0.20, 0.18, 0.02].iter().sum();
+        let total: f64 = [0.27, 0.05, 0.05, 0.15, 0.05, 0.20, 0.18, 0.02, 0.03]
+            .iter()
+            .sum();
         assert!(
             total <= 1.0 + f64::EPSILON,
             "cache shares sum to {total}, over-committing the budget"

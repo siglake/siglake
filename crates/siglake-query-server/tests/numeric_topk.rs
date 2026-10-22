@@ -7,7 +7,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use siglake_core::{Event, PromotedColumn, PromotedType};
-use siglake_query_server::{router, AppState, AuthConfig};
+use siglake_query_server::{reset_result_cache_for_test, router, AppState, AuthConfig};
 use siglake_storage::iceberg::IcebergContext;
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -253,6 +253,71 @@ async fn numeric_topk_http_canonical_sized_footer_routes_and_over_cap_falls_back
                     .collect::<Vec<_>>())
             );
         }
+    }
+}
+
+fn scan_counter(body: &Value, name: &str) -> u64 {
+    body["stats"]["scan"][name].as_u64().unwrap_or(0)
+}
+
+/// #7099: a repeat of the UNCHANGED registered SQL on the same immutable
+/// snapshot must answer identically through the same route, and must stop
+/// re-reading the footers it already parsed. The cold and warm responses are
+/// kept apart on purpose — this is a local source comparison on a small real
+/// Parquet fixture, not a field measurement of either.
+#[tokio::test]
+async fn numeric_topk_repeat_request_reuses_footers_and_repeats_the_answer() {
+    let (_dir, _ice, app) = fixture().await;
+    // ASC first against an empty footer cache, then DESC — a different query
+    // over the SAME objects, which must already find their footers decoded.
+    for (direction, first_is_cold) in [("ASC", true), ("DESC", false)] {
+        let sql = format!(
+            "SELECT {VALUE} AS value FROM events WHERE {VALUE} IS NOT NULL \
+             ORDER BY {VALUE} {direction} LIMIT 3"
+        );
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            // The whole-result cache would replay the first response verbatim,
+            // stats included, and prove nothing about the footer path. Clearing
+            // it keeps the SQL unchanged and still re-executes the route — the
+            // same thing the qualification protocol does with the cache off.
+            reset_result_cache_for_test().await;
+            let (status, bytes) = request(&app, json!({"query":sql,"format":"records"})).await;
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["stats"]["served_by"], "numeric_topk", "{body}");
+            responses.push(body);
+        }
+        let cold = &responses[0];
+        if !first_is_cold {
+            for reused in &responses {
+                assert_eq!(scan_counter(reused, "bytes_footer"), 0, "{reused}");
+                assert_eq!(reused["rows"], responses[0]["rows"]);
+            }
+            continue;
+        }
+        for warm in &responses[1..] {
+            assert_eq!(warm["rows"], cold["rows"], "{warm}");
+            assert_eq!(
+                warm["stats"]["scan"]["files_read"],
+                cold["stats"]["scan"]["files_read"]
+            );
+            assert_eq!(
+                warm["stats"]["scan"]["row_groups_read"],
+                cold["stats"]["scan"]["row_groups_read"]
+            );
+            // A zero counter is omitted from the body, so absent reads as zero.
+            assert_eq!(
+                scan_counter(warm, "bytes_footer"),
+                0,
+                "a reused footer must not claim bytes it never read: {warm}"
+            );
+            assert!(
+                scan_counter(warm, "object_store_reads") < scan_counter(cold, "object_store_reads"),
+                "{warm}"
+            );
+        }
+        assert!(scan_counter(cold, "bytes_footer") > 0, "{cold}");
     }
 }
 

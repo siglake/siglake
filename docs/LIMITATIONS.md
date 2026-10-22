@@ -21,13 +21,22 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ramp opens first no longer varies run to run — but that fixes the spread,
   not the level: the same retained runs took 379–508 ms whenever the file they
   opened had to be read. No matched round has been run against the ceilings.
-- **The numeric TopK route is unmeasured.** Snapshot-qualified value-only Int64
-  `ORDER BY … LIMIT` reads can prune row groups by exact Parquet bounds
-  (#6978), and the focused suite proves the route is taken and the answers are
-  exact, including NULL, ties and signed extremes. No timing exists: nothing
-  compares it against the ordinary scan on one image and one snapshot, so the
-  retained Big5 numbers it targets stay historical cross-system observations.
-  The qualification protocol is in
+- **The numeric TopK route's footer reuse is unmeasured in the field.**
+  Snapshot-qualified value-only Int64 `ORDER BY … LIMIT` reads prune row groups
+  by exact Parquet bounds (#6978), and the matched #7076 round measured that on
+  the canonical snapshot: 2 and 6 decoded row groups of 319, warm medians 453
+  and 522 ms, all 32 files still footer-opened. #7099 narrows the footer decode
+  and retains decoded footers across requests, which on a bounded local fixture
+  of the same metadata shape takes a repeat from 68 ms to 1.7 ms with no footer
+  reads. That is a debug-build local source measurement; no round has yet
+  measured it on one image and one snapshot, so the retained Big5 numbers it
+  targets stay historical cross-system observations. On a small query pod the
+  reuse may not help: the cache takes 3% of a metadata-cache budget that floors
+  at 64 MiB, so a 2 GiB pod gives it about 2 MiB, and a canonical 32-file
+  snapshot's decoded footers do not fit. Eviction is counted on
+  `siglake_cache_evictions_total{cache="numeric_topk_metadata"}`. A snapshot
+  whose files place the target column at different leaf ordinals is refused and
+  takes the ordinary plan. The qualification protocol is in
   [`DESIGN_numeric_topk.md`](DESIGN_numeric_topk.md) and `SIGLAKE_NUMERIC_TOPK=0`
   turns the route off at process startup.
 - **The persistent ingest lane cap has no timed reclamation.** Once
