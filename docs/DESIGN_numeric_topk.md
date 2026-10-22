@@ -32,6 +32,34 @@ WAL projection values into NULL; it does not broaden existing bounded WAL filter
 or carrier admission. Some complex buffered queries therefore still intentionally
 serve the committed snapshot, exactly as the existing residual route does.
 
+Footer decoding is narrowed to what the route reads: page-encoding and size
+statistics are skipped for every column, and once a file in an attempt proves
+the target leaf's ordinal, later files decode column statistics for that ordinal
+alone. This weakens no check — a skipped statistic is absent, and absent
+statistics already refuse. A file that places the target column at a different
+ordinal is refused (`column_position`) rather than read against a neighbour's
+bounds; heterogeneous column orders within one snapshot therefore take the
+ordinary plan.
+
+Decoded footers are retained across requests in a bounded LRU keyed by
+`(object path, manifest length, statistics scope)`. An entry is admitted only
+after the physical object length matched the manifest length that keys it, and
+siglake data objects are immutable and UUID-named, so an entry is a pure
+function of its key. Nothing is keyed by table or column name and nothing
+expires on time: a new snapshot's new files miss, retained files hit. The
+statistics scope is part of the key because a narrowed entry carries one leaf's
+bounds and must never answer for another column. Every per-request check — row
+counts, field id, column path, Int64 type, exact min/max/null counts, chunk and
+group budgets, and the serialized-footer budget — runs against the reused
+metadata, so reuse saves the parse and never a check. A reused footer issues no
+read and reports no footer bytes. The cache takes 0.03 of the derived
+metadata-cache budget, which `footer_group_counts` gives up (0.30 → 0.27); the
+shares still sum to 1.0. Under byte or entry pressure it evicts, counted on the
+existing `siglake_cache_evictions_total{cache="numeric_topk_metadata"}` and
+`siglake_cache_admission_refused_total{cache="numeric_topk_metadata"}` series —
+the signal an operator reads when a small pod sees no repeat improvement. No new
+metric name is introduced.
+
 All row-group metadata is validated before any value decoding. The candidate
 requires the exact physical field ID/type, exact Int64 min/max and null counts.
 It schedules groups by their best possible numeric bound and keeps at most K
@@ -63,8 +91,11 @@ byte breaker.
 
 `served_by: numeric_topk` identifies the route. Rows and decoded bytes come from
 actual batches; footer/data/fetched bytes and read counts come from actual reader
-outcomes. `files_read` includes footer-opened files, even where data groups are
-pruned. Group pruning includes all-null groups. A metadata refusal returns no
+outcomes. `files_read` counts every file the attempt validated — including files
+whose data groups are pruned, and files whose footer was reused rather than
+opened. Physical work is `object_store_reads`, `bytes_footer` and `bytes_data`,
+all of which a reused footer leaves at zero. Group pruning includes all-null
+groups. A metadata refusal returns no
 partial output and runs the original plan once; its probe bytes/reads are added
 to the fallback Records statistics and its cost warnings, including row-breaker
 errors. Debug diagnostics record the bounded refusal reason and the probe bytes
@@ -111,3 +142,55 @@ boundary and its one-byte overflow, plus cumulative footer overflow before data
 reads. This is admission compatibility, not a performance result or a production
 RSS guarantee. Exact original ASC/DESC SQL must still prove the numeric route
 on the restored catalog/snapshot/current provenance before field timing.
+
+### Repeated metadata work on warm requests (#7099)
+
+The matched #7076 field result is the starting point, not the original
+full-scan diagnosis: on the canonical snapshot the route already pruned to
+2 (ASC) and 6 (DESC) decoded row groups of 319, and warm medians were still
+453.06 ms and 521.74 ms. All 32 files stayed footer-opened and cold footer
+bytes were 12,800,919, with warm footer counters absent in the body.
+
+A local `#[ignore]`d measurement
+(`numeric_topk_repeat_request_metadata_cost_measurement`) builds a bounded
+32-file fixture matched to that metadata shape — 8,285,216 serialized footer
+bytes and 12,379,712 decoded, against the canonical 8,296,285 / 10,985,491 —
+over a trivial amount of data, so per-request metadata work is separated from
+decode work. Measured in a debug build on a local filesystem, steady state over
+six attempts:
+
+| | repeat ms | object-store reads | footer bytes |
+|---|---:|---:|---:|
+| before this change | 68.4 | 98 | 16,777,472 |
+| narrowed decode only | 56.3 | 98 | 16,777,472 |
+| narrowed decode + retained footers | 1.70 | 2 | 0 |
+
+The first two rows were taken from the pre-change and intermediate binaries in
+the same session on the same fixture; the third is the committed code, and the
+`reuse=off` series of the retained test reproduces the second row at 59.2 ms
+(it reads footer bytes through the page cache rather than the process byte-range
+cache, which costs about 2.5 ms). A phase breakdown attributes the repeat almost
+entirely to the footer decode: 0.07 ms to open the 32 objects and read their
+lengths, 51.1 ms to fetch and decode their footers, 1.4 ms to measure retained
+metadata and 3.5 ms to derive the Arrow schema. Retained decoded metadata for the
+whole 32-file fixture is 8,094,944 bytes.
+
+These are local source measurements in a debug build on one filesystem. They are
+not field timing, not an AWS acceptance, and not a claim about the canonical
+snapshot's warm medians; the local ratio also overstates the S3 case, where the
+32 uncached object-length requests this change removes cost more than 0.07 ms and
+the decode is one term among several.
+
+The next matched qualification is the existing #7076 protocol, unchanged, with
+one addition. Same immutable image and snapshot, result caches off, original
+f48e35f6 harness/SQL and seed, 58 GiB query container, three cold samples with
+five warm responses each per canonical ASC/DESC shape. Record, per warm response,
+`stats.scan.bytes_footer`, `object_store_reads` and `files_read` alongside the
+median: the claim this change makes is that a warm response reads no footers,
+and a warm `bytes_footer` that is present and nonzero refutes it regardless of
+timing. Report the query pod's `siglake_cache_evictions_total` and
+`siglake_cache_admission_refused_total` for
+`cache="numeric_topk_metadata"`; both must be zero for a 32-file snapshot on a
+58 GiB container, and a nonzero count means the retained footers did not fit and
+the timing is measuring eviction. Exact answers must still match the independently
+accepted original full-source oracle.
