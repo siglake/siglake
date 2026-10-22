@@ -162,30 +162,23 @@ pub async fn estimate(df: &DataFrame, ice: &Arc<IcebergContext>) -> anyhow::Resu
     // Same shape as the 2026-07-11 finding where the distribution gate knew
     // `events` and not user indexes.
     //
-    // Resolved LAZILY: a query touching only built-ins pays nothing for this.
-    let mut index_time_columns: Option<std::collections::HashMap<String, String>> = None;
     let mut had_known_scan = false;
     for table in &scanned {
         let time_col = if is_siglake_table(table) {
             Some("timestamp".to_string())
         } else {
-            match &index_time_columns {
-                Some(columns) => columns.get(table).cloned(),
-                None => {
-                    let columns: std::collections::HashMap<String, String> =
-                        match ice.list_indexes().await {
-                            Ok(cfgs) => cfgs
-                                .into_iter()
-                                .map(|c| (c.index_id, c.doc_mapping.timestamp_field))
-                                .collect(),
-                            Err(e) => {
-                                tracing::debug!(error = %e, "cost: list_indexes failed");
-                                Default::default()
-                            }
-                        };
-                    let time_col = columns.get(table).cloned();
-                    index_time_columns = Some(columns);
-                    time_col
+            // Registration has already loaded each referenced table through the
+            // bounded-staleness metadata cache. Reuse that same entry instead of
+            // `list_indexes()`, which enumerates the namespace and performs an
+            // uncached `load_table` for every managed index on every estimate.
+            // The fresh catalog-row check inside this accessor still prevents a
+            // dropped index from resolving through stale cache.
+            match ice.cached_index_config(table).await {
+                Ok(Some(config)) => Some(config.doc_mapping.timestamp_field),
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::debug!(table, error = %e, "cost: cached index config failed");
+                    None
                 }
             }
         };
@@ -1268,6 +1261,27 @@ mod user_index_cost_tests {
     use siglake_core::index_config::IndexConfig;
     use siglake_core::Event;
 
+    fn strip_table_metadata(warehouse: &std::path::Path, index_id: &str) -> usize {
+        let mut removed = 0;
+        for namespace in std::fs::read_dir(warehouse).unwrap() {
+            let metadata = namespace.unwrap().path().join(index_id).join("metadata");
+            let Ok(entries) = std::fs::read_dir(metadata) else {
+                continue;
+            };
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    std::fs::remove_file(path).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     /// A query against a MANAGED INDEX must be priced like one against
     /// `events`. `is_siglake_table` listed only built-ins, so a user
     /// index matched nothing and the whole report came back
@@ -1340,6 +1354,69 @@ mod user_index_cost_tests {
         assert_eq!(
             future_cost.estimated_rows_processed, 0,
             "the managed index timestamp field did not prune future rows: {future_cost:?}"
+        );
+    }
+
+    /// A repeated cost estimate for one managed index must reuse the metadata
+    /// registration already loaded. The former `list_indexes()` lookup reloaded
+    /// every table's metadata, so even this one-table query became a zero-byte,
+    /// inexact estimate when metadata storage was unavailable after warm-up.
+    #[tokio::test]
+    async fn a_warm_managed_index_estimate_does_not_reload_table_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let warehouse = tmp.path().join("warehouse");
+        let ice = Arc::new(
+            IcebergContext::open(&warehouse)
+                .await
+                .unwrap()
+                .with_table_cache_ttl(std::time::Duration::from_secs(3600)),
+        );
+        let config = IndexConfig {
+            index_id: "candidates".into(),
+            ..IndexConfig::builtin_events()
+        };
+        ice.create_index(&config).await.unwrap();
+        let ident = ice.index_table_ident("candidates");
+        let batch = siglake_core::events_to_record_batch(&[
+            Event::now("queen one"),
+            Event::now("queen two"),
+        ])
+        .unwrap();
+        let mapped = siglake_core::mapping::map_carrier_batch(&batch, &config).unwrap();
+        ice.append_to_table(&ident, mapped, &[]).await.unwrap();
+
+        let ctx = SessionContext::new();
+        assert!(ice
+            .register_index_with_datafusion(&ctx, "candidates")
+            .await
+            .unwrap());
+        let df = ctx
+            .sql("SELECT raw FROM candidates WHERE raw LIKE '%queen%' LIMIT 1")
+            .await
+            .unwrap();
+        let warm = estimate(&df, &ice).await.unwrap();
+        assert!(warm.exact && warm.estimated_rows_processed == 2, "{warm:?}");
+
+        let removed = strip_table_metadata(&warehouse, "candidates");
+        assert!(removed > 0, "the fixture removed no metadata.json files");
+        assert!(
+            ice.get_index("candidates").await.is_err(),
+            "the uncached control did not reach metadata storage"
+        );
+
+        let repeated = estimate(&df, &ice).await.unwrap();
+        assert_eq!(repeated.files_to_scan, warm.files_to_scan);
+        assert_eq!(
+            repeated.estimated_bytes_scanned,
+            warm.estimated_bytes_scanned
+        );
+        assert_eq!(
+            repeated.estimated_rows_processed,
+            warm.estimated_rows_processed
+        );
+        assert!(
+            repeated.exact,
+            "the warm exact estimate degraded: {repeated:?}"
         );
     }
 

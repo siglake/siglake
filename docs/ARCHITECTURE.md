@@ -1687,8 +1687,10 @@ request. Mapping-dependent query preparation follows the same policy: the
 `search()` rewrite reads `default_search_fields` and Jaeger validates its trace
 columns from the cached table entry. Mapping commits invalidate that entry;
 the fresh catalog-row check keeps a dropped index from resolving through an
-old cache entry. UUID and incarnation-sensitive maintenance reads remain
-uncached. A worker
+old cache entry. Query cost estimation also reads only the referenced indexes'
+event-time fields from these entries; it does not enumerate and reload every
+managed index before using the snapshot-keyed scan-cost cache. UUID and
+incarnation-sensitive maintenance reads remain uncached. A worker
 fragment carries the same one-budget-per-request rule as the local path,
 anchored when the shard request arrives: preparation (tenant resolution, table
 registration, generation pin, planning) spends the same clock as the scan, so a
