@@ -202,6 +202,33 @@ remains deterministic weight-first. The fixture is retained as
 `estimated_cost_order_measures_a_non_head_prunable_file`; a later policy needs
 a per-file signal whose acquisition cost is part of its comparison.
 
+## Residual request planning (#7100)
+
+The matched #7076 candidate still missed the unchanged `keyword`,
+`keyword_last25` and `substring_scan` ceilings at 23.12, 25.18 and 16.32 ms.
+Its warm responses attribute about 1.1--1.3 ms to physical planning and
+7.9--14.4 ms to collection for those three shapes; rendering stays below
+0.1 ms. Across the retained measured interval, the server phase counters add
+an average 0.61 ms for table registration and 1.86 ms for cost estimation.
+The scan-cost cache refreshed only three times in that interval, so the
+repeated estimate time was outside the snapshot-keyed file walk.
+
+The remaining repeatable metadata work was `estimate()` calling
+`list_indexes()` for every managed-index query. That operation enumerates the
+namespace and performs an uncached `load_table` for every managed index, even
+though registration already loaded the referenced table through the
+bounded-staleness table cache. Cost estimation now reads only each referenced
+index's cached configuration. The accessor retains a fresh catalog-row check,
+so a dropped index cannot resolve through an old cache entry. `scan_cost`
+remains snapshot-keyed and supplies the same exact byte, row and file totals.
+
+`a_warm_managed_index_estimate_does_not_reload_table_metadata` removes the
+target's `metadata.json` files after registration and a first exact estimate.
+The uncached control then fails, while the repeated estimate returns the same
+exact rows, bytes and file count. This is a bounded local cause proof, not an
+AWS speedup claim; the unchanged matched qualification must be rerun against
+the gated source.
+
 ## Local measurement
 
 `the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit`: 16
