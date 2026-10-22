@@ -156,30 +156,35 @@ A local `#[ignore]`d measurement
 32-file fixture matched to that metadata shape — 8,285,216 serialized footer
 bytes and 12,379,712 decoded, against the canonical 8,296,285 / 10,985,491 —
 over a trivial amount of data, so per-request metadata work is separated from
-decode work. Measured in a debug build on a local filesystem, steady state over
-six attempts:
+decode work. Steady state over six attempts on a local filesystem, release and
+debug profiles:
 
-| | repeat ms | object-store reads | footer bytes |
-|---|---:|---:|---:|
-| before this change | 68.4 | 98 | 16,777,472 |
-| narrowed decode only | 56.3 | 98 | 16,777,472 |
-| narrowed decode + retained footers | 1.70 | 2 | 0 |
+| | release ms | debug ms | object-store reads | footer bytes |
+|---|---:|---:|---:|---:|
+| repeat without reuse | 5.9 | 59.2 | 98 | 16,777,472 |
+| repeat with reuse | 0.15 | 1.70 | 2 | 0 |
 
-The first two rows were taken from the pre-change and intermediate binaries in
-the same session on the same fixture; the third is the committed code, and the
-`reuse=off` series of the retained test reproduces the second row at 59.2 ms
-(it reads footer bytes through the page cache rather than the process byte-range
-cache, which costs about 2.5 ms). A phase breakdown attributes the repeat almost
-entirely to the footer decode: 0.07 ms to open the 32 objects and read their
-lengths, 51.1 ms to fetch and decode their footers, 1.4 ms to measure retained
-metadata and 3.5 ms to derive the Arrow schema. Retained decoded metadata for the
-whole 32-file fixture is 8,094,944 bytes.
+Both rows come from the committed code: the test runs the same request against a
+cache the previous request populated and against a fresh one. The narrowed
+decode was measured separately before the reuse landed, on the same fixture in
+the same session: it took the debug repeat from 68.4 ms to 56.3 ms, about 18%.
+Retained decoded metadata for the whole 32-file fixture is 8,094,944 bytes, which
+is less than the 10,985,491 the canonical snapshot decoded with full statistics.
 
-These are local source measurements in a debug build on one filesystem. They are
-not field timing, not an AWS acceptance, and not a claim about the canonical
-snapshot's warm medians; the local ratio also overstates the S3 case, where the
-32 uncached object-length requests this change removes cost more than 0.07 ms and
-the decode is one term among several.
+A phase breakdown puts almost all of the local repeat in the footer decode: of
+the 5.9 ms release repeat, 0.05 ms opens the 32 objects and reads their lengths,
+5.4 ms fetches and decodes their footers, and the rest measures retained metadata
+and derives the Arrow schema.
+
+What that does NOT establish is how much of the canonical snapshot's 453 ms warm
+median this removes. Six milliseconds of release-profile decode is not 453 ms,
+and the local filesystem makes the other repeated work invisible: the 32
+sequential object-length requests the metadata loop issued per attempt are
+microseconds here and uncached S3 HEAD round trips there, which is a term this
+fixture cannot weigh. Reuse removes both, but the field split between them, and
+whatever else the warm median contains, is unmeasured. These are local source
+measurements on one filesystem — not field timing, not an AWS acceptance, and not
+a claim about the canonical warm medians.
 
 The next matched qualification is the existing #7076 protocol, unchanged, with
 one addition. Same immutable image and snapshot, result caches off, original
@@ -194,3 +199,9 @@ timing. Report the query pod's `siglake_cache_evictions_total` and
 58 GiB container, and a nonzero count means the retained footers did not fit and
 the timing is measuring eviction. Exact answers must still match the independently
 accepted original full-source oracle.
+
+That round settles the route's own counters. It does not say where the rest of a
+warm request goes, and the local numbers say the remainder is most of it. The
+same round can answer that for free by retaining each warm response's
+`stats.phases` (`plan_micros`, `collect_micros`, `render_micros`) next to the
+median, which is what decides whether the next card belongs in this route at all.
