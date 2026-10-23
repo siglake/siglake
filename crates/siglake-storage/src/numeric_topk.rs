@@ -323,30 +323,21 @@ async fn admit_footer(
 /// errors rather than raising them: the caller validates in file order and
 /// stops at the first file that refuses, exactly as a serial attempt did.
 #[allow(clippy::too_many_arguments)]
-async fn prefetch_metadata(
-    io: &FileIO,
-    paths: &[(String, u64, u64)],
+async fn prefetch_metadata<'a>(
+    io: &'a FileIO,
+    paths: &'a [(String, u64, u64)],
     leaf: usize,
     footer_bytes: usize,
-    cache: &MetadataCache,
-    budget: &Arc<AtomicU64>,
-    metrics: &ScanMetrics,
+    cache: &'a MetadataCache,
+    budget: &'a Arc<AtomicU64>,
+    metrics: &'a ScanMetrics,
     concurrency: usize,
 ) -> Vec<Option<Prefetched>> {
-    let scope = StatsScope::Leaf(leaf);
-    let mut probed: Vec<Option<Prefetched>> = stream::iter(paths)
-        .map(|(path, _, expected_size)| async move {
-            if let Some(hit) = cache.get(&(path.clone(), *expected_size, scope)) {
-                return Some(Prefetched::Footer(hit));
-            }
-            Some(
-                match probe_file(io, path, *expected_size, budget, metrics).await {
-                    Ok(Probed::Ready(probe)) => Prefetched::Pending(probe),
-                    Ok(Probed::Refused(reason)) => Prefetched::Refused(reason),
-                    Err(error) => Prefetched::Failed(error),
-                },
-            )
-        })
+    // Indices, not borrowed items: a closure taking `&'item _` and returning a
+    // future that borrows it is only `FnOnce` for one lifetime, and the request
+    // future has to stay `Send` for every lifetime to reach an axum handler.
+    let mut probed: Vec<Prefetched> = stream::iter(0..paths.len())
+        .map(|file| probe_or_reuse(io, &paths[file], leaf, cache, budget, metrics))
         .buffered(concurrency.max(1))
         .collect()
         .await;
@@ -356,13 +347,13 @@ async fn prefetch_metadata(
         match entry {
             // A reused footer charges the same aggregate total the read that
             // admitted it did, and stops the prefix when it overflows.
-            Some(Prefetched::Footer(hit)) => {
+            Prefetched::Footer(hit) => {
                 planned = planned.saturating_add(hit.footer_length);
                 if planned > MAX_FOOTER_BYTES {
                     break;
                 }
             }
-            Some(Prefetched::Pending(probe)) if footer_fits(probe, planned) => {
+            Prefetched::Pending(probe) if footer_fits(probe, planned) => {
                 planned = planned.saturating_add(probe.length);
             }
             _ => break,
@@ -370,26 +361,62 @@ async fn prefetch_metadata(
         cleared += 1;
     }
     let withheld = probed.split_off(cleared);
-    let mut fetched: Vec<Option<Prefetched>> = stream::iter(probed.into_iter().zip(paths))
-        .map(|(entry, (path, _, expected_size))| async move {
-            let Some(Prefetched::Pending(probe)) = entry else {
-                return entry;
-            };
-            Some(match fetch_footer(probe, Some(leaf), metrics).await {
-                Ok(footer) => {
-                    // Admitted only after the physical object length matched the
-                    // manifest length that keys the entry.
-                    cache.put((path.clone(), *expected_size, scope), footer.clone());
-                    Prefetched::Footer(footer)
-                }
-                Err(error) => Prefetched::Failed(error),
-            })
-        })
+    let mut fetched: Vec<Prefetched> = stream::iter(probed.into_iter().enumerate())
+        .map(|(file, entry)| fetch_cleared(entry, &paths[file], leaf, cache, metrics))
         .buffered(concurrency.max(1))
         .collect()
         .await;
     fetched.extend(withheld);
-    fetched
+    fetched.into_iter().map(Some).collect()
+}
+
+/// One file's share of the first prefetch pass. A named future rather than an
+/// inline `async` block: the request future has to stay `Send` for every
+/// lifetime, and an opaque block behind a closure does not generalize.
+async fn probe_or_reuse<'a>(
+    io: &'a FileIO,
+    file: &'a (String, u64, u64),
+    leaf: usize,
+    cache: &'a MetadataCache,
+    budget: &'a Arc<AtomicU64>,
+    metrics: &'a ScanMetrics,
+) -> Prefetched {
+    let (path, _, expected_size) = file;
+    if let Some(hit) = cache.get(&(path.clone(), *expected_size, StatsScope::Leaf(leaf))) {
+        return Prefetched::Footer(hit);
+    }
+    match probe_file(io, path, *expected_size, budget, metrics).await {
+        Ok(Probed::Ready(probe)) => Prefetched::Pending(probe),
+        Ok(Probed::Refused(reason)) => Prefetched::Refused(reason),
+        Err(error) => Prefetched::Failed(error),
+    }
+}
+
+/// One file's share of the second prefetch pass. Only entries the ordered
+/// prefix walk cleared reach this with a footer still to fetch.
+async fn fetch_cleared<'a>(
+    entry: Prefetched,
+    file: &'a (String, u64, u64),
+    leaf: usize,
+    cache: &'a MetadataCache,
+    metrics: &'a ScanMetrics,
+) -> Prefetched {
+    let Prefetched::Pending(probe) = entry else {
+        return entry;
+    };
+    let (path, _, expected_size) = file;
+    match fetch_footer(probe, Some(leaf), metrics).await {
+        Ok(footer) => {
+            // Admitted only after the physical object length matched the
+            // manifest length that keys the entry.
+            cache.put(
+                (path.clone(), *expected_size, StatsScope::Leaf(leaf)),
+                footer.clone(),
+            );
+            Prefetched::Footer(footer)
+        }
+        Err(error) => Prefetched::Failed(error),
+    }
 }
 
 /// Files must be complete, delete-free tasks from the *same* qualified
@@ -741,6 +768,19 @@ mod tests {
 
     fn io() -> FileIO {
         FileIOBuilder::new(Arc::new(LocalFsStorageFactory)).build()
+    }
+    /// The request future reaches an axum handler, which needs `Send` for every
+    /// lifetime. A prefetch closure that borrows its stream item satisfies that
+    /// for one lifetime only, and the first crate to notice is the query server.
+    /// Being generic over `'a`, this fails here instead.
+    #[allow(dead_code)]
+    fn read_future_is_send<'a>(
+        io: &'a FileIO,
+        paths: &'a [(String, u64, u64)],
+        pool: &'a Arc<dyn MemoryPool>,
+        cache: &'a MetadataCache,
+    ) -> impl Send + use<'a> {
+        read(io, paths, "value", 42, 1, true, pool, cache)
     }
     /// A fresh cache per call keeps every existing assertion a COLD one.
     fn cache() -> MetadataCache {

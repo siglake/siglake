@@ -347,6 +347,13 @@ to read fewer bytes than that one footer. The pinned
 `..._refuses_decoded_metadata_and_actual_size_before_data` tests are unchanged
 and still pass.
 
+The request future has to stay `Send` for every lifetime to reach an axum
+handler. A stream closure that takes a borrowed item and returns a future
+borrowing it is `FnOnce` for one lifetime only, and the first crate to report
+that is the query server, several hundred lines from the cause. The prefetch
+passes indices instead, and the lifetime-generic `read_future_is_send` in this
+module fails in place if that regresses.
+
 The ignored `numeric_topk_cold_metadata_concurrency_measurement` is the local
 half, on the same 32-file fixture: 8,285,216 serialized footer bytes,
 12,379,712 decoded. At every concurrency from 1 to 32 the attempt reported 98
