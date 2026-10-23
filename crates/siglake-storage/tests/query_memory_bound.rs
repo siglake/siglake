@@ -227,8 +227,8 @@ mod memory_budget_tests {
     /// over-commitment in this system's history was arithmetic nobody could
     /// evaluate without deploying.
     ///
-    /// Checked across the sizes that actually ship: the operator renders 2Gi,
-    /// the chart renders 4Gi, and bench nodes run 30-64 GiB.
+    /// Checked across the packaged 4Gi limit, a 2Gi below-floor override, and
+    /// the 30-64 GiB limits used on bench nodes.
     #[test]
     fn pool_and_caches_fit_the_pod_with_headroom() {
         for limit_gib in [2u64, 4, 8, 16, 30, 64] {

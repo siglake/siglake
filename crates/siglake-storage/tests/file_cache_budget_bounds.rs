@@ -307,8 +307,8 @@ fn the_derived_limits_are_positive_and_priced_against_a_compacted_file() {
     // A compacted file is `cold_target_file_bytes` (256 MiB) at the scan's
     // decompression estimate (5) — about 1.25 GiB decoded, so the quarter rule
     // wants a 5 GiB file cache to hold ONE. An eighth of the container is that
-    // only at 40 GiB, which no packaged pod is: the chart's query pod is 4Gi
-    // and the operator renders 2Gi.
+    // only at 40 GiB, which no packaged pod is: the chart and operator query
+    // pods are 4Gi. The 2Gi table row is a below-floor override.
     let compacted_entry = 256 * MIB * 5;
     let needed = siglake_storage::min_file_cache_bytes_for_entry(compacted_entry);
     assert_eq!(needed, 5 * GIB);
