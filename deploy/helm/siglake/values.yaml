@@ -651,6 +651,18 @@ query:
       # such shape's p50 from 22,798.9 ms to 120.2 ms, at 20.2-21.3 GiB of
       # process RSS for the pair (#4102). See docs/LIMITATIONS.md before
       # copying either number into a pod spec.
+      #
+      # The numeric TopK decoded-footer cache gets 3% of the metadata budget:
+      # 16,106,127 bytes (~15.36MiB) at this packaged 4Gi limit. The #7099 local
+      # 32-file fixture retained 8,094,944 bytes, which fits here but is 41,881
+      # bytes above the 8,053,063-byte (~7.68MiB) share derived from a 2Gi
+      # sizing limit. That fixture is not a measurement of the canonical
+      # snapshot's narrowed footprint or of field performance. For a custom
+      # limit, watch `siglake_cache_evictions_total` and
+      # `siglake_cache_admission_refused_total` with
+      # `cache="numeric_topk_metadata"`. If they show capacity pressure, set
+      # SIGLAKE_METADATA_CACHE_BYTES through query.extraEnv; it changes the
+      # whole metadata-cache budget, so include it in the pod's memory budget.
       # Enabling the file-batch cache subtracts its configured
       # bytes before the 50% pool share is calculated. The pool is a real bound
       # as of 2026-08: DataFusion sorts and aggregates SPILL at it rather than
