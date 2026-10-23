@@ -208,10 +208,9 @@ median, which is what decides whether the next card belongs in this route at all
 
 ### Canonical request attribution (#7131)
 
-The #7076 round did retain phases. The evidence is the six `queries.json` files
-under
-`/home/todd/workspace/loglake-manager/var/investigations/20261021-matched-performance-a1/numeric/evidence/frozen/numeric/results/mode1-canonical/cold/`.
-Their SHA-256 hashes, in sample order 0000 through 0005, are
+The #7076 round did retain phases. The evidence is the six retained
+`mode1-canonical` `queries.json` files. Their SHA-256 hashes, in sample order
+0000 through 0005, are
 `2b56ff8426f4fbe08d3f58bac405622e3d62b598475403da45612c47d14f7f1a`,
 `6fa9e1bb74a40837d818903cb725fe9a73f7aea3b643411bd55678cb3d676c5d`,
 `e886b360d2efca89172a219d9e4d5ca29f47a9d8c6cdd6980f30da8431724ab2`,
