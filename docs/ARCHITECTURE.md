@@ -1027,6 +1027,7 @@ schema migration:
 | `otel.scope.{name,version,schema_url,attributes,dropped_attributes_count}` | Instrumentation scope identity, schema, typed attributes and loss count |
 | `otel.resource.{schema_url,dropped_attributes_count}` | Resource schema and loss count |
 | `otel.resource.attributes` | Resource values hidden by same-key record attributes in the flat compatibility view |
+| `otel.any_values` | Typed sidecar for values whose compatibility JSON loses OTLP type or presence |
 
 The ordinary flat resource-then-record map is unchanged, including its
 last-record-value-wins behavior. Only resource values shadowed by record values
@@ -1036,6 +1037,20 @@ Scope attributes stay separate under `otel.scope.attributes`. OTLP `intValue`
 stays a signed JSON integer, arrays and nested key-value lists retain their
 types, and unsigned nanosecond times are written as exact JSON integers. Empty
 IDs and zero-valued optional metadata are omitted.
+
+The flat map remains the compatibility view, including protobuf bytes as
+lowercase hex, OTLP/JSON bytes as their wire string, omitted missing-valued
+keys, and non-finite doubles as `null`. When that view would lose information,
+`otel.any_values` records only the affected body or resource, scope and record
+attributes. Each value has an explicit `type`; attribute and nested key-value
+lists are arrays of `{key,value}` entries so a missing value, an empty
+`AnyValue`, duplicate keys and list order remain distinct. Bytes use canonical
+lowercase hex when the OTLP/JSON base64 is valid, making equivalent JSON and
+protobuf values equal in the sidecar. Invalid OTLP/JSON base64 is retained
+verbatim under `base64`. Non-finite doubles use the JSON strings `NaN`,
+`Infinity` and `-Infinity`. Arrays and nested key-value lists are recursively
+typed whenever any nested value needs the sidecar. Records without such a
+value do not pay for this copy.
 
 Attribute lookup keeps the extraction rule below. A literal user key such as
 `otel.trace_id` wins before the nested walk. A user attribute named `otel` is

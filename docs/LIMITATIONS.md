@@ -13,11 +13,10 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   absent — so an old client that sends no newly preserved fields retains the
   exact same residual JSON bytes. Scope name is recorded under `otel.scope`
   whenever version, schema, scope attributes or another preserved log field
-  creates that object. Empty and missing `AnyValue` variants still collide,
-  and OTLP/JSON bytes retain their wire string while protobuf bytes use
-  lowercase hex; those AnyValue issues are tracked separately from this
-  context change. Trace ingest keeps its existing scope and resource mapping;
-  this log change does not claim trace-side fidelity.
+  creates that object. The flat compatibility view retains its lossy AnyValue
+  encodings; `otel.any_values` carries the typed, presence-preserving form for
+  affected log values. Trace ingest keeps its existing scope and resource
+  mapping; this log change does not claim trace-side fidelity.
 - **The dependency rebase has matched historical performance evidence with
   explicit limits.** The October 11 pre-adoption/current comparison kept all
   21 median ratios below 2x, but four original absolute latency goals failed.

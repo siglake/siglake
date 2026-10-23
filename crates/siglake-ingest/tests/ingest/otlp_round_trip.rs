@@ -438,6 +438,10 @@ async fn otlp_log_fidelity_survives_http_json_and_protobuf_wal_round_trips() {
         json["otel"]["scope"]["attributes"]["scope.array"],
         serde_json::json!([i64::MAX, "AQI="])
     );
+    assert_eq!(
+        json["otel"]["any_values"]["scope_attributes"][0]["value"]["value"][1],
+        serde_json::json!({"type":"bytes","hex":"0102"})
+    );
 
     let protobuf = read_attributes("protobuf-fidelity");
     assert_eq!(protobuf["otel"]["severity_number"], 17);

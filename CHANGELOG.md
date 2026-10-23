@@ -8,6 +8,12 @@
   `otel` object in residual attributes. Existing flat attribute lookups and
   event columns are unchanged.
 
+- Lossy OTLP log AnyValues gain an additive `otel.any_values` sidecar that
+  distinguishes strings from bytes, missing values from empty values, retains
+  nested arrays and key-value lists, and records non-finite doubles. Equivalent
+  JSON and protobuf bytes use the same canonical hex in the sidecar; existing
+  flat attribute lookups are unchanged.
+
 ## 0.3.0
 
 - Auto-promotion remains disabled by default. Remaining optional qualification is

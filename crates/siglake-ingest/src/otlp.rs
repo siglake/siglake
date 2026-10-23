@@ -1,4 +1,5 @@
 use arrow_array::RecordBatch;
+use base64::Engine as _;
 use chrono::{DateTime, TimeZone, Utc};
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess as ProtoExportLogsPartialSuccess,
@@ -118,7 +119,7 @@ pub struct AnyValue<'a> {
     pub bool_value: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_option_i64")]
     pub int_value: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_option_f64")]
     pub double_value: Option<f64>,
     #[serde(default, borrow)]
     pub array_value: Option<ArrayValue<'a>>,
@@ -126,6 +127,17 @@ pub struct AnyValue<'a> {
     pub kvlist_value: Option<KeyValueList<'a>>,
     #[serde(default, borrow)]
     pub bytes_value: Option<Cow<'a, str>>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub bytes_value_encoding: BytesValueEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum BytesValueEncoding {
+    #[default]
+    Base64,
+    Hex,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -282,7 +294,8 @@ fn convert_any_value(proto: ProtoAnyValue) -> AnyValue<'static> {
         Some(ProtoValue::ArrayValue(value)) => out.array_value = Some(convert_array_value(value)),
         Some(ProtoValue::KvlistValue(value)) => out.kvlist_value = Some(convert_kvlist(value)),
         Some(ProtoValue::BytesValue(value)) => {
-            out.bytes_value = Some(Cow::Owned(hex_encode(&value)))
+            out.bytes_value = Some(Cow::Owned(hex_encode(&value)));
+            out.bytes_value_encoding = BytesValueEncoding::Hex;
         }
         // Other AnyValue variants (e.g. string_value_strindex from the
         // profiles signal) are not used by the logs mapping; ignore them.
@@ -547,6 +560,7 @@ fn has_otel_context(
             .as_ref()
             .is_some_and(|resource| resource.dropped_attributes_count != 0)
         || !scope_logs.schema_url.is_empty()
+        || any_value_sidecar_needed(record, resource_attrs, scope_logs)
         || scope_logs.scope.as_ref().is_some_and(|scope| {
             !scope.version.is_empty()
                 || !scope.attributes.is_empty()
@@ -618,6 +632,11 @@ fn write_otel_context(
 
     field(out, "timestamp_source");
     write_json_str(out, timestamp_source(record));
+
+    if any_value_sidecar_needed(record, resource_attrs, scope_logs) {
+        field(out, "any_values");
+        write_any_value_sidecar(out, record, resource_attrs, scope_logs);
+    }
 
     let resource = resource_logs.resource.as_ref();
     let has_resource_context = !resource_logs.schema_url.is_empty()
@@ -726,6 +745,219 @@ fn write_key_values_object(out: &mut String, values: &[KeyValue<'_>]) {
         write_object_field(out, &mut first, &kv.key);
         write_any_value_json(out, value);
     }
+    out.push('}');
+}
+
+fn any_value_sidecar_needed(
+    record: &LogRecord<'_>,
+    resource_attrs: &[KeyValue<'_>],
+    scope_logs: &ScopeLogs<'_>,
+) -> bool {
+    record.body.as_ref().is_some_and(any_value_needs_sidecar)
+        || resource_attrs.iter().any(key_value_needs_sidecar)
+        || scope_logs
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.attributes.iter().any(key_value_needs_sidecar))
+        || record.attributes.iter().any(key_value_needs_sidecar)
+}
+
+fn key_value_needs_sidecar(kv: &KeyValue<'_>) -> bool {
+    kv.value.as_ref().is_none_or(any_value_needs_sidecar)
+}
+
+fn any_value_needs_sidecar(value: &AnyValue<'_>) -> bool {
+    if value.string_value.is_some() || value.bool_value.is_some() || value.int_value.is_some() {
+        false
+    } else if let Some(value) = value.double_value {
+        !value.is_finite()
+    } else if value.bytes_value.is_some() {
+        true
+    } else if let Some(array) = &value.array_value {
+        array.values.iter().any(any_value_needs_sidecar)
+    } else if let Some(kvlist) = &value.kvlist_value {
+        kvlist.values.iter().any(key_value_needs_sidecar)
+            || kvlist.values.iter().enumerate().any(|(index, value)| {
+                kvlist.values[..index]
+                    .iter()
+                    .any(|previous| previous.key == value.key)
+            })
+    } else {
+        true
+    }
+}
+
+/// Write only the values whose ordinary JSON compatibility form loses OTLP
+/// type or presence. Attribute lists stay arrays so duplicate keys and a
+/// present key without a value remain distinguishable.
+fn write_any_value_sidecar(
+    out: &mut String,
+    record: &LogRecord<'_>,
+    resource_attrs: &[KeyValue<'_>],
+    scope_logs: &ScopeLogs<'_>,
+) {
+    out.push('{');
+    let mut first = true;
+    if let Some(body) = record
+        .body
+        .as_ref()
+        .filter(|body| any_value_needs_sidecar(body))
+    {
+        write_object_field(out, &mut first, "body");
+        write_typed_any_value(out, body);
+    }
+    write_key_value_sidecar_field(out, &mut first, "resource_attributes", resource_attrs);
+    if let Some(scope) = &scope_logs.scope {
+        write_key_value_sidecar_field(out, &mut first, "scope_attributes", &scope.attributes);
+    }
+    write_key_value_sidecar_field(out, &mut first, "record_attributes", &record.attributes);
+    out.push('}');
+}
+
+fn write_key_value_sidecar_field(
+    out: &mut String,
+    first: &mut bool,
+    name: &str,
+    values: &[KeyValue<'_>],
+) {
+    if !values.iter().any(key_value_needs_sidecar) {
+        return;
+    }
+    write_object_field(out, first, name);
+    out.push('[');
+    let mut entry_first = true;
+    for kv in values.iter().filter(|kv| key_value_needs_sidecar(kv)) {
+        if !entry_first {
+            out.push(',');
+        }
+        entry_first = false;
+        out.push('{');
+        write_json_str(out, "key");
+        out.push(':');
+        write_json_str(out, &kv.key);
+        out.push(',');
+        write_json_str(out, "value");
+        out.push(':');
+        match &kv.value {
+            Some(value) => write_typed_any_value(out, value),
+            None => write_typed_value_kind(out, "missing"),
+        }
+        out.push('}');
+    }
+    out.push(']');
+}
+
+fn write_typed_any_value(out: &mut String, value: &AnyValue<'_>) {
+    use std::fmt::Write as _;
+
+    out.push('{');
+    if let Some(value) = &value.string_value {
+        write_typed_value_prefix(out, "string");
+        write_json_str(out, value);
+    } else if let Some(value) = value.bool_value {
+        write_typed_value_prefix(out, "bool");
+        out.push_str(if value { "true" } else { "false" });
+    } else if let Some(value) = value.int_value {
+        write_typed_value_prefix(out, "int");
+        let _ = write!(out, "{value}");
+    } else if let Some(value) = value.double_value {
+        write_typed_value_prefix(out, "double");
+        if value.is_finite() {
+            let _ = write!(out, "{value}");
+        } else {
+            write_json_str(
+                out,
+                if value.is_nan() {
+                    "NaN"
+                } else if value.is_sign_positive() {
+                    "Infinity"
+                } else {
+                    "-Infinity"
+                },
+            );
+        }
+    } else if let Some(bytes) = &value.bytes_value {
+        write_json_str(out, "type");
+        out.push(':');
+        write_json_str(out, "bytes");
+        match value.bytes_value_encoding {
+            BytesValueEncoding::Hex => {
+                out.push(',');
+                write_json_str(out, "hex");
+                out.push(':');
+                write_json_str(out, bytes);
+            }
+            BytesValueEncoding::Base64 => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(bytes.as_bytes())
+                    .or_else(|_| {
+                        base64::engine::general_purpose::STANDARD_NO_PAD.decode(bytes.as_bytes())
+                    });
+                out.push(',');
+                if let Ok(decoded) = decoded {
+                    write_json_str(out, "hex");
+                    out.push(':');
+                    write_json_str(out, &hex_encode(&decoded));
+                } else {
+                    write_json_str(out, "base64");
+                    out.push(':');
+                    write_json_str(out, bytes);
+                }
+            }
+        }
+    } else if let Some(array) = &value.array_value {
+        write_typed_value_prefix(out, "array");
+        out.push('[');
+        for (index, value) in array.values.iter().enumerate() {
+            if index != 0 {
+                out.push(',');
+            }
+            write_typed_any_value(out, value);
+        }
+        out.push(']');
+    } else if let Some(kvlist) = &value.kvlist_value {
+        write_typed_value_prefix(out, "kvlist");
+        out.push('[');
+        for (index, kv) in kvlist.values.iter().enumerate() {
+            if index != 0 {
+                out.push(',');
+            }
+            out.push('{');
+            write_json_str(out, "key");
+            out.push(':');
+            write_json_str(out, &kv.key);
+            out.push(',');
+            write_json_str(out, "value");
+            out.push(':');
+            match &kv.value {
+                Some(value) => write_typed_any_value(out, value),
+                None => write_typed_value_kind(out, "missing"),
+            }
+            out.push('}');
+        }
+        out.push(']');
+    } else {
+        write_json_str(out, "type");
+        out.push(':');
+        write_json_str(out, "empty");
+    }
+    out.push('}');
+}
+
+fn write_typed_value_prefix(out: &mut String, kind: &str) {
+    write_json_str(out, "type");
+    out.push(':');
+    write_json_str(out, kind);
+    out.push(',');
+    write_json_str(out, "value");
+    out.push(':');
+}
+
+fn write_typed_value_kind(out: &mut String, kind: &str) {
+    out.push('{');
+    write_json_str(out, "type");
+    out.push(':');
+    write_json_str(out, kind);
     out.push('}');
 }
 
@@ -924,6 +1156,40 @@ where
         }
     }
     deserializer.deserialize_any(I64Visitor)
+}
+
+fn deserialize_option_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct F64Visitor;
+    impl serde::de::Visitor<'_> for F64Visitor {
+        type Value = Option<f64>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a number or one of NaN, Infinity and -Infinity")
+        }
+        fn visit_f64<E>(self, value: f64) -> Result<Option<f64>, E> {
+            Ok(Some(value))
+        }
+        fn visit_i64<E>(self, value: i64) -> Result<Option<f64>, E> {
+            Ok(Some(value as f64))
+        }
+        fn visit_u64<E>(self, value: u64) -> Result<Option<f64>, E> {
+            Ok(Some(value as f64))
+        }
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Option<f64>, E> {
+            match value {
+                "NaN" => Ok(Some(f64::NAN)),
+                "Infinity" => Ok(Some(f64::INFINITY)),
+                "-Infinity" => Ok(Some(f64::NEG_INFINITY)),
+                _ => Err(E::custom("invalid non-finite double")),
+            }
+        }
+        fn visit_unit<E>(self) -> Result<Option<f64>, E> {
+            Ok(None)
+        }
+    }
+    deserializer.deserialize_any(F64Visitor)
 }
 
 fn deserialize_severity_number<'de, D>(deserializer: D) -> Result<i32, D::Error>
@@ -1231,6 +1497,177 @@ mod tests {
         let mut beyond_arrow_ns = beyond_arrow_ns.as_bytes().to_vec();
         let request = parse_otlp_json(&mut beyond_arrow_ns).unwrap();
         assert!(otlp_logs_to_record_batch(request).is_err());
+    }
+
+    #[test]
+    fn any_value_sidecar_preserves_lossy_json_and_protobuf_values() {
+        use opentelemetry_proto::tonic::common::v1::{
+            any_value::Value as PValue, AnyValue as PAnyValue, ArrayValue as PArrayValue,
+            InstrumentationScope as PInstrumentationScope, KeyValue as PKeyValue,
+            KeyValueList as PKeyValueList,
+        };
+        use opentelemetry_proto::tonic::logs::v1::{
+            LogRecord as PLogRecord, ResourceLogs as PResourceLogs, ScopeLogs as PScopeLogs,
+        };
+        use opentelemetry_proto::tonic::resource::v1::Resource as PResource;
+
+        fn pvalue(value: PValue) -> Option<PAnyValue> {
+            Some(PAnyValue { value: Some(value) })
+        }
+
+        let json = r#"{"resourceLogs":[{"resource":{"attributes":[
+          {"key":"missing-value"},
+          {"key":"empty","value":{}},
+          {"key":"absent-control","value":{"stringValue":"present"}}
+        ]},"scopeLogs":[{"scope":{"attributes":[
+          {"key":"nested","value":{"kvlistValue":{"values":[
+            {"key":"items","value":{"arrayValue":{"values":[
+              {"bytesValue":"AQI="},{},{"doubleValue":"NaN"}
+            ]}}},
+            {"key":"missing-nested"}
+          ]}}}
+        ]},"logRecords":[{"attributes":[
+          {"key":"string","value":{"stringValue":"dead"}},
+          {"key":"bytes","value":{"bytesValue":"3q0="}},
+          {"key":"positive-infinity","value":{"doubleValue":"Infinity"}},
+          {"key":"negative-infinity","value":{"doubleValue":"-Infinity"}}
+        ]}]}]}]}"#;
+        let mut json_buf = json.as_bytes().to_vec();
+        let json_events = otlp_logs_to_events(parse_otlp_json(&mut json_buf).unwrap());
+        let json_attrs: serde_json::Value =
+            serde_json::from_str(json_events[0].attributes.as_deref().unwrap()).unwrap();
+
+        let proto = ProtoExportLogsServiceRequest {
+            resource_logs: vec![PResourceLogs {
+                resource: Some(PResource {
+                    attributes: vec![
+                        PKeyValue {
+                            key: "missing-value".into(),
+                            value: None,
+                            ..Default::default()
+                        },
+                        PKeyValue {
+                            key: "empty".into(),
+                            value: Some(PAnyValue { value: None }),
+                            ..Default::default()
+                        },
+                        PKeyValue {
+                            key: "absent-control".into(),
+                            value: pvalue(PValue::StringValue("present".into())),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                scope_logs: vec![PScopeLogs {
+                    scope: Some(PInstrumentationScope {
+                        attributes: vec![PKeyValue {
+                            key: "nested".into(),
+                            value: pvalue(PValue::KvlistValue(PKeyValueList {
+                                values: vec![
+                                    PKeyValue {
+                                        key: "items".into(),
+                                        value: pvalue(PValue::ArrayValue(PArrayValue {
+                                            values: vec![
+                                                PAnyValue {
+                                                    value: Some(PValue::BytesValue(vec![1, 2])),
+                                                },
+                                                PAnyValue { value: None },
+                                                PAnyValue {
+                                                    value: Some(PValue::DoubleValue(f64::NAN)),
+                                                },
+                                            ],
+                                        })),
+                                        ..Default::default()
+                                    },
+                                    PKeyValue {
+                                        key: "missing-nested".into(),
+                                        value: None,
+                                        ..Default::default()
+                                    },
+                                ],
+                            })),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    log_records: vec![PLogRecord {
+                        attributes: vec![
+                            PKeyValue {
+                                key: "string".into(),
+                                value: pvalue(PValue::StringValue("dead".into())),
+                                ..Default::default()
+                            },
+                            PKeyValue {
+                                key: "bytes".into(),
+                                value: pvalue(PValue::BytesValue(vec![0xde, 0xad])),
+                                ..Default::default()
+                            },
+                            PKeyValue {
+                                key: "positive-infinity".into(),
+                                value: pvalue(PValue::DoubleValue(f64::INFINITY)),
+                                ..Default::default()
+                            },
+                            PKeyValue {
+                                key: "negative-infinity".into(),
+                                value: pvalue(PValue::DoubleValue(f64::NEG_INFINITY)),
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let proto_events = otlp_logs_to_events(
+            decode_export_logs_service_request_protobuf(&proto.encode_to_vec()).unwrap(),
+        );
+        let proto_attrs: serde_json::Value =
+            serde_json::from_str(proto_events[0].attributes.as_deref().unwrap()).unwrap();
+
+        assert_eq!(proto_attrs["string"], "dead");
+        assert_eq!(proto_attrs["bytes"], "dead");
+        assert_eq!(proto_attrs["positive-infinity"], serde_json::Value::Null);
+        assert!(proto_attrs.get("missing-value").is_none());
+        assert_eq!(proto_attrs["empty"], serde_json::Value::Null);
+        assert!(proto_attrs.get("absent").is_none());
+
+        let json_sidecar = &json_attrs["otel"]["any_values"];
+        let proto_sidecar = &proto_attrs["otel"]["any_values"];
+        assert_eq!(json_sidecar, proto_sidecar);
+        assert_eq!(
+            proto_sidecar["resource_attributes"],
+            serde_json::json!([
+                {"key":"missing-value","value":{"type":"missing"}},
+                {"key":"empty","value":{"type":"empty"}}
+            ])
+        );
+        assert_eq!(
+            proto_sidecar["record_attributes"],
+            serde_json::json!([
+                {"key":"bytes","value":{"type":"bytes","hex":"dead"}},
+                {"key":"positive-infinity","value":{"type":"double","value":"Infinity"}},
+                {"key":"negative-infinity","value":{"type":"double","value":"-Infinity"}}
+            ])
+        );
+        assert_eq!(
+            proto_sidecar["scope_attributes"][0]["value"]["value"][0]["value"]["value"][0],
+            serde_json::json!({"type":"bytes","hex":"0102"})
+        );
+        assert_eq!(
+            proto_sidecar["scope_attributes"][0]["value"]["value"][0]["value"]["value"][1],
+            serde_json::json!({"type":"empty"})
+        );
+        assert_eq!(
+            proto_sidecar["scope_attributes"][0]["value"]["value"][0]["value"]["value"][2],
+            serde_json::json!({"type":"double","value":"NaN"})
+        );
+        assert_eq!(
+            proto_sidecar["scope_attributes"][0]["value"]["value"][1],
+            serde_json::json!({"key":"missing-nested","value":{"type":"missing"}})
+        );
     }
 
     #[test]
