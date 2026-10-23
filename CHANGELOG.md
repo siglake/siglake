@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- OTLP log ingest preserves severity, trace/span correlation, flags, observed
+  time, event name, dropped counts, schema URLs, instrumentation scope context
+  and resource values shadowed by record attributes under the additive
+  `otel` object in residual attributes. Existing flat attribute lookups and
+  event columns are unchanged.
+
 ## 0.3.0
 
 - Auto-promotion remains disabled by default. Remaining optional qualification is
