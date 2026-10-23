@@ -370,9 +370,8 @@ async fn prefetch_metadata<'a>(
     fetched.into_iter().map(Some).collect()
 }
 
-/// One file's share of the first prefetch pass. A named future rather than an
-/// inline `async` block: the request future has to stay `Send` for every
-/// lifetime, and an opaque block behind a closure does not generalize.
+/// One file's share of the first prefetch pass: reuse a retained footer, or
+/// match the object length and read the trailer.
 async fn probe_or_reuse<'a>(
     io: &'a FileIO,
     file: &'a (String, u64, u64),
