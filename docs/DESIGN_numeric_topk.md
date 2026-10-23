@@ -289,3 +289,86 @@ round cannot measure its field effect. For cold requests, #7132 is the next
 implementation candidate because the same-sample cold delta is large and the
 metadata loop is serial; its acceptance must retain the finer timing that this
 round lacks.
+
+### Concurrent cold metadata requests (#7132)
+
+A cold attempt used to validate files in one serial loop: per file an object
+length request, an 8-byte trailer read and a footer fetch, each awaited before
+the next file started. On the canonical 32-file snapshot that is 32 sequential
+request chains before any data is decoded. #7099 removed that cost on a warm
+repeat; a first request, a new snapshot or an attempt after eviction still paid
+all of it.
+
+The route now runs the first file exactly as before and overlaps the rest in
+two bounded passes, `METADATA_CONCURRENCY` = 8 requests in flight:
+
+1. open, match the physical object length against the manifest length and read
+   the trailer, concurrently;
+2. walk the known serialized lengths in FILE order and clear a prefix for
+   fetching, charging the 512 KiB per-file cap, the 8 MiB running aggregate and
+   the object's own length;
+3. fetch the cleared prefix's footers concurrently.
+
+The ordered validation walk is unchanged and still decides everything. Nothing
+reorders because:
+
+- The first file is serial, so the leaf ordinal it proves is known before any
+  later file is probed. Every file after it decodes with the same
+  `metadata_options(Some(leaf))` and looks up the same `StatsScope::Leaf(leaf)`
+  cache entry it did when the loop was serial, and a file that places the target
+  column at another ordinal still refuses `column_position`.
+- The aggregate serialized budget is charged in file order against lengths read
+  before any footer fetch, so the footer that would overflow 8 MiB is still
+  never fetched, and neither is any footer after it. A reused footer charges the
+  same length it charged when it was admitted.
+- Refusals and errors from the prefetch are carried per file, not raised. The
+  walk stops at the lowest-index file that refuses and returns that file's
+  reason, so a refusal at file 3 is never replaced by file 7's.
+- Everything is validated before any data read, and the memory reservation and
+  cancellation behaviour are untouched: the prefetch futures live inside the
+  request future and drop with it.
+
+What a refusing attempt now does that a serial one did not: files after the
+refusal may have had their object length and 8 bytes read. Decoded metadata is
+also held for the whole cleared prefix before the 32 MiB decoded-metadata bound
+is charged against it, where the serial loop charged it file by file. The prefix
+is capped at 8 MiB of serialized footers, which decoded to 10,985,491 bytes on
+the canonical snapshot and 12,379,712 on the local fixture, both inside the
+128 MiB reservation.
+
+`numeric_topk_concurrency_does_not_move_ordered_decisions` runs the same
+fixtures at concurrency 1, 2, 8 and 64 — an answered attempt ASC and DESC, and a
+mid-list refusal for absent statistics, for the target leaf at another ordinal
+and for a single footer over the per-file cap — and requires identical values,
+identical `files_read` and `groups_considered`, identical bytes asked of storage
+and identical read counts. The over-cap case additionally requires the attempt
+to read fewer bytes than that one footer. The pinned
+`..._still_refuse_aggregate_overflow_before_data` and
+`..._refuses_decoded_metadata_and_actual_size_before_data` tests are unchanged
+and still pass.
+
+The request future has to stay `Send` for every lifetime to reach an axum
+handler. A stream closure that takes a borrowed item and returns a future
+borrowing it is `FnOnce` for one lifetime only, and the first crate to report
+that is the query server, several hundred lines from the cause. The prefetch
+passes indices instead, and the lifetime-generic `read_future_is_send` in this
+module fails in place if that regresses.
+
+The ignored `numeric_topk_cold_metadata_concurrency_measurement` is the local
+half, on the same 32-file fixture: 8,285,216 serialized footer bytes,
+12,379,712 decoded. At every concurrency from 1 to 32 the attempt reported 98
+object-store reads, 16,777,472 footer bytes and 16,935,032 fetched bytes —
+byte-identical to the serial code at `5082877` run against the same fixture.
+Debug-profile wall time was ~62 ms at every concurrency, including 1. A local
+filesystem has no round-trip latency to overlap — #7131 measured an object open
+at 0.05 ms for all 32 files — so flat wall time is what this fixture can show.
+These numbers establish that overlapping the requests changes no decision and no
+byte; they establish nothing about AWS.
+
+The saving this change is for is unmeasured. It needs a matched round against
+the same image and snapshot as #7076 — result caches off, original harness, SQL
+and seed, 58 GiB query container — recording cold ASC/DESC medians against the
+2,229.63 ms and 2,990.22 ms this card started from, and separating the metadata
+batch from the data reads in each cold response rather than reporting the
+`collect` total. Until that exists, the cold medians are not improved, only the
+request pattern is changed.

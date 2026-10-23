@@ -684,7 +684,12 @@ files' footers, so the route decodes only the target leaf's statistics and
 retains the decoded footers in a bounded LRU keyed by object path, manifest
 length and statistics scope — 3% of the derived metadata-cache byte budget, with
 the common 4,096-entry cap. A reused footer issues no read, reports no footer
-bytes, and is still checked in full against the request. Its provenance, budgets
+bytes, and is still checked in full against the request. A cold attempt, which
+has no footers to reuse, issues the remaining files' metadata requests with
+bounded concurrency after the first file proves the target leaf; the validation
+walk stays in file order, so the aggregate serialized-footer budget still
+refuses before fetching the footer that would overflow it and a refusal still
+reports the lowest-index file's reason. Its provenance, budgets
 and remaining performance qualification are described in
 [DESIGN_numeric_topk.md](DESIGN_numeric_topk.md).
 
