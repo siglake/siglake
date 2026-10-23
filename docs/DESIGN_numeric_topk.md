@@ -205,3 +205,88 @@ warm request goes, and the local numbers say the remainder is most of it. The
 same round can answer that for free by retaining each warm response's
 `stats.phases` (`plan_micros`, `collect_micros`, `render_micros`) next to the
 median, which is what decides whether the next card belongs in this route at all.
+
+### Canonical request attribution (#7131)
+
+The #7076 round did retain phases. The evidence is the six `queries.json` files
+under
+`/home/todd/workspace/loglake-manager/var/investigations/20261021-matched-performance-a1/numeric/evidence/frozen/numeric/results/mode1-canonical/cold/`.
+Their SHA-256 hashes, in sample order 0000 through 0005, are
+`2b56ff8426f4fbe08d3f58bac405622e3d62b598475403da45612c47d14f7f1a`,
+`6fa9e1bb74a40837d818903cb725fe9a73f7aea3b643411bd55678cb3d676c5d`,
+`e886b360d2efca89172a219d9e4d5ca29f47a9d8c6cdd6980f30da8431724ab2`,
+`99b326070d27d788411f9e6f407961ff14f11be13b6f0ef8172306958861243f`,
+`ccb7263f647029e1330d781792fc5db360b60c5f5052d4a5fa39e9b6e08c299f`
+and `387ae4914e7d9a59c3e126d5e9df8d68cdbd90fc988fa6f9908804d9d9b4b16c`.
+`summary.json`
+(`d7c3beb3979e69d1963d9f1b4b3a2a8b5d85ed4823e0f732c14319c057e2a685`)
+says 36 responses passed; `protocol.json`
+(`e7085684254b72400895f94f976471069a4f3ddc44a546f0276e486a65ddc46b`)
+records three cold samples with five warm runs apiece and an uncontrolled
+remote-storage cache. The image was built from `21a53d5`, before #7099.
+
+The following rows use the individual response at the warm wall-time median,
+not independently computed component medians. `Server remainder` is
+`server_micros - plan_micros - collect_micros`; it includes request work outside
+the two reported phases and JSON response construction. `Client gap` is wall
+time minus the server header. Each row therefore sums exactly to its wall time.
+
+| canonical warm response | plan | collect | server remainder | client gap | wall |
+|---|---:|---:|---:|---:|---:|
+| ASC, sample 0004 warm 2 | 3.583 ms | 432.398 ms | 16.438 ms | 0.641 ms | 453.060 ms |
+| DESC, sample 0002 warm 2 | 3.552 ms | 501.465 ms | 16.056 ms | 0.667 ms | 521.740 ms |
+
+`render_micros` is zero in these bodies, but zero is assigned by
+`attach_fast_path_phases`; it is not a rendering measurement. `collect` starts
+before the fast-path battery and ends once the numeric response body has been
+built. It therefore combines metadata validation, footer decode, row-group
+selection, page decode and candidate selection. The median ASC response decoded
+one row group (234,441 rows and 1,903,328 decoded bytes); DESC decoded eight
+(1,721,327 rows and 13,979,616 decoded bytes). All 30 warm responses report zero
+fetched bytes and zero range reads. The old path's per-file `metadata()` calls
+are outside those scan counters, so the retained responses cannot separate 32
+object-length round trips from CPU work inside `collect`.
+
+The retained cold medians use the same samples and decoded group counts as the
+warm medians:
+
+| canonical cold response | plan | collect | server remainder | client gap | wall | range reads / fetched bytes |
+|---|---:|---:|---:|---:|---:|---:|
+| ASC, sample 0004 | 11.156 ms | 2,176.226 ms | 41.569 ms | 0.679 ms | 2,229.630 ms | 51 / 21,971,178 |
+| DESC, sample 0002 | 11.355 ms | 2,936.772 ms | 41.427 ms | 0.666 ms | 2,990.220 ms | 58 / 24,566,036 |
+
+Both cold responses fetched 12,800,919 footer bytes. Against their warm response
+in the same reset sample, cold `collect` adds 1,743.828 ms ASC and 2,435.307 ms
+DESC while decoded groups and rows are unchanged. That delta contains footer and
+data object reads, page-cache state and footer decode; the retained counters do
+not assign it among them. It supports #7132's bounded cold-metadata concurrency
+experiment, but its result must time the metadata batch separately from data
+reads before claiming a cause.
+
+The ignored
+`numeric_topk_whole_request_cost_measurement` test supplies the local half. It
+sends the registered SQL through the in-process `/api/v1/sql` router against 32
+one-row files whose serialized footers total 8,285,216 bytes. This deliberately
+does not model the canonical data volume. In a release build, the individual
+median warm responses were:
+
+| local warm response | plan | collect | other router/body work | wall |
+|---|---:|---:|---:|---:|
+| ASC | 0.202 ms | 0.282 ms | 13.550 ms | 14.034 ms |
+| DESC | 0.197 ms | 0.275 ms | 13.529 ms | 14.001 ms |
+
+Each response reused all footers, read ten trivial data groups and decoded 1,040
+bytes. The first cold local request took 52.812 ms: 14.185 ms plan, 23.431 ms
+collect and 15.196 ms other work. The storage-only matched-metadata measurement
+above puts a fresh repeat at 5.9 ms, including 5.4 ms of footer fetch and decode.
+These local numbers bound fixed route and local metadata cost; they are not
+components to subtract from an AWS response.
+
+The attribution selects no new warm optimization. Planning and response work
+are small, and the 432--501 ms field `collect` term remains a combination of
+unmeasured object-length latency and canonical data decode/selection. #7099
+removes the former plus repeated footer decode on a cache hit, but this pre-#7099
+round cannot measure its field effect. For cold requests, #7132 is the next
+implementation candidate because the same-sample cold delta is large and the
+metadata loop is serial; its acceptance must retain the finer timing that this
+round lacks.

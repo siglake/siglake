@@ -321,6 +321,73 @@ async fn numeric_topk_repeat_request_reuses_footers_and_repeats_the_answer() {
     }
 }
 
+/// #7131: measure the whole records route separately from the storage-only
+/// metadata probe. The fixture matches #7099's serialized-footer total but has
+/// one row group and one row per file, so it measures fixed route/metadata
+/// overhead rather than the canonical snapshot's data-decode work.
+#[tokio::test]
+#[ignore = "local release-profile attribution measurement, not a gate"]
+async fn numeric_topk_whole_request_cost_measurement() {
+    const FILES: usize = 32;
+    const FOOTER_BYTES_PER_FILE: usize = 258_913;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ice = Arc::new(
+        IcebergContext::open(dir.path())
+            .await
+            .unwrap()
+            .with_promoted_columns(vec![PromotedColumn {
+                attr_key: "metrics.size".into(),
+                attr_get_path: vec![],
+                carrier: Default::default(),
+                name: "metrics_size".into(),
+                ty: PromotedType::Int64,
+            }]),
+    );
+    ice.ensure_promoted_columns().await.unwrap();
+    for value in 0..FILES {
+        let row = Event::now(r#"{"metrics":{"size":999}}"#)
+            .with_attributes(Some(json!({"metrics":{"size":value as i64}}).to_string()));
+        ice.append_events(&[row]).await.unwrap();
+    }
+    assert!(ice.ensure_promotion_backfill_property().await.unwrap());
+    replace_with_sized_footers(&ice, FOOTER_BYTES_PER_FILE).await;
+    let app = router(AppState::new(ice, AuthConfig::open()));
+
+    println!(
+        "fixture_files={FILES} serialized_footer_total={}",
+        FILES * FOOTER_BYTES_PER_FILE
+    );
+    for direction in ["ASC", "DESC"] {
+        let sql = format!(
+            "SELECT {VALUE} AS value FROM events WHERE {VALUE} IS NOT NULL \
+             ORDER BY {VALUE} {direction} LIMIT 10"
+        );
+        for attempt in 0..6 {
+            reset_result_cache_for_test().await;
+            let started = std::time::Instant::now();
+            let (status, bytes) = request(&app, json!({"query":sql,"format":"records"})).await;
+            let wall_micros = started.elapsed().as_micros() as u64;
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["stats"]["served_by"], "numeric_topk", "{body}");
+            let phases = &body["stats"]["phases"];
+            let plan_micros = phases["plan_micros"].as_u64().unwrap();
+            let collect_micros = phases["collect_micros"].as_u64().unwrap();
+            println!(
+                "direction={direction} attempt={attempt} wall_micros={wall_micros} \
+                 plan_micros={plan_micros} collect_micros={collect_micros} \
+                 other_micros={} reads={} footer_bytes={} decoded_bytes={} rows_scanned={}",
+                wall_micros.saturating_sub(plan_micros + collect_micros),
+                scan_counter(&body, "object_store_reads"),
+                scan_counter(&body, "bytes_footer"),
+                scan_counter(&body, "decoded_bytes"),
+                body["stats"]["rows_scanned"].as_u64().unwrap(),
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn numeric_topk_http_registered_sql_matches_generic_ndjson_and_prunes() {
     let (_dir, _ice, app) = fixture().await;
