@@ -9,9 +9,9 @@ and what they take from the query memory pool.
 
 The measurements that exist ran at the bench fleet's 8 GiB / 16,384 entries
 (#4494, #4846, #4891, #4847). No packaged pod has 8 GiB to spend on one cache —
-the chart's query pod is 4Gi in TOTAL and the operator renders 2Gi — so at every
-size that ships, the budget was the one thing never exercised: eviction, the
-per-entry ceiling and the pool subtraction had no numbers at all.
+the chart and operator query pods are 4Gi in TOTAL — so at every size that
+ships, the budget was the one thing never exercised: eviction, the per-entry
+ceiling and the pool subtraction had no numbers at all.
 
 ## What the cache is, and where it is configured
 

@@ -912,9 +912,9 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   the byte budget is refused (`skip_oversized`), and a compacted file is 256 MiB
   of Parquet at the scan's x5 decode estimate — about 1.25 GiB — so a cache that
   holds ONE is 5 GiB, which the recommendation (an eighth of the container
-  limit) reaches only at a 40 GiB pod. The chart's query pod is 4Gi and the
-  operator renders 2Gi, so enabled there the cache holds pre-compaction files
-  and nothing else. Measured 2026-09-17 over three runs on a local 8-file
+  limit) reaches only at a 40 GiB pod. The chart and operator query pods are
+  4Gi, so enabled at that default the cache holds pre-compaction files and
+  nothing else. Measured 2026-09-17 over three runs on a local 8-file
   fixture (`crates/siglake-storage/tests/file_cache_budget_measurement.rs`): a
   budget covering the working set is 5-7x faster warm (1.2-1.6 ms against
   7.6-9.3), a budget covering HALF of it is within noise of no cache at all,

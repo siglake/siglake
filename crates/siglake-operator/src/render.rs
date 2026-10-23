@@ -148,9 +148,9 @@ pub const QUERY_SPILL_SIZE_LIMIT: &str = "10Gi";
 ///
 /// No CRD field: enabling it is an `spec.extraEnv` override of BOTH variables
 /// (one alone leaves the cache off and logs a warning), which is deliberate
-/// while the cache stays opt-in. The operator renders 2Gi query pods by default
-/// and a decoded compacted file is about 1.25Gi, so there is no size here at
-/// which the cache could hold one — see
+/// while the cache stays opt-in. The operator renders 4Gi query pods by default,
+/// and a decoded compacted file is about 1.25Gi, so the cache cannot hold one
+/// unless that limit is also raised — see
 /// `docs/DESIGN_source_file_cache_qualification.md` before raising a limit to
 /// enable it.
 const QUERY_FILE_CACHE_MAX_BYTES: &str = "0";

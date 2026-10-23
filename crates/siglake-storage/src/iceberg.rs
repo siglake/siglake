@@ -13963,9 +13963,9 @@ const DEFAULT_FOOTER_CACHE_CAP: usize = 4096;
 /// against a pool that derives to 1.25 GiB on the packaged pod.
 ///
 /// 12.5% of the limit, clamped to [64 MiB, 2 GiB]. The clamp is doing real work
-/// at both ends: the operator renders a 2Gi query pod, where a percentage alone
-/// would leave these caches unable to hold one snapshot's file list; and a 64Gi
-/// node does not want 8 GiB of metadata cached just because it can.
+/// at both ends: on a 2Gi below-floor override, a percentage alone would leave
+/// these caches unable to hold one snapshot's file list; and a 64Gi node does
+/// not want 8 GiB of metadata cached just because it can.
 ///
 /// Override with `SIGLAKE_METADATA_CACHE_BYTES`.
 pub(crate) fn metadata_cache_budget_bytes() -> usize {
@@ -13981,9 +13981,9 @@ pub(crate) fn metadata_cache_budget_bytes() -> usize {
 
 /// The derivation, separated from the environment so the whole memory budget can
 /// be computed for a pod size that is not this one — which is the only way to
-/// check that the pool and the caches together fit inside a 2Gi pod, a 4Gi pod
-/// and a 64Gi node. Mirrors `derive_read_cache_bytes`, which takes its limit for
-/// the same reason.
+/// check that the pool and the caches together fit inside a 2Gi below-floor
+/// override, the packaged 4Gi pod and a 64Gi node. Mirrors
+/// `derive_read_cache_bytes`, which takes its limit for the same reason.
 pub(crate) fn derive_metadata_cache_bytes(memory_limit_bytes: Option<u64>) -> usize {
     const MIN: usize = 64 * 1024 * 1024;
     const MAX: usize = 2 * 1024 * 1024 * 1024;
