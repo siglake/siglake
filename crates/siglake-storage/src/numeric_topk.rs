@@ -12,7 +12,7 @@ use anyhow::Result;
 use arrow_array::{Array, Int64Array};
 use arrow_schema::DataType;
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use iceberg::arrow::{ArrowFileReader, ScanMetrics};
 use iceberg::io::{FileIO, FileRead, ReadOutcome};
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -31,6 +31,11 @@ const MAX_SINGLE_FOOTER_BYTES: usize = 512 * 1024;
 const MAX_RETAINED_METADATA_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CHUNK_BYTES: i64 = 32 * 1024 * 1024;
 const MAX_GROUPS: usize = 4096;
+/// Per-file metadata request chains a cold attempt may have in flight. Every
+/// decision below — refusal reason, refusal position, the aggregate serialized
+/// budget, the narrowed statistics scope — is taken in file order and is
+/// independent of this number; it only bounds how many round trips overlap.
+const METADATA_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Default)]
 pub struct NumericTopK {
@@ -188,6 +193,205 @@ impl FileRead for BudgetedReader {
     }
 }
 
+/// One file's metadata request chain up to — but not including — its footer:
+/// the object length matched against the manifest, and the 8-byte trailer that
+/// declares the serialized footer length. Holding the opened reader means the
+/// footer fetch that follows costs one request, not a second open.
+struct Probe {
+    size: iceberg::io::FileMetadata,
+    length: usize,
+    reader: Box<dyn FileRead>,
+}
+
+enum Probed {
+    Ready(Probe),
+    Refused(&'static str),
+}
+
+/// What a prefetch left for one file, consumed by the ordered validation walk.
+/// A refusal or an error is carried rather than raised: the walk must still
+/// refuse at the lowest-index file that refuses, with that file's reason.
+enum Prefetched {
+    /// A decoded footer, reused from the cache or fetched by this attempt.
+    Footer(CachedFooter),
+    /// Probed, with its footer deliberately NOT fetched: the ordered budget
+    /// walk stopped at or before this file.
+    Pending(Probe),
+    Refused(&'static str),
+    Failed(anyhow::Error),
+}
+
+/// Open the object, match its physical length against the manifest length and
+/// read the trailer. No footer is fetched here, so an attempt can learn every
+/// file's serialized footer length before it decides which footers to fetch.
+async fn probe_file(
+    io: &FileIO,
+    path: &str,
+    expected_size: u64,
+    budget: &Arc<AtomicU64>,
+    metrics: &ScanMetrics,
+) -> Result<Probed> {
+    let input = io.new_input(path)?;
+    let size = input.metadata().await?;
+    if size.size < 12 || size.size != expected_size {
+        return Ok(Probed::Refused("footer"));
+    }
+    let reader: Box<dyn FileRead> = Box::new(BudgetedReader {
+        inner: input.reader().await?,
+        remaining: budget.clone(),
+    });
+    let outcome = reader.read_with_outcome(size.size - 8..size.size).await?;
+    if outcome.fetched {
+        metrics
+            .scan_counters()
+            .object_store_reads
+            .fetch_add(1, Relaxed);
+        metrics
+            .scan_counters()
+            .bytes_footer
+            .fetch_add(outcome.bytes.len() as u64, Relaxed);
+    }
+    let tail = outcome.bytes;
+    if tail.len() != 8 || &tail[4..] != b"PAR1" {
+        return Ok(Probed::Refused("footer"));
+    }
+    let length = u32::from_le_bytes(tail[..4].try_into().unwrap()) as usize;
+    Ok(Probed::Ready(Probe {
+        size,
+        length,
+        reader,
+    }))
+}
+
+/// The gate every footer passes before it is fetched: the per-file cap, the
+/// running aggregate serialized total in file order, and the object's own
+/// length. `footer_bytes` is the total the files BEFORE this one charged.
+fn footer_fits(probe: &Probe, footer_bytes: usize) -> bool {
+    probe.length <= MAX_SINGLE_FOOTER_BYTES
+        && footer_bytes.saturating_add(probe.length) <= MAX_FOOTER_BYTES
+        && probe.length as u64 <= probe.size.size - 12
+}
+
+async fn fetch_footer(
+    probe: Probe,
+    narrowed_leaf: Option<usize>,
+    metrics: &ScanMetrics,
+) -> Result<CachedFooter> {
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(
+        ArrowFileReader::new(probe.size, probe.reader).with_scan_metrics(metrics.clone()),
+        metadata_options(narrowed_leaf),
+    )
+    .await?;
+    Ok(CachedFooter {
+        footer_length: probe.length,
+        metadata: ArrowReaderMetadata::try_new(
+            builder.metadata().clone(),
+            ArrowReaderOptions::new(),
+        )?,
+    })
+}
+
+/// `Ok(None)` is the `footer_budget` refusal, taken before the fetch.
+async fn admit_footer(
+    probe: Probe,
+    footer_bytes: usize,
+    narrowed_leaf: Option<usize>,
+    metrics: &ScanMetrics,
+) -> Result<Option<CachedFooter>> {
+    if !footer_fits(&probe, footer_bytes) {
+        return Ok(None);
+    }
+    Ok(Some(fetch_footer(probe, narrowed_leaf, metrics).await?))
+}
+
+/// Issue the metadata requests for every file AFTER the first with bounded
+/// concurrency. Sequenced in two passes so nothing is reordered that is
+/// allowed to decide anything:
+///
+/// 1. open + length match + trailer, concurrently. 8 bytes per file, and the
+///    only extra work a refusing attempt does — a file the ordered walk never
+///    reaches may have had its trailer read.
+/// 2. clear a PREFIX for fetching by charging the per-file and aggregate
+///    serialized budgets in file order against the known lengths, so the
+///    footer that would overflow the 8 MiB total is never fetched, and
+///    neither is anything after it.
+/// 3. fetch the cleared prefix's footers concurrently, all against the leaf
+///    the first file proved — every file in this range decodes with the same
+///    `metadata_options`, so narrowing is unchanged by the overlap.
+///
+/// The returned entries are index-aligned with `paths` and carry refusals and
+/// errors rather than raising them: the caller validates in file order and
+/// stops at the first file that refuses, exactly as a serial attempt did.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_metadata(
+    io: &FileIO,
+    paths: &[(String, u64, u64)],
+    leaf: usize,
+    footer_bytes: usize,
+    cache: &MetadataCache,
+    budget: &Arc<AtomicU64>,
+    metrics: &ScanMetrics,
+    concurrency: usize,
+) -> Vec<Option<Prefetched>> {
+    let scope = StatsScope::Leaf(leaf);
+    let mut probed: Vec<Option<Prefetched>> = stream::iter(paths)
+        .map(|(path, _, expected_size)| async move {
+            if let Some(hit) = cache.get(&(path.clone(), *expected_size, scope)) {
+                return Some(Prefetched::Footer(hit));
+            }
+            Some(
+                match probe_file(io, path, *expected_size, budget, metrics).await {
+                    Ok(Probed::Ready(probe)) => Prefetched::Pending(probe),
+                    Ok(Probed::Refused(reason)) => Prefetched::Refused(reason),
+                    Err(error) => Prefetched::Failed(error),
+                },
+            )
+        })
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+    let mut planned = footer_bytes;
+    let mut cleared = 0usize;
+    for entry in &probed {
+        match entry {
+            // A reused footer charges the same aggregate total the read that
+            // admitted it did, and stops the prefix when it overflows.
+            Some(Prefetched::Footer(hit)) => {
+                planned = planned.saturating_add(hit.footer_length);
+                if planned > MAX_FOOTER_BYTES {
+                    break;
+                }
+            }
+            Some(Prefetched::Pending(probe)) if footer_fits(probe, planned) => {
+                planned = planned.saturating_add(probe.length);
+            }
+            _ => break,
+        }
+        cleared += 1;
+    }
+    let withheld = probed.split_off(cleared);
+    let mut fetched: Vec<Option<Prefetched>> = stream::iter(probed.into_iter().zip(paths))
+        .map(|(entry, (path, _, expected_size))| async move {
+            let Some(Prefetched::Pending(probe)) = entry else {
+                return entry;
+            };
+            Some(match fetch_footer(probe, Some(leaf), metrics).await {
+                Ok(footer) => {
+                    // Admitted only after the physical object length matched the
+                    // manifest length that keys the entry.
+                    cache.put((path.clone(), *expected_size, scope), footer.clone());
+                    Prefetched::Footer(footer)
+                }
+                Err(error) => Prefetched::Failed(error),
+            })
+        })
+        .buffered(concurrency.max(1))
+        .collect()
+        .await;
+    fetched.extend(withheld);
+    fetched
+}
+
 /// Files must be complete, delete-free tasks from the *same* qualified
 /// snapshot. The field ID prevents a renamed/reused physical name from being
 /// accepted. There is no table-name refresh anywhere in this function.
@@ -222,6 +426,7 @@ pub(crate) async fn read(
         cache,
         &metrics,
         MAX_RETAINED_METADATA_BYTES,
+        METADATA_CONCURRENCY,
     )
     .await?;
     let probe_bytes = metrics.bytes_read();
@@ -252,6 +457,7 @@ async fn read_inner(
     cache: &MetadataCache,
     metrics: &ScanMetrics,
     metadata_limit: usize,
+    concurrency: usize,
 ) -> Result<Option<NumericTopK>> {
     if !(1..=1000).contains(&k) || paths.len() > 256 {
         return Ok(refuse("shape_or_file_limit"));
@@ -278,70 +484,75 @@ async fn read_inner(
     // decoded schema below, so a file that places the column elsewhere refuses
     // rather than reading a neighbour's bounds.
     let mut narrowed_leaf: Option<usize> = None;
+    // Metadata the prefetch below already has in hand, index-aligned with
+    // `paths` from index 1. Empty until the first file proves the leaf.
+    let mut prefetched: Vec<Option<Prefetched>> = Vec::new();
     let mut result = NumericTopK {
         files_planned: paths.len() as u64,
         ..Default::default()
     };
     // Validate ALL metadata before decoding: a late refusal must not combine
     // partial optimized output with the normal execution result.
-    for (path, expected_rows, expected_size) in paths {
+    for (index, (path, expected_rows, expected_size)) in paths.iter().enumerate() {
         tokio::task::yield_now().await;
+        if index == 1 {
+            // The first file has proved the leaf and charged its footer bytes,
+            // so every remaining file shares one cache scope, one decode option
+            // set and one known starting total: their metadata requests can
+            // overlap without moving a decision.
+            if let Some(leaf) = narrowed_leaf {
+                prefetched = prefetch_metadata(
+                    io,
+                    &paths[1..],
+                    leaf,
+                    footer_bytes,
+                    cache,
+                    &budget,
+                    metrics,
+                    concurrency,
+                )
+                .await;
+            }
+        }
         // The scope an earlier file in this attempt proved, so a warm repeat
         // asks for the entry its own predecessor admitted.
         let scope = narrowed_leaf.map_or(StatsScope::All, StatsScope::Leaf);
         let key = (path.clone(), *expected_size, scope);
-        let cached = match cache.get(&key) {
-            Some(hit) => hit,
-            None => {
-                let input = io.new_input(path)?;
-                let size = input.metadata().await?;
-                if size.size < 12 || size.size != *expected_size {
-                    return Ok(refuse("footer"));
-                }
-                let reader: Box<dyn FileRead> = Box::new(BudgetedReader {
-                    inner: input.reader().await?,
-                    remaining: budget.clone(),
-                });
-                let outcome = reader.read_with_outcome(size.size - 8..size.size).await?;
-                if outcome.fetched {
-                    metrics
-                        .scan_counters()
-                        .object_store_reads
-                        .fetch_add(1, Relaxed);
-                    metrics
-                        .scan_counters()
-                        .bytes_footer
-                        .fetch_add(outcome.bytes.len() as u64, Relaxed);
-                }
-                let tail = outcome.bytes;
-                if tail.len() != 8 || &tail[4..] != b"PAR1" {
-                    return Ok(refuse("footer"));
-                }
-                let length = u32::from_le_bytes(tail[..4].try_into().unwrap()) as usize;
-                // Still refused before the footer itself is fetched.
-                if length > MAX_SINGLE_FOOTER_BYTES
-                    || footer_bytes.saturating_add(length) > MAX_FOOTER_BYTES
-                    || length as u64 > size.size - 12
-                {
+        let ready = index
+            .checked_sub(1)
+            .and_then(|slot| prefetched.get_mut(slot))
+            .and_then(Option::take);
+        let cached = match ready {
+            Some(Prefetched::Footer(footer)) => footer,
+            Some(Prefetched::Refused(reason)) => return Ok(refuse(reason)),
+            Some(Prefetched::Failed(error)) => return Err(error),
+            // Withheld by the ordered prefix walk, which charged exactly the
+            // budgets this file is about to charge: it refuses here.
+            Some(Prefetched::Pending(probe)) => {
+                let Some(footer) =
+                    admit_footer(probe, footer_bytes, narrowed_leaf, metrics).await?
+                else {
                     return Ok(refuse("footer_budget"));
-                }
-                let builder = ParquetRecordBatchStreamBuilder::new_with_options(
-                    ArrowFileReader::new(size, reader).with_scan_metrics(metrics.clone()),
-                    metadata_options(narrowed_leaf),
-                )
-                .await?;
-                let footer = CachedFooter {
-                    footer_length: length,
-                    metadata: ArrowReaderMetadata::try_new(
-                        builder.metadata().clone(),
-                        ArrowReaderOptions::new(),
-                    )?,
                 };
-                // Admitted only after the physical object length matched the
-                // manifest length that keys the entry.
                 cache.put(key, footer.clone());
                 footer
             }
+            None => match cache.get(&key) {
+                Some(hit) => hit,
+                None => match probe_file(io, path, *expected_size, &budget, metrics).await? {
+                    Probed::Refused(reason) => return Ok(refuse(reason)),
+                    Probed::Ready(probe) => {
+                        // Still refused before the footer itself is fetched.
+                        let Some(footer) =
+                            admit_footer(probe, footer_bytes, narrowed_leaf, metrics).await?
+                        else {
+                            return Ok(refuse("footer_budget"));
+                        };
+                        cache.put(key, footer.clone());
+                        footer
+                    }
+                },
+            },
         };
         let metadata = cached.metadata.metadata();
         // Charged identically whether the footer was parsed now or reused.
@@ -675,7 +886,8 @@ mod tests {
             &memory,
             &cache(),
             &metrics,
-            MAX_RETAINED_METADATA_BYTES
+            MAX_RETAINED_METADATA_BYTES,
+            METADATA_CONCURRENCY
         )
         .await
         .unwrap()
@@ -705,6 +917,7 @@ mod tests {
             &cache(),
             &metrics,
             MAX_RETAINED_METADATA_BYTES,
+            METADATA_CONCURRENCY,
         )
         .await
         .unwrap();
@@ -856,6 +1069,7 @@ mod tests {
             &cache(),
             &metrics,
             decoded,
+            METADATA_CONCURRENCY,
         )
         .await
         .unwrap();
@@ -1086,6 +1300,52 @@ mod tests {
         }
     }
 
+    /// The cold metadata phase at several concurrencies on the canonical
+    /// metadata shape. A local object open measures ~0.05 ms, so this reports
+    /// the mechanics — identical request counts and identical fetched bytes,
+    /// whatever overlaps — and cannot show the round-trip saving the change is
+    /// for. Only a matched round against the same image and snapshot can.
+    #[tokio::test]
+    #[ignore = "local timing measurement, not a gate; see docs/DESIGN_numeric_topk.md"]
+    async fn numeric_topk_cold_metadata_concurrency_measurement() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = wide_fixture(dir.path(), 32);
+        let (serialized, decoded) = fixture_metadata_bytes(&paths);
+        println!("serialized_footer_total={serialized} decoded_metadata_total={decoded}");
+        for concurrency in [1usize, 2, 4, 8, 16, 32] {
+            for attempt in 0..6 {
+                let metrics = ScanMetrics::default();
+                let start = std::time::Instant::now();
+                let result = read_inner(
+                    &io(),
+                    &paths,
+                    "value",
+                    42,
+                    10,
+                    true,
+                    &pool(RESERVATION_BYTES),
+                    &cache(),
+                    &metrics,
+                    MAX_RETAINED_METADATA_BYTES,
+                    concurrency,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                println!(
+                    "concurrency={concurrency} attempt={attempt} elapsed_ms={:.2} \
+                     files_read={} groups_read={} footer_bytes={} fetched_bytes={} reads={}",
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    result.files_read,
+                    result.groups_read,
+                    result.footer_bytes,
+                    result.fetched_bytes,
+                    result.reads,
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn numeric_topk_cancellation_drops_its_memory_reservation() {
         let memory = pool(RESERVATION_BYTES);
@@ -1097,6 +1357,116 @@ mod tests {
         assert_eq!(memory.reserved(), RESERVATION_BYTES);
         drop(future);
         assert_eq!(memory.reserved(), 0);
+    }
+
+    /// Overlapping the per-file metadata requests must not move a decision.
+    /// For every concurrency the same attempt answers or refuses, with the same
+    /// values, the same files validated and the same bytes asked of storage —
+    /// including a refusal in the middle of the list, where the files after it
+    /// have had their trailers read and their footers deliberately not fetched.
+    /// A fresh fixture per concurrency keeps every attempt a cold one whatever
+    /// the process-global byte-range cache happens to hold.
+    #[tokio::test]
+    async fn numeric_topk_concurrency_does_not_move_ordered_decisions() {
+        let mut observed = Vec::new();
+        for concurrency in [1usize, 2, 8, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let attempt = move |paths: Vec<(String, u64, u64)>, ascending: bool| async move {
+                let metrics = ScanMetrics::default();
+                let result = read_inner(
+                    &io(),
+                    &paths,
+                    "value",
+                    42,
+                    3,
+                    ascending,
+                    &pool(RESERVATION_BYTES),
+                    &cache(),
+                    &metrics,
+                    MAX_RETAINED_METADATA_BYTES,
+                    concurrency,
+                )
+                .await
+                .unwrap();
+                (
+                    result
+                        .as_ref()
+                        .map(|r| (r.values.clone(), r.files_read, r.groups_considered)),
+                    metrics.bytes_read(),
+                    metrics.scan_counters().bytes_data.load(Relaxed),
+                    metrics.scan_counters().object_store_reads.load(Relaxed),
+                )
+            };
+            let good = (0..6)
+                .map(|i| {
+                    write(
+                        dir.path(),
+                        &format!("good-{i}.parquet"),
+                        vec![Some(i), Some(i + 100), Some(i + 200)],
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let answered = attempt(good.clone(), false).await;
+            assert_eq!(
+                answered.0,
+                Some((vec![205, 204, 203], 6, 6)),
+                "concurrency={concurrency}"
+            );
+            let ascending = attempt(good.clone(), true).await;
+            assert_eq!(
+                ascending.0,
+                Some((vec![0, 1, 2], 6, 6)),
+                "concurrency={concurrency}"
+            );
+
+            // A file in the middle of the list refuses, three ways: absent
+            // statistics, the target leaf at another ordinal, and a single
+            // footer over the per-file cap.
+            let mut refusals = Vec::new();
+            for (name, replacement) in [
+                (
+                    "stats",
+                    write(dir.path(), "no-stats.parquet", vec![Some(5)], false),
+                ),
+                (
+                    "ordinal",
+                    write_two_columns(
+                        dir.path(),
+                        "reversed.parquet",
+                        vec![Some(1), Some(2), Some(3)],
+                        vec![Some(70), Some(80), Some(90)],
+                        true,
+                    ),
+                ),
+                (
+                    "footer_cap",
+                    write_sized_footer(dir.path(), "over.parquet", 512 * 1024 + 1),
+                ),
+            ] {
+                let mut paths = good.clone();
+                paths[3] = replacement;
+                let refused = attempt(paths, false).await;
+                assert!(refused.0.is_none(), "{name} concurrency={concurrency}");
+                assert_eq!(refused.2, 0, "{name} must refuse before any data read");
+                if name == "footer_cap" {
+                    assert!(
+                        refused.1 < MAX_SINGLE_FOOTER_BYTES as u64,
+                        "the over-cap footer must never be fetched, read {} bytes",
+                        refused.1
+                    );
+                }
+                refusals.push(refused);
+            }
+            observed.push((answered, ascending, refusals));
+        }
+        for later in &observed[1..] {
+            assert_eq!(
+                later, &observed[0],
+                "concurrency changed an answer, a refusal or what a cold \
+                 attempt asked storage for"
+            );
+        }
     }
 
     /// Two Int64 columns with field ids and contents that differ, so a reused
@@ -1339,6 +1709,7 @@ mod tests {
             &shared,
             &metrics,
             MAX_RETAINED_METADATA_BYTES,
+            METADATA_CONCURRENCY,
         )
         .await
         .unwrap()
