@@ -1014,6 +1014,37 @@ column, queryable via the `attr_get(attributes, key)` UDF (values come back as
 text so they `CAST` cleanly) and `LIKE`. Existing tables gain the column via
 the additive `siglake migrate-schema` — see **Upgrades** below.
 
+Standard OTLP log metadata that has no event column uses the reserved top-level
+`otel` object in that same JSON string. This is additive and needs no table
+schema migration:
+
+| JSON path | Preserved OTLP field |
+|---|---|
+| `otel.severity_number`, `otel.severity_text` | Normalized severity number and original severity text |
+| `otel.trace_id`, `otel.span_id`, `otel.flags` | Correlation IDs as lowercase hex, plus the log trace flags |
+| `otel.observed_time_unix_nano`, `otel.timestamp_source` | Exact unsigned observation time and which OTLP or ingest clock supplied the event timestamp |
+| `otel.event_name`, `otel.dropped_attributes_count` | Event name and record attribute loss count |
+| `otel.scope.{name,version,schema_url,attributes,dropped_attributes_count}` | Instrumentation scope identity, schema, typed attributes and loss count |
+| `otel.resource.{schema_url,dropped_attributes_count}` | Resource schema and loss count |
+| `otel.resource.attributes` | Resource values hidden by same-key record attributes in the flat compatibility view |
+
+The ordinary flat resource-then-record map is unchanged, including its
+last-record-value-wins behavior. Only resource values shadowed by record values
+are repeated under `otel.resource.attributes`; copying every resource
+attribute into every row would add storage without recovering more context.
+Scope attributes stay separate under `otel.scope.attributes`. OTLP `intValue`
+stays a signed JSON integer, arrays and nested key-value lists retain their
+types, and unsigned nanosecond times are written as exact JSON integers. Empty
+IDs and zero-valued optional metadata are omitted.
+
+Attribute lookup keeps the extraction rule below. A literal user key such as
+`otel.trace_id` wins before the nested walk. A user attribute named `otel` is
+written after the reserved object and therefore hides it, preserving the
+existing last-value-wins rule rather than taking ownership of a user key.
+Records that carry none of the newly preserved metadata keep their previous
+`attributes` bytes and allocation behavior. When another preserved field
+creates the object, the existing scope name is included with its new context.
+
 **One extraction rule, versioned.** A promoted column is a materialized
 `attr_get`: the query layer substitutes the column for the UDF once backfill
 completes, and prunes row groups from its statistics before that. Both are
@@ -2539,6 +2570,10 @@ time-ordered storage, distributed query, ordered early-stop, leveled
 compaction + graded backpressure, defer-index, continuous-dispatch drain).
 September WAL durability hardening added directory-boundary fsyncs and bounded
 recovery of complete acknowledged batches ahead of a torn partial tail.
+The October OTLP log fidelity phase added standard correlation, severity,
+observation-time, resource-schema and instrumentation-scope context inside the
+existing residual JSON representation, without changing the event schema or
+flat attribute compatibility view.
 The S3 mirror follow-up pinned queued segments across local compaction and
 retention, made crash catch-up scan those pins, and exposed uploader queue lag.
 The operator's September WAL follow-up made its mirror-prefix override apply to

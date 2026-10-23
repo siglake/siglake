@@ -7,6 +7,17 @@ moved here from the README on 2026-09-15; the docs site's
 user-facing summary of the same list. The mechanisms named below are described
 in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+- **Some OTLP context remains outside the log compatibility representation.**
+  Log resource entity references are not stored. A scope name by itself keeps
+  its previous behavior — it supplies `source` only when `service.name` is
+  absent — so an old client that sends no newly preserved fields retains the
+  exact same residual JSON bytes. Scope name is recorded under `otel.scope`
+  whenever version, schema, scope attributes or another preserved log field
+  creates that object. Empty and missing `AnyValue` variants still collide,
+  and OTLP/JSON bytes retain their wire string while protobuf bytes use
+  lowercase hex; those AnyValue issues are tracked separately from this
+  context change. Trace ingest keeps its existing scope and resource mapping;
+  this log change does not claim trace-side fidelity.
 - **The dependency rebase has matched historical performance evidence with
   explicit limits.** The October 11 pre-adoption/current comparison kept all
   21 median ratios below 2x, but four original absolute latency goals failed.

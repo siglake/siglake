@@ -11,6 +11,7 @@ use opentelemetry_proto::tonic::common::v1::{
 };
 use opentelemetry_proto::tonic::logs::v1::{
     LogRecord as ProtoLogRecord, ResourceLogs as ProtoResourceLogs, ScopeLogs as ProtoScopeLogs,
+    SeverityNumber,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource as ProtoResource;
 use prost::Message;
@@ -35,6 +36,8 @@ pub struct ResourceLogs<'a> {
     pub resource: Option<Resource<'a>>,
     #[serde(default, borrow)]
     pub scope_logs: Vec<ScopeLogs<'a>>,
+    #[serde(default, borrow)]
+    pub schema_url: Cow<'a, str>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -42,6 +45,8 @@ pub struct ResourceLogs<'a> {
 pub struct Resource<'a> {
     #[serde(default, borrow)]
     pub attributes: Vec<KeyValue<'a>>,
+    #[serde(default)]
+    pub dropped_attributes_count: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -51,6 +56,8 @@ pub struct ScopeLogs<'a> {
     pub scope: Option<InstrumentationScope<'a>>,
     #[serde(default, borrow)]
     pub log_records: Vec<LogRecord<'a>>,
+    #[serde(default, borrow)]
+    pub schema_url: Cow<'a, str>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -58,6 +65,12 @@ pub struct ScopeLogs<'a> {
 pub struct InstrumentationScope<'a> {
     #[serde(default, borrow)]
     pub name: Cow<'a, str>,
+    #[serde(default, borrow)]
+    pub version: Cow<'a, str>,
+    #[serde(default, borrow)]
+    pub attributes: Vec<KeyValue<'a>>,
+    #[serde(default)]
+    pub dropped_attributes_count: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -67,10 +80,24 @@ pub struct LogRecord<'a> {
     pub time_unix_nano: u64,
     #[serde(default, deserialize_with = "deserialize_u64")]
     pub observed_time_unix_nano: u64,
+    #[serde(default, deserialize_with = "deserialize_severity_number")]
+    pub severity_number: i32,
+    #[serde(default, borrow)]
+    pub severity_text: Cow<'a, str>,
     #[serde(default, borrow)]
     pub body: Option<AnyValue<'a>>,
     #[serde(default, borrow)]
     pub attributes: Vec<KeyValue<'a>>,
+    #[serde(default)]
+    pub dropped_attributes_count: u32,
+    #[serde(default)]
+    pub flags: u32,
+    #[serde(default, borrow)]
+    pub trace_id: Cow<'a, str>,
+    #[serde(default, borrow)]
+    pub span_id: Cow<'a, str>,
+    #[serde(default, borrow)]
+    pub event_name: Cow<'a, str>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -182,6 +209,7 @@ fn convert_resource_logs(proto: ProtoResourceLogs) -> ResourceLogs<'static> {
             .into_iter()
             .map(convert_scope_logs)
             .collect(),
+        schema_url: Cow::Owned(proto.schema_url),
     }
 }
 
@@ -192,6 +220,7 @@ fn convert_resource(proto: ProtoResource) -> Resource<'static> {
             .into_iter()
             .map(convert_key_value)
             .collect(),
+        dropped_attributes_count: proto.dropped_attributes_count,
     }
 }
 
@@ -199,12 +228,20 @@ fn convert_scope_logs(proto: ProtoScopeLogs) -> ScopeLogs<'static> {
     ScopeLogs {
         scope: proto.scope.map(|scope| InstrumentationScope {
             name: Cow::Owned(scope.name),
+            version: Cow::Owned(scope.version),
+            attributes: scope
+                .attributes
+                .into_iter()
+                .map(convert_key_value)
+                .collect(),
+            dropped_attributes_count: scope.dropped_attributes_count,
         }),
         log_records: proto
             .log_records
             .into_iter()
             .map(convert_log_record)
             .collect(),
+        schema_url: Cow::Owned(proto.schema_url),
     }
 }
 
@@ -212,12 +249,19 @@ fn convert_log_record(proto: ProtoLogRecord) -> LogRecord<'static> {
     LogRecord {
         time_unix_nano: proto.time_unix_nano,
         observed_time_unix_nano: proto.observed_time_unix_nano,
+        severity_number: proto.severity_number,
+        severity_text: Cow::Owned(proto.severity_text),
         body: proto.body.map(convert_any_value),
         attributes: proto
             .attributes
             .into_iter()
             .map(convert_key_value)
             .collect(),
+        dropped_attributes_count: proto.dropped_attributes_count,
+        flags: proto.flags,
+        trace_id: Cow::Owned(hex_encode(&proto.trace_id)),
+        span_id: Cow::Owned(hex_encode(&proto.span_id)),
+        event_name: Cow::Owned(proto.event_name),
     }
 }
 
@@ -306,8 +350,13 @@ fn map_logs<'a>(req: &'a ExportLogsServiceRequest<'a>, mut emit: impl FnMut(Mapp
             for record in &scope_logs.log_records {
                 // Single pass over the record's attributes: pull `sourcetype` +
                 // `index` and build the residual JSON in one scan (was 3 scans).
-                let (sourcetype, index, attributes) =
-                    map_record_attributes(&record.attributes, &resource_fragment);
+                let (sourcetype, index, attributes) = map_record_attributes(
+                    record,
+                    resource_attrs,
+                    &resource_fragment,
+                    resource_logs,
+                    scope_logs,
+                );
                 emit(MappedRecord {
                     timestamp: timestamp_for_record(record),
                     host,
@@ -412,16 +461,33 @@ fn build_residual_fragment(attrs: &[KeyValue], core_keys: &[&str]) -> String {
 /// — so records with only core attrs (`sourcetype` / `index`) pay zero alloc.
 #[allow(clippy::type_complexity)]
 fn map_record_attributes<'a>(
-    record_attrs: &'a [KeyValue<'a>],
+    record: &'a LogRecord<'a>,
+    resource_attrs: &'a [KeyValue<'a>],
     resource_fragment: &str,
+    resource_logs: &'a ResourceLogs<'a>,
+    scope_logs: &'a ScopeLogs<'a>,
 ) -> (Option<&'a str>, Option<&'a str>, Option<String>) {
+    let record_attrs = &record.attributes;
     let mut sourcetype = None;
     let mut index = None;
     // Defer the String alloc: initialize with the resource fragment when it
     // is non-empty (always has content), otherwise leave it None until the
     // first residual record attr triggers the allocation.
-    let record_residual_cap = 1 + resource_fragment.len() + record_attrs.len() * 32;
-    let mut out: Option<String> = if resource_fragment.is_empty() {
+    let has_context = has_otel_context(record, resource_attrs, resource_logs, scope_logs);
+    let record_residual_cap =
+        1 + resource_fragment.len() + record_attrs.len() * 32 + if has_context { 256 } else { 0 };
+    let mut out = if has_context {
+        let mut s = String::with_capacity(record_residual_cap);
+        s.push('{');
+        write_json_str(&mut s, "otel");
+        s.push(':');
+        write_otel_context(&mut s, record, resource_attrs, resource_logs, scope_logs);
+        if !resource_fragment.is_empty() {
+            s.push(',');
+            s.push_str(resource_fragment);
+        }
+        Some(s)
+    } else if resource_fragment.is_empty() {
         None
     } else {
         let mut s = String::with_capacity(record_residual_cap);
@@ -459,6 +525,216 @@ fn map_record_attributes<'a>(
         s
     });
     (sourcetype, index, attributes)
+}
+
+fn has_otel_context(
+    record: &LogRecord<'_>,
+    resource_attrs: &[KeyValue<'_>],
+    resource_logs: &ResourceLogs<'_>,
+    scope_logs: &ScopeLogs<'_>,
+) -> bool {
+    record.observed_time_unix_nano != 0
+        || record.severity_number != 0
+        || !record.severity_text.is_empty()
+        || record.dropped_attributes_count != 0
+        || record.flags != 0
+        || !record.trace_id.is_empty()
+        || !record.span_id.is_empty()
+        || !record.event_name.is_empty()
+        || !resource_logs.schema_url.is_empty()
+        || resource_logs
+            .resource
+            .as_ref()
+            .is_some_and(|resource| resource.dropped_attributes_count != 0)
+        || !scope_logs.schema_url.is_empty()
+        || scope_logs.scope.as_ref().is_some_and(|scope| {
+            !scope.version.is_empty()
+                || !scope.attributes.is_empty()
+                || scope.dropped_attributes_count != 0
+        })
+        || resource_attrs.iter().any(|resource| {
+            !CORE_RESOURCE_KEYS.contains(&resource.key.as_ref())
+                && resource.value.is_some()
+                && record.attributes.iter().any(|record| {
+                    record.key == resource.key
+                        && record.value.is_some()
+                        && !matches!(record.key.as_ref(), "sourcetype" | "index")
+                })
+        })
+}
+
+fn write_otel_context(
+    out: &mut String,
+    record: &LogRecord<'_>,
+    resource_attrs: &[KeyValue<'_>],
+    resource_logs: &ResourceLogs<'_>,
+    scope_logs: &ScopeLogs<'_>,
+) {
+    use std::fmt::Write as _;
+
+    out.push('{');
+    let mut first = true;
+    let mut field = |out: &mut String, name: &str| {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write_json_str(out, name);
+        out.push(':');
+    };
+
+    if record.severity_number != 0 {
+        field(out, "severity_number");
+        let _ = write!(out, "{}", record.severity_number);
+    }
+    if !record.severity_text.is_empty() {
+        field(out, "severity_text");
+        write_json_str(out, &record.severity_text);
+    }
+    if !record.trace_id.is_empty() {
+        field(out, "trace_id");
+        write_ascii_lowercase_json_str(out, &record.trace_id);
+    }
+    if !record.span_id.is_empty() {
+        field(out, "span_id");
+        write_ascii_lowercase_json_str(out, &record.span_id);
+    }
+    if record.flags != 0 {
+        field(out, "flags");
+        let _ = write!(out, "{}", record.flags);
+    }
+    if record.observed_time_unix_nano != 0 {
+        field(out, "observed_time_unix_nano");
+        let _ = write!(out, "{}", record.observed_time_unix_nano);
+    }
+    if !record.event_name.is_empty() {
+        field(out, "event_name");
+        write_json_str(out, &record.event_name);
+    }
+    if record.dropped_attributes_count != 0 {
+        field(out, "dropped_attributes_count");
+        let _ = write!(out, "{}", record.dropped_attributes_count);
+    }
+
+    field(out, "timestamp_source");
+    write_json_str(out, timestamp_source(record));
+
+    let resource = resource_logs.resource.as_ref();
+    let has_resource_context = !resource_logs.schema_url.is_empty()
+        || resource.is_some_and(|resource| resource.dropped_attributes_count != 0)
+        || resource_attrs.iter().any(|resource| {
+            !CORE_RESOURCE_KEYS.contains(&resource.key.as_ref())
+                && resource.value.is_some()
+                && record.attributes.iter().any(|record| {
+                    record.key == resource.key
+                        && record.value.is_some()
+                        && !matches!(record.key.as_ref(), "sourcetype" | "index")
+                })
+        });
+    if has_resource_context {
+        field(out, "resource");
+        out.push('{');
+        let mut resource_first = true;
+        if !resource_logs.schema_url.is_empty() {
+            write_object_field(out, &mut resource_first, "schema_url");
+            write_json_str(out, &resource_logs.schema_url);
+        }
+        if let Some(dropped) = resource
+            .map(|resource| resource.dropped_attributes_count)
+            .filter(|dropped| *dropped != 0)
+        {
+            write_object_field(out, &mut resource_first, "dropped_attributes_count");
+            let _ = write!(out, "{dropped}");
+        }
+        let mut wrote_attributes = false;
+        for resource in resource_attrs {
+            let shadowed = !CORE_RESOURCE_KEYS.contains(&resource.key.as_ref())
+                && resource.value.is_some()
+                && record.attributes.iter().any(|record| {
+                    record.key == resource.key
+                        && record.value.is_some()
+                        && !matches!(record.key.as_ref(), "sourcetype" | "index")
+                });
+            if !shadowed {
+                continue;
+            }
+            if !wrote_attributes {
+                write_object_field(out, &mut resource_first, "attributes");
+                out.push('{');
+                wrote_attributes = true;
+            } else {
+                out.push(',');
+            }
+            write_json_str(out, &resource.key);
+            out.push(':');
+            write_any_value_json(out, resource.value.as_ref().expect("checked above"));
+        }
+        if wrote_attributes {
+            out.push('}');
+        }
+        out.push('}');
+    }
+
+    let scope = scope_logs.scope.as_ref();
+    if scope.is_some() || !scope_logs.schema_url.is_empty() {
+        field(out, "scope");
+        out.push('{');
+        let mut scope_first = true;
+        if let Some(scope) = scope {
+            if !scope.name.is_empty() {
+                write_object_field(out, &mut scope_first, "name");
+                write_json_str(out, &scope.name);
+            }
+            if !scope.version.is_empty() {
+                write_object_field(out, &mut scope_first, "version");
+                write_json_str(out, &scope.version);
+            }
+            if !scope.attributes.is_empty() {
+                write_object_field(out, &mut scope_first, "attributes");
+                write_key_values_object(out, &scope.attributes);
+            }
+            if scope.dropped_attributes_count != 0 {
+                write_object_field(out, &mut scope_first, "dropped_attributes_count");
+                let _ = write!(out, "{}", scope.dropped_attributes_count);
+            }
+        }
+        if !scope_logs.schema_url.is_empty() {
+            write_object_field(out, &mut scope_first, "schema_url");
+            write_json_str(out, &scope_logs.schema_url);
+        }
+        out.push('}');
+    }
+    out.push('}');
+}
+
+fn write_object_field(out: &mut String, first: &mut bool, name: &str) {
+    if !*first {
+        out.push(',');
+    }
+    *first = false;
+    write_json_str(out, name);
+    out.push(':');
+}
+
+fn write_key_values_object(out: &mut String, values: &[KeyValue<'_>]) {
+    out.push('{');
+    let mut first = true;
+    for kv in values {
+        let Some(value) = kv.value.as_ref() else {
+            continue;
+        };
+        write_object_field(out, &mut first, &kv.key);
+        write_any_value_json(out, value);
+    }
+    out.push('}');
+}
+
+fn write_ascii_lowercase_json_str(out: &mut String, value: &str) {
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        write_json_str(out, &value.to_ascii_lowercase());
+    } else {
+        write_json_str(out, value);
+    }
 }
 
 /// Append a JSON-escaped, quoted string to `out` (RFC 8259 string escaping).
@@ -543,6 +819,16 @@ fn timestamp_for_record(record: &LogRecord) -> DateTime<Utc> {
     timestamp_from_unix_nanos(record.time_unix_nano)
         .or_else(|| timestamp_from_unix_nanos(record.observed_time_unix_nano))
         .unwrap_or_else(Utc::now)
+}
+
+fn timestamp_source(record: &LogRecord<'_>) -> &'static str {
+    if timestamp_from_unix_nanos(record.time_unix_nano).is_some() {
+        "time_unix_nano"
+    } else if timestamp_from_unix_nanos(record.observed_time_unix_nano).is_some() {
+        "observed_time_unix_nano"
+    } else {
+        "ingest_time"
+    }
 }
 
 fn timestamp_from_unix_nanos(nanos: u64) -> Option<DateTime<Utc>> {
@@ -640,6 +926,35 @@ where
     deserializer.deserialize_any(I64Visitor)
 }
 
+fn deserialize_severity_number<'de, D>(deserializer: D) -> Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct SeverityVisitor;
+    impl serde::de::Visitor<'_> for SeverityVisitor {
+        type Value = i32;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an OTLP severity number or enum name")
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<i32, E> {
+            i32::try_from(value).map_err(E::custom)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<i32, E> {
+            i32::try_from(value).map_err(E::custom)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<i32, E> {
+            Ok(SeverityNumber::from_str_name(value)
+                .map(|severity| severity as i32)
+                .unwrap_or(SeverityNumber::Unspecified as i32))
+        }
+    }
+    deserializer.deserialize_any(SeverityVisitor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,10 +968,12 @@ mod tests {
                         string_kv("host.name", "web-01"),
                         string_kv("service.name", "checkout"),
                     ],
+                    ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: Some(InstrumentationScope {
                         name: "scope-name".into(),
+                        ..Default::default()
                     }),
                     log_records: vec![LogRecord {
                         time_unix_nano: 1_700_000_000_123_456_789,
@@ -667,7 +984,9 @@ mod tests {
                         ],
                         ..Default::default()
                     }],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
         };
 
@@ -695,6 +1014,7 @@ mod tests {
                         string_kv("host.name", "web-01"),   // core → host
                         string_kv("k8s.namespace", "prod"), // residual
                     ],
+                    ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: None,
@@ -714,7 +1034,9 @@ mod tests {
                         ],
                         ..Default::default()
                     }],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
         };
         let events = otlp_logs_to_events(req);
@@ -742,6 +1064,7 @@ mod tests {
             resource_logs: vec![ResourceLogs {
                 resource: Some(Resource {
                     attributes: vec![string_kv("host.name", "h")],
+                    ..Default::default()
                 }),
                 scope_logs: vec![ScopeLogs {
                     scope: None,
@@ -771,7 +1094,9 @@ mod tests {
                         ],
                         ..Default::default()
                     }],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }],
         };
         let events = otlp_logs_to_events(req);
@@ -781,6 +1106,131 @@ mod tests {
         assert_eq!(v["quote\"key"], "tab\tand\nnewline");
         assert_eq!(v["arr"][0], 1);
         assert_eq!(v["arr"][1], "x");
+    }
+
+    #[test]
+    fn old_client_attributes_remain_byte_identical() {
+        let json = r#"{"resourceLogs":[{"resource":{"attributes":[
+          {"key":"host.name","value":{"stringValue":"h"}},
+          {"key":"resource.only","value":{"stringValue":"resource"}}]},
+          "scopeLogs":[{"scope":{"name":"old-scope"},"logRecords":[{
+            "timeUnixNano":"1700000000000000000",
+            "attributes":[{"key":"record.only","value":{"intValue":"7"}}]
+          }]}]}]}"#;
+        let mut buf = json.as_bytes().to_vec();
+        let events = otlp_logs_to_events(parse_otlp_json(&mut buf).unwrap());
+
+        assert_eq!(
+            events[0].attributes.as_deref(),
+            Some(r#"{"resource.only":"resource","record.only":7}"#)
+        );
+    }
+
+    #[test]
+    fn json_preserves_log_and_context_fidelity_under_otel() {
+        let json = r#"{"resourceLogs":[{
+          "schemaUrl":"https://opentelemetry.io/schemas/1.30.0",
+          "resource":{"droppedAttributesCount":2,"attributes":[
+            {"key":"host.name","value":{"stringValue":"json-host"}},
+            {"key":"shared","value":{"intValue":"41"}}]},
+          "scopeLogs":[{
+            "schemaUrl":"https://example.test/scope/1.0",
+            "scope":{"name":"json-scope","version":"2.1.0",
+              "droppedAttributesCount":3,"attributes":[
+                {"key":"scope.max","value":{"intValue":"9223372036854775807"}},
+                {"key":"scope.array","value":{"arrayValue":{"values":[
+                  {"boolValue":true},{"bytesValue":"AQI="}
+                ]}}}]},
+            "logRecords":[{
+              "observedTimeUnixNano":"1700000000123456789",
+              "severityNumber":"SEVERITY_NUMBER_INFO","severityText":"INFO",
+              "flags":257,
+              "traceId":"00112233445566778899AABBCCDDEEFF",
+              "spanId":"8899AABBCCDDEEFF","eventName":"checkout.completed",
+              "droppedAttributesCount":4,
+              "attributes":[
+                {"key":"shared","value":{"intValue":"42"}},
+                {"key":"otel.trace_id","value":{"stringValue":"literal-id"}},
+                {"key":"record.min","value":{"intValue":"-9223372036854775808"}}
+              ]
+            },{
+              "timeUnixNano":"1700000001000000000","severityText":"WARN",
+              "attributes":[{"key":"otel","value":{"kvlistValue":{"values":[
+                {"key":"trace_id","value":{"stringValue":"user-wins"}}
+              ]}}}]
+            },{
+              "timeUnixNano":"1700000002000000000",
+              "observedTimeUnixNano":"18446744073709551615"
+            }]
+          }]
+        }]}"#;
+        let mut buf = json.as_bytes().to_vec();
+        let events = otlp_logs_to_events(parse_otlp_json(&mut buf).unwrap());
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].timestamp.timestamp(), 1_700_000_000);
+        assert_eq!(events[0].timestamp.timestamp_subsec_nanos(), 123_456_789);
+        let first: serde_json::Value =
+            serde_json::from_str(events[0].attributes.as_deref().unwrap()).unwrap();
+        assert_eq!(first["shared"], 42);
+        assert_eq!(first["otel.trace_id"], "literal-id");
+        assert_eq!(first["record.min"], i64::MIN);
+        assert_eq!(first["otel"]["severity_number"], 9);
+        assert_eq!(first["otel"]["severity_text"], "INFO");
+        assert_eq!(
+            first["otel"]["trace_id"],
+            "00112233445566778899aabbccddeeff"
+        );
+        assert_eq!(first["otel"]["span_id"], "8899aabbccddeeff");
+        assert_eq!(first["otel"]["flags"], 257);
+        assert_eq!(
+            first["otel"]["observed_time_unix_nano"].as_u64(),
+            Some(1_700_000_000_123_456_789)
+        );
+        assert_eq!(first["otel"]["timestamp_source"], "observed_time_unix_nano");
+        assert_eq!(first["otel"]["resource"]["attributes"]["shared"], 41);
+        assert_eq!(first["otel"]["scope"]["name"], "json-scope");
+        assert_eq!(first["otel"]["scope"]["version"], "2.1.0");
+        assert_eq!(first["otel"]["scope"]["attributes"]["scope.max"], i64::MAX);
+        assert_eq!(
+            first["otel"]["scope"]["attributes"]["scope.array"],
+            serde_json::json!([true, "AQI="])
+        );
+
+        let second: serde_json::Value =
+            serde_json::from_str(events[1].attributes.as_deref().unwrap()).unwrap();
+        assert_eq!(second["otel"]["trace_id"], "user-wins");
+        assert!(second["otel"].get("severity_text").is_none());
+
+        let third: serde_json::Value =
+            serde_json::from_str(events[2].attributes.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            third["otel"]["observed_time_unix_nano"].as_u64(),
+            Some(u64::MAX)
+        );
+        assert_eq!(third["otel"]["timestamp_source"], "time_unix_nano");
+    }
+
+    #[test]
+    fn json_keeps_existing_integer_and_timestamp_rejections() {
+        let above_i64 = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{
+          "attributes":[{"key":"too-large","value":{"intValue":"9223372036854775808"}}]
+        }]}]}]}"#;
+        let mut above_i64 = above_i64.as_bytes().to_vec();
+        assert!(parse_otlp_json(&mut above_i64).is_err());
+
+        let negative_time = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{
+          "timeUnixNano":"-1"
+        }]}]}]}"#;
+        let mut negative_time = negative_time.as_bytes().to_vec();
+        assert!(parse_otlp_json(&mut negative_time).is_err());
+
+        let beyond_arrow_ns = r#"{"resourceLogs":[{"scopeLogs":[{"logRecords":[{
+          "timeUnixNano":"10000000000000000000"
+        }]}]}]}"#;
+        let mut beyond_arrow_ns = beyond_arrow_ns.as_bytes().to_vec();
+        let request = parse_otlp_json(&mut beyond_arrow_ns).unwrap();
+        assert!(otlp_logs_to_record_batch(request).is_err());
     }
 
     #[test]
@@ -812,7 +1262,8 @@ mod tests {
     #[test]
     fn decodes_protobuf_via_opentelemetry_proto() {
         use opentelemetry_proto::tonic::common::v1::{
-            any_value::Value as PValue, AnyValue as PAnyValue, KeyValue as PKeyValue,
+            any_value::Value as PValue, AnyValue as PAnyValue,
+            InstrumentationScope as PInstrumentationScope, KeyValue as PKeyValue,
         };
         use opentelemetry_proto::tonic::logs::v1::{
             LogRecord as PLogRecord, ResourceLogs as PResourceLogs, ScopeLogs as PScopeLogs,
@@ -836,20 +1287,40 @@ mod tests {
                         pstr("host.name", "pb-host"),
                         pstr("service.name", "billing"),
                     ],
+                    dropped_attributes_count: 2,
                     ..Default::default()
                 }),
                 scope_logs: vec![PScopeLogs {
+                    scope: Some(PInstrumentationScope {
+                        name: "protobuf-scope".into(),
+                        version: "3.0.0".into(),
+                        attributes: vec![PKeyValue {
+                            key: "scope.bytes".into(),
+                            value: Some(PAnyValue {
+                                value: Some(PValue::BytesValue(vec![0xab, 0xcd])),
+                            }),
+                            ..Default::default()
+                        }],
+                        dropped_attributes_count: 3,
+                    }),
                     log_records: vec![PLogRecord {
                         time_unix_nano: 1_700_000_000_123_456_789,
+                        observed_time_unix_nano: 1_700_000_000_123_456_999,
+                        severity_number: SeverityNumber::Error as i32,
+                        severity_text: "ERROR".into(),
                         body: Some(PAnyValue {
                             value: Some(PValue::StringValue("pb body".into())),
                         }),
                         attributes: vec![pstr("sourcetype", "otel:pb")],
-                        ..Default::default()
+                        dropped_attributes_count: 4,
+                        flags: 1,
+                        trace_id: vec![0x11; 16],
+                        span_id: vec![0x22; 8],
+                        event_name: "payment.failed".into(),
                     }],
-                    ..Default::default()
+                    schema_url: "https://example.test/scope/3.0".into(),
                 }],
-                ..Default::default()
+                schema_url: "https://opentelemetry.io/schemas/1.30.0".into(),
             }],
         };
 
@@ -864,6 +1335,21 @@ mod tests {
         assert_eq!(event.sourcetype, "otel:pb");
         assert_eq!(event.raw, "pb body");
         assert_eq!(event.timestamp.timestamp(), 1_700_000_000);
+        let attrs: serde_json::Value =
+            serde_json::from_str(event.attributes.as_deref().unwrap()).unwrap();
+        assert_eq!(attrs["otel"]["severity_number"], 17);
+        assert_eq!(attrs["otel"]["severity_text"], "ERROR");
+        assert_eq!(
+            attrs["otel"]["trace_id"],
+            "11111111111111111111111111111111"
+        );
+        assert_eq!(attrs["otel"]["span_id"], "2222222222222222");
+        assert_eq!(attrs["otel"]["flags"], 1);
+        assert_eq!(attrs["otel"]["event_name"], "payment.failed");
+        assert_eq!(attrs["otel"]["dropped_attributes_count"], 4);
+        assert_eq!(attrs["otel"]["resource"]["dropped_attributes_count"], 2);
+        assert_eq!(attrs["otel"]["scope"]["version"], "3.0.0");
+        assert_eq!(attrs["otel"]["scope"]["attributes"]["scope.bytes"], "abcd");
     }
 
     #[test]

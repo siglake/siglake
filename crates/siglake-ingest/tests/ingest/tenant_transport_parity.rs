@@ -24,6 +24,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::Array;
 use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
@@ -31,8 +32,8 @@ use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::LogsSe
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest as ProtoLogsRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest as ProtoTracesRequest;
-use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
-use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use opentelemetry_proto::tonic::common::v1::{AnyValue, InstrumentationScope, KeyValue};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use serde_json::json;
@@ -46,7 +47,7 @@ use siglake_ingest::{
     router, AppState, AuthTokens, OtlpGrpcLogsService, OtlpGrpcTracesService, TenantRouting,
     TenantWalRouter, TENANT_HEADER,
 };
-use siglake_wal::WalWriter;
+use siglake_wal::{list_sealed, read_segment, WalWriter};
 
 use crate::fake_idp::{issue_jwt_with_tenant, spawn_fake_idp};
 
@@ -124,6 +125,24 @@ impl Ingester {
         self.root.path().join(tenant).exists()
     }
 
+    fn sealed_log_attributes(&self, tenant: &str) -> Vec<serde_json::Value> {
+        let mut values = Vec::new();
+        for path in list_sealed(&self.root.path().join(tenant)).unwrap() {
+            for batch in read_segment(&path).unwrap() {
+                let attributes = batch
+                    .column_by_name("attributes")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap();
+                for row in 0..attributes.len() {
+                    values.push(serde_json::from_str(attributes.value(row)).unwrap());
+                }
+            }
+        }
+        values
+    }
+
     async fn http_logs(&self, tenant: Option<&str>, auth: Option<&str>) -> Outcome {
         let mut req = HttpRequest::builder()
             .method("POST")
@@ -183,7 +202,11 @@ fn otlp_logs_json() -> String {
                 "logRecords": [{
                     "timeUnixNano": "1700000000000000000",
                     "body": { "stringValue": "hello" },
-                    "severityText": "INFO"
+                    "severityNumber": "SEVERITY_NUMBER_INFO",
+                    "severityText": "INFO",
+                    "flags": 1,
+                    "traceId": "11111111111111111111111111111111",
+                    "spanId": "2222222222222222"
                 }]
             }]
         }]
@@ -213,9 +236,17 @@ fn proto_logs() -> ProtoLogsRequest {
                 ..Default::default()
             }),
             scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "t".to_string(),
+                    ..Default::default()
+                }),
                 log_records: vec![LogRecord {
                     time_unix_nano: 1_700_000_000_000_000_000,
+                    severity_number: SeverityNumber::Info as i32,
                     severity_text: "INFO".to_string(),
+                    flags: 1,
+                    trace_id: vec![0x11; 16],
+                    span_id: vec![0x22; 8],
                     body: Some(AnyValue {
                         value: Some(
                             opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
@@ -230,6 +261,26 @@ fn proto_logs() -> ProtoLogsRequest {
             ..Default::default()
         }],
     }
+}
+
+#[tokio::test]
+async fn http_and_grpc_logs_preserve_the_same_standard_fields() {
+    let ingester = Ingester::new();
+
+    assert_eq!(ingester.http_logs(None, None).await, Outcome::Accepted);
+    assert_eq!(ingester.grpc_logs(None, None).await, Outcome::Accepted);
+
+    let attributes = ingester.sealed_log_attributes("default");
+    assert_eq!(attributes.len(), 2);
+    assert_eq!(attributes[0], attributes[1]);
+    assert_eq!(attributes[0]["otel"]["severity_number"], 9);
+    assert_eq!(attributes[0]["otel"]["severity_text"], "INFO");
+    assert_eq!(
+        attributes[0]["otel"]["trace_id"],
+        "11111111111111111111111111111111"
+    );
+    assert_eq!(attributes[0]["otel"]["span_id"], "2222222222222222");
+    assert_eq!(attributes[0]["otel"]["scope"]["name"], "t");
 }
 
 fn proto_traces() -> ProtoTracesRequest {

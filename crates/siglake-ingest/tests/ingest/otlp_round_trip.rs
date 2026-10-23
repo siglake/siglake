@@ -10,8 +10,12 @@ use prost::Message;
 use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 
+use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
-use opentelemetry_proto::tonic::common::v1::{any_value::Value as ProtoValue, AnyValue, KeyValue};
+use opentelemetry_proto::tonic::common::v1::{
+    any_value::Value as ProtoValue, AnyValue, InstrumentationScope, KeyValue,
+};
+use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs, SeverityNumber};
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use siglake_ingest::{router, AppState, AuthTokens, TenantRouting, TenantWalRouter};
@@ -86,6 +90,76 @@ fn otlp_logs(host: &str, body: &str, sourcetype: &str) -> serde_json::Value {
             }]
         }]
     })
+}
+
+fn otlp_logs_fidelity_json() -> serde_json::Value {
+    serde_json::json!({
+        "resourceLogs": [{
+            "schemaUrl": "https://opentelemetry.io/schemas/1.30.0",
+            "resource": { "attributes": [
+                { "key": "host.name", "value": { "stringValue": "json-host" } },
+                { "key": "shared", "value": { "intValue": "1" } }
+            ]},
+            "scopeLogs": [{
+                "schemaUrl": "https://example.test/scope/1.0",
+                "scope": {
+                    "name": "http-json",
+                    "version": "1.2.3",
+                    "attributes": [{
+                        "key": "scope.array",
+                        "value": { "arrayValue": { "values": [
+                            { "intValue": "9223372036854775807" },
+                            { "bytesValue": "AQI=" }
+                        ]}}
+                    }]
+                },
+                "logRecords": [{
+                    "observedTimeUnixNano": "1700000000123456789",
+                    "severityNumber": "SEVERITY_NUMBER_INFO",
+                    "severityText": "INFO",
+                    "flags": 1,
+                    "traceId": "00112233445566778899AABBCCDDEEFF",
+                    "spanId": "8899AABBCCDDEEFF",
+                    "eventName": "http.event",
+                    "attributes": [
+                        { "key": "shared", "value": { "intValue": "2" } },
+                        { "key": "large", "value": { "intValue": "-9223372036854775808" } }
+                    ]
+                }]
+            }]
+        }]
+    })
+}
+
+fn otlp_logs_fidelity_protobuf() -> ExportLogsServiceRequest {
+    ExportLogsServiceRequest {
+        resource_logs: vec![ResourceLogs {
+            resource: Some(Resource {
+                attributes: vec![proto_str("host.name", "protobuf-host")],
+                ..Default::default()
+            }),
+            scope_logs: vec![ScopeLogs {
+                scope: Some(InstrumentationScope {
+                    name: "http-protobuf".into(),
+                    version: "4.5.6".into(),
+                    ..Default::default()
+                }),
+                log_records: vec![LogRecord {
+                    time_unix_nano: 1_700_000_001_000_000_000,
+                    observed_time_unix_nano: u64::MAX,
+                    severity_number: SeverityNumber::Error as i32,
+                    severity_text: "ERROR".into(),
+                    flags: 1,
+                    trace_id: vec![0x11; 16],
+                    span_id: vec![0x22; 8],
+                    event_name: "protobuf.event".into(),
+                    ..Default::default()
+                }],
+                schema_url: "https://example.test/scope/4.0".into(),
+            }],
+            ..Default::default()
+        }],
+    }
 }
 
 fn otlp_traces_json(name: &str) -> serde_json::Value {
@@ -196,6 +270,26 @@ async fn post_logs(
     .await
 }
 
+async fn post_logs_protobuf(
+    app: &Router,
+    tenant: Option<&str>,
+    payload: &ExportLogsServiceRequest,
+) -> axum::response::Response {
+    send(
+        app,
+        SendSpec {
+            method: "POST",
+            uri: "/v1/logs",
+            tenant,
+            index: None,
+            auth: None,
+            content_type: "application/x-protobuf",
+            body: payload.encode_to_vec(),
+        },
+    )
+    .await
+}
+
 async fn post_traces_json(
     app: &Router,
     tenant: Option<&str>,
@@ -296,6 +390,68 @@ async fn otlp_logs_land_in_default_tenant_wal() {
         .downcast_ref::<arrow_array::StringArray>()
         .unwrap();
     assert!(raw.value(0).contains("event"));
+}
+
+#[tokio::test]
+async fn otlp_log_fidelity_survives_http_json_and_protobuf_wal_round_trips() {
+    let (app, tmp) = build_app(None).await;
+    for _ in 0..6 {
+        let response = post_logs(
+            &app,
+            Some("json-fidelity"),
+            None,
+            &otlp_logs_fidelity_json(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    for _ in 0..6 {
+        let response = post_logs_protobuf(
+            &app,
+            Some("protobuf-fidelity"),
+            &otlp_logs_fidelity_protobuf(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let read_attributes = |tenant: &str| {
+        let sealed = list_sealed(&tmp.path().join(tenant)).unwrap();
+        let batches = read_segment(&sealed[0]).unwrap();
+        let attributes = batches[0]
+            .column_by_name("attributes")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        serde_json::from_str::<serde_json::Value>(attributes.value(0)).unwrap()
+    };
+
+    let json = read_attributes("json-fidelity");
+    assert_eq!(json["shared"], 2);
+    assert_eq!(json["large"], i64::MIN);
+    assert_eq!(json["otel"]["severity_number"], 9);
+    assert_eq!(json["otel"]["trace_id"], "00112233445566778899aabbccddeeff");
+    assert_eq!(json["otel"]["resource"]["attributes"]["shared"], 1);
+    assert_eq!(json["otel"]["scope"]["version"], "1.2.3");
+    assert_eq!(
+        json["otel"]["scope"]["attributes"]["scope.array"],
+        serde_json::json!([i64::MAX, "AQI="])
+    );
+
+    let protobuf = read_attributes("protobuf-fidelity");
+    assert_eq!(protobuf["otel"]["severity_number"], 17);
+    assert_eq!(
+        protobuf["otel"]["trace_id"],
+        "11111111111111111111111111111111"
+    );
+    assert_eq!(protobuf["otel"]["span_id"], "2222222222222222");
+    assert_eq!(
+        protobuf["otel"]["observed_time_unix_nano"].as_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(protobuf["otel"]["timestamp_source"], "time_unix_nano");
+    assert_eq!(protobuf["otel"]["scope"]["version"], "4.5.6");
 }
 
 #[tokio::test]
