@@ -40,13 +40,19 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   of the same metadata shape takes a repeat from 68 ms to 1.7 ms with no footer
   reads. That is a debug-build local source measurement; no round has yet
   measured it on one image and one snapshot, so the retained Big5 numbers it
-  targets stay historical cross-system observations. On a small query pod the
-  reuse may not help: the cache takes 3% of a metadata-cache budget that floors
-  at 64 MiB, so a 2 GiB pod gives it about 2 MiB, and a canonical 32-file
-  snapshot's decoded footers do not fit. Eviction is counted on
-  `siglake_cache_evictions_total{cache="numeric_topk_metadata"}`. A snapshot
-  whose files place the target column at different leaf ordinals is refused and
-  takes the ordinary plan. The qualification protocol is in
+  targets stay historical cross-system observations. The cache takes 3% of the
+  metadata-cache budget, which is one eighth of the readable memory sizing
+  limit clamped to 64 MiB–2 GiB. A 2 GiB sizing limit therefore gives this cache
+  8,053,063 bytes (about 7.68 MiB), while the packaged 4 GiB limit gives it
+  16,106,127 bytes (about 15.36 MiB). The local fixture retained 8,094,944
+  bytes: 41,881 bytes above the derived 2 GiB capacity and below the packaged
+  4 GiB capacity. That fixture measurement does not establish the canonical
+  snapshot's narrowed retained footprint or field reuse. Runtime pressure is
+  reported by `siglake_cache_evictions_total{cache="numeric_topk_metadata"}`
+  and oversized single entries by
+  `siglake_cache_admission_refused_total{cache="numeric_topk_metadata"}`. A
+  snapshot whose files place the target column at different leaf ordinals is
+  refused and takes the ordinary plan. The qualification protocol is in
   [`DESIGN_numeric_topk.md`](DESIGN_numeric_topk.md) and `SIGLAKE_NUMERIC_TOPK=0`
   turns the route off at process startup.
 - **The persistent ingest lane cap has no timed reclamation.** Once
