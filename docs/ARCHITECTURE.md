@@ -1314,7 +1314,9 @@ through 200 GB and 1 TB sustained-ingest rounds
   fan-in (≤64) of one level's files toward the next level's size through a
   gap-aware bin packer that never splits a time-overlapping cluster across
   bins (disjointness is the query-performance invariant). Optional per-table
-  window sealing bounds output time spans.
+  window sealing bounds output time spans. The pass covers `events`, the
+  optional `query_audit` table and every managed index; each uses its declared
+  schema, time sort and bloom columns.
 - **Per-tier cadence.** L0 rescans every ~10 s, L1 every minute, colder levels
   hourly — the leading edge gets the attention; cold rescans don't pay
   needless manifest walks.
@@ -1392,7 +1394,8 @@ through 200 GB and 1 TB sustained-ingest rounds
   against the packaged 1Gi compactor in
   [`DESIGN_row_group_target_qualification.md`](DESIGN_row_group_target_qualification.md),
   which keeps it and records 64 MiB as a compactor-scoped candidate for 0.2.0.
-- **Metadata hygiene on the same loop:** snapshot expiry (count + age),
+- **Metadata hygiene on the same loop:** snapshot expiry (count + age) across
+  `events`, the optional `query_audit` table and every managed index,
   orphan-file GC with its own safety age (deliberately not the retention
   window — a file younger than the longest write-then-commit gap may be about
   to be committed), table-generic retention sweeps (file/day-granular), and
@@ -1510,7 +1513,10 @@ process. For batch jobs,
 queued future starts on the dedicated batch runtime; it excludes both
 batch-runtime queue time and the HTTP `202` handoff. The jobs API exposes
 `submitted_at`, `started_at`, and `ended_at` separately when clients need those
-intervals.
+intervals. The ordinary compactor applies the configured snapshot retention and
+the bounded flat or leveled small-file policy to this table. A missing audit
+table is skipped, and an audit maintenance error does not stop maintenance of
+`events` or managed indexes.
 
 **Batch jobs are owned by an executor, not by the tier.** The batch-job store
 is the catalog Postgres — the database the query pods already connect to —
