@@ -23308,12 +23308,12 @@ impl IcebergContext {
         Ok(all_stats)
     }
 
-    /// Run one bounded re-clustering pass over **every** managed index — the
-    /// built-in `events` table plus every user-created index — so a custom index
-    /// consolidates its small files just like `events` does. Each index is healed
-    /// independently; a failure on one is logged and skipped so it can't starve
-    /// the others. Returns the concatenated per-partition stats across all
-    /// indexes that were acted on (empty if nothing needed healing).
+    /// Run one bounded re-clustering pass over every maintained table: the
+    /// built-in `events` and `query_audit` tables plus every user-created index.
+    /// Each table is healed independently; a failure on one is logged and
+    /// skipped so it can't starve the others. Returns the concatenated
+    /// per-partition stats across all tables that were acted on (empty if
+    /// nothing needed healing).
     pub async fn recluster_all_indexes(
         &self,
         policy: ReclusterPolicy,
@@ -23339,6 +23339,26 @@ impl IcebergContext {
                     "re-clustering pass for index failed; continuing with other indexes"
                 ),
             }
+        }
+        let audit_ident = self.query_audit_table_ident();
+        match self.catalog.table_exists(&audit_ident).await {
+            Ok(true) => match self
+                .recluster_pass(&audit_ident, QUERY_AUDIT_BLOOM_COLUMNS, policy)
+                .await
+            {
+                Ok(stats) => all.extend(stats),
+                Err(e) => tracing::warn!(
+                    table = %audit_ident.name(),
+                    error = ?e,
+                    "re-clustering pass for query audit failed; continuing"
+                ),
+            },
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                table = %audit_ident.name(),
+                error = ?e,
+                "could not check query-audit table for re-clustering; continuing"
+            ),
         }
         Ok(all)
     }
@@ -24042,8 +24062,9 @@ impl IcebergContext {
     }
 
     /// Leveled counterpart of [`Self::recluster_all_indexes`]: run one bounded
-    /// [`Self::recluster_pass_leveled`] over the `events` table plus every managed
-    /// index, healing each independently (a failure on one is logged + skipped).
+    /// [`Self::recluster_pass_leveled`] over the `events` and `query_audit`
+    /// tables plus every managed index, healing each independently (a failure
+    /// on one is logged + skipped).
     pub async fn recluster_all_indexes_leveled(
         &self,
         levels: &LevelPolicy,
@@ -24083,6 +24104,35 @@ impl IcebergContext {
                     "leveled re-clustering pass for index failed; continuing with other indexes"
                 ),
             }
+        }
+        if opts.preempt.as_ref().is_some_and(|p| p()) {
+            return Ok(all);
+        }
+        let audit_ident = self.query_audit_table_ident();
+        match self.catalog.table_exists(&audit_ident).await {
+            Ok(true) => match self
+                .recluster_pass_leveled(
+                    &audit_ident,
+                    QUERY_AUDIT_BLOOM_COLUMNS,
+                    levels,
+                    policy,
+                    opts,
+                )
+                .await
+            {
+                Ok(stats) => all.extend(stats),
+                Err(e) => tracing::warn!(
+                    table = %audit_ident.name(),
+                    error = ?e,
+                    "leveled re-clustering pass for query audit failed; continuing"
+                ),
+            },
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                table = %audit_ident.name(),
+                error = ?e,
+                "could not check query-audit table for leveled re-clustering; continuing"
+            ),
         }
         Ok(all)
     }

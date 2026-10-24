@@ -2905,7 +2905,7 @@ impl Compactor {
         metrics::counter!("siglake_inline_coverage_census_total").increment(1);
     }
 
-    /// Run a single snapshot-metadata expiry pass over the events table,
+    /// Run a single snapshot-metadata expiry pass over every maintained table,
     /// retaining the configured number of recent snapshots. Non-destructive
     /// (metadata only) and idempotent — a second pass at the same retention
     /// expires nothing. Returns the number of snapshots expired (0 if expiry
@@ -2931,6 +2931,16 @@ impl Compactor {
         // reports `events` as a built-in index, so naive concatenation visits it
         // twice.
         let mut idents = vec![self.ice.events_table_ident().clone()];
+        let audit_ident = self.ice.query_audit_table_ident();
+        match self.ice.catalog().table_exists(&audit_ident).await {
+            Ok(true) => idents.push(audit_ident),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                table = %audit_ident.name(),
+                error = %e,
+                "could not check query-audit table for snapshot expiry; continuing"
+            ),
+        }
         for config in self.ice.list_indexes().await.unwrap_or_default() {
             let ident = self.ice.index_table_ident(&config.index_id);
             if !idents.contains(&ident) {

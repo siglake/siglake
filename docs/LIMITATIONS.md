@@ -423,6 +423,19 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   is full, as before. Per-row delivery is therefore best-effort in both
   directions: the `query_audit` table is an operational record, not an
   accounting one.
+- **Audit maintenance does not reclaim old Iceberg metadata JSON files.** The
+  automatic compactor now includes `query_audit` in snapshot expiry and in the
+  bounded flat or leveled small-file pass. This bounds the current snapshot
+  list and live-file count while preserving the audit rows. Snapshot expiry
+  leaves expired manifest lists, manifests and data files for the existing
+  age-gated orphan collector, and that collector deliberately excludes
+  `*.metadata.json` and `version-hint.text`. An upgraded deployment therefore
+  does not recover every byte written before the fix, and each future commit
+  still leaves one old metadata JSON object. The exact v0.3.0 local census also
+  found both effects before maintenance: after seven workload cycles,
+  `query_audit` held 36 Parquet files and 37 metadata JSON objects. A qualified
+  duration rerun is still required before attributing the released run's total
+  physical growth to this source change.
 - **Dropping an index records cleanup inventory but does not reclaim storage.**
   Before `DELETE /api/v1/indexes/{id}` removes the catalog entry, it writes and
   confirms a warehouse-root record containing the loaded table's UUID, exact

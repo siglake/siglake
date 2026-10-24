@@ -346,6 +346,15 @@ unbounded un-compacted layout's *read* amplification at query time.
   records the selected geometry, path and eligibility reason; the scaled
   64-input then two-small-bin regression retains RSS and exact row parity
   evidence.
+- **A.4.6 — Built-in audit maintenance** ✅ *(source; duration qualification
+  pending).* The same automatic snapshot-expiry and bounded flat or leveled
+  re-clustering passes now visit the optional `query_audit` table with its own
+  schema, timestamp sort and bloom columns. Per-table failures remain isolated.
+  The regression compares all 14 columns, including nulls and duplicate rows,
+  accepts a fresh append after maintenance, checks exact status aggregates, and
+  bounds retained snapshots.
+  This does not reclaim old `metadata.json` objects; the duration rerun must
+  measure total physical growth rather than infer it from snapshot counts.
 
 ### A.5 Validation
 
