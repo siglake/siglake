@@ -1064,6 +1064,7 @@ fn session_state_template() -> &'static datafusion::execution::session_state::Se
                     .expect("query runtime environment must be constructible"),
             )
             .with_default_features()
+            .with_physical_optimizer_rule(Arc::new(query_provider::ClippedLimitBackpressureRule))
             .build()
     })
 }

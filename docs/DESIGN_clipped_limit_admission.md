@@ -229,6 +229,43 @@ exact rows, bytes and file count. This is a bounded local cause proof, not an
 AWS speedup claim; the unchanged matched qualification must be rerun against
 the gated source.
 
+## Coalesce backpressure (#7339)
+
+The restored #7204 candidate removed repeated cost-mapping work, but its warm
+collection still averaged 15.09 ms for `keyword`, 19.18 ms for
+`keyword_last25`, and 8.83 ms for `substring_scan`. The five measured samples
+scanned 386,188--400,524, 231,424--238,592, and 362,636--400,524 source rows,
+respectively. Each `keyword` response opened all 15 cached readers and decoded
+27.9--28.9 MB despite returning 100 rows. Cost estimation averaged only
+0.126--0.158 ms, so it was no longer the material phase.
+
+The remaining avoidable work was between admission and cancellation.
+DataFusion's `CoalescePartitionsExec` sizes its shared channel to the input
+partition count. A producer runs the complete residual filter in its partition
+task, sends a filtered batch into that channel, and immediately polls the scan
+again while the root has not yet observed the first batch. With 15 partitions,
+one admitted producer could buffer many filtered batches. Its raw source
+batches also paid paced admission credits, opening more readers before the
+global limit dropped the plan.
+
+The clipped shape now substitutes an equivalent coalescer whose shared channel
+holds one batch. At most one batch is buffered and one is held by a blocked
+sender; the root then observes the first filtered batch and cancellation closes
+the senders. This changes neither the filter nor the `LIMIT`: every admitted
+partition still runs the complete predicate, sparse predicates retain the same
+batch and terminal admission credits, and unordered SQL continues to permit
+any qualifying rows.
+
+`one_batch_coalesce_bounds_dense_residual_producer_runahead` holds a 16-file
+snapshot and dense residual predicate fixed. The bounded arm returned 100
+distinct qualifying rows while opening one reader and decoding 138,364 bytes;
+the ordinary-coalesce control returned the same cardinality and predicate
+domain while opening 16 readers and decoding 691,820 bytes. Drain time was
+7.65 ms versus 12.35 ms in that diagnostic run; the work counters, rather than
+one local timing pair, are the regression oracle. This local result does not
+qualify the AWS ceilings. The unchanged matched field qualification remains
+required.
+
 ## Local measurement
 
 `the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit`: 16

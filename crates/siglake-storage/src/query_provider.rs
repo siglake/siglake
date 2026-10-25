@@ -23,12 +23,15 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::{Expr, Like, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
-use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
 use datafusion::scalar::ScalarValue;
 use futures::future::{BoxFuture, FutureExt};
@@ -6540,6 +6543,226 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             }
         }
         Ok(stats)
+    }
+}
+
+/// Keep a clipped residual scan from outrunning the `LIMIT` through
+/// DataFusion's partition coalescer.
+///
+/// `CoalescePartitionsExec` sizes its shared batch channel to the input
+/// partition count. That is useful for an ordinary parallel scan, but defeats
+/// the staged start above it: one admitted producer can fill the whole channel
+/// with already-filtered batches before the root observes its first batch and
+/// cancels at the limit. Those raw batches also advance [`ScanAdmission`], so
+/// the buffered work can open more readers. This equivalent coalescer keeps
+/// one batch in the shared channel. A sender can decode at most the batch it is
+/// trying to send ahead of that, while empty/sparse inputs retain the existing
+/// terminal and paced-batch progress rules.
+#[derive(Debug)]
+struct ClippedLimitCoalesceExec {
+    input: Arc<dyn ExecutionPlan>,
+    fetch: Option<usize>,
+    metrics: ExecutionPlanMetricsSet,
+    properties: Arc<PlanProperties>,
+}
+
+impl ClippedLimitCoalesceExec {
+    fn new(input: Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> Self {
+        let standard = CoalescePartitionsExec::new(input.clone()).with_fetch(fetch);
+        Self {
+            input,
+            fetch,
+            metrics: ExecutionPlanMetricsSet::new(),
+            properties: standard.properties().clone(),
+        }
+    }
+}
+
+impl DisplayAs for ClippedLimitCoalesceExec {
+    fn fmt_as(
+        &self,
+        _t: datafusion::physical_plan::DisplayFormatType,
+        f: &mut std::fmt::Formatter,
+    ) -> std::fmt::Result {
+        match self.fetch {
+            Some(fetch) => write!(f, "ClippedLimitCoalesceExec: fetch={fetch}, buffer=1"),
+            None => write!(f, "ClippedLimitCoalesceExec: buffer=1"),
+        }
+    }
+}
+
+impl ExecutionPlan for ClippedLimitCoalesceExec {
+    fn name(&self) -> &str {
+        "ClippedLimitCoalesceExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Plan(format!(
+                "ClippedLimitCoalesceExec requires one child, got {}",
+                children.len()
+            )));
+        }
+        Ok(Arc::new(Self::new(children.swap_remove(0), self.fetch)))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "ClippedLimitCoalesceExec invalid partition {partition}"
+            )));
+        }
+        let input_partitions = self
+            .input
+            .properties()
+            .output_partitioning()
+            .partition_count();
+        if input_partitions == 0 {
+            return Err(DataFusionError::Execution(
+                "ClippedLimitCoalesceExec requires at least one input partition".into(),
+            ));
+        }
+
+        let mut builder = RecordBatchReceiverStream::builder(self.schema(), 1);
+        for input_partition in 0..input_partitions {
+            let input = self.input.clone();
+            let context = context.clone();
+            let output = builder.tx();
+            builder.spawn(async move {
+                let mut stream = match input.execute(input_partition, context) {
+                    Ok(stream) => stream,
+                    Err(error) => {
+                        output.send(Err(error)).await.ok();
+                        return Ok(());
+                    }
+                };
+                while let Some(item) = stream.next().await {
+                    let is_error = item.is_err();
+                    if output.send(item).await.is_err() || is_error {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            });
+        }
+        let baseline = BaselineMetrics::new(&self.metrics, partition);
+        Ok(Box::pin(LimitStream::new(
+            builder.build(),
+            0,
+            self.fetch,
+            baseline,
+        )))
+    }
+
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
+        self.input
+            .partition_statistics(None)?
+            .with_fetch(self.fetch, 0, 1)
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    fn supports_limit_pushdown(&self) -> bool {
+        true
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
+}
+
+fn contains_clipped_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    if plan
+        .as_any()
+        .downcast_ref::<SiglakeIcebergTableScan>()
+        .is_some_and(|scan| scan.admission.is_some())
+    {
+        return true;
+    }
+    plan.children().into_iter().any(contains_clipped_scan)
+}
+
+fn apply_clipped_limit_backpressure(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let old_children: Vec<_> = plan.children().into_iter().cloned().collect();
+    let mut changed = false;
+    let mut new_children = Vec::with_capacity(old_children.len());
+    for child in old_children {
+        let rewritten = apply_clipped_limit_backpressure(child.clone())?;
+        changed |= !Arc::ptr_eq(&child, &rewritten);
+        new_children.push(rewritten);
+    }
+    let plan = if changed {
+        plan.with_new_children(new_children)?
+    } else {
+        plan
+    };
+
+    let Some(coalesce) = plan.as_any().downcast_ref::<CoalescePartitionsExec>() else {
+        return Ok(plan);
+    };
+    let input = coalesce.input().clone();
+    if coalesce.fetch().is_some()
+        && input.properties().output_partitioning().partition_count() > 1
+        && contains_clipped_scan(&input)
+    {
+        return Ok(Arc::new(ClippedLimitCoalesceExec::new(
+            input,
+            coalesce.fetch(),
+        )));
+    }
+    Ok(plan)
+}
+
+/// Final physical-plan rule for the unordered clipped-LIMIT shape only.
+#[derive(Debug)]
+pub(crate) struct ClippedLimitBackpressureRule;
+
+impl datafusion::physical_optimizer::PhysicalOptimizerRule for ClippedLimitBackpressureRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &datafusion::common::config::ConfigOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        apply_clipped_limit_backpressure(plan)
+    }
+
+    fn name(&self) -> &str {
+        "clipped_limit_backpressure"
+    }
+
+    fn schema_check(&self) -> bool {
+        true
     }
 }
 
