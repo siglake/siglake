@@ -2540,7 +2540,13 @@ impl Compactor {
                             .increment(report.promoted.len() as u64);
                         "promoted"
                     };
-                    note_auto_promotion_pass(&iceberg_namespace, &table, outcome);
+                    // Keep the acceptance marker independent of the bounded
+                    // diagnostic payload below.  The wave reader requires one
+                    // exact namespace/table-attributed completion line; emit
+                    // that small line before publishing the completion metric,
+                    // so a metric delta with no line proves a capture gap rather
+                    // than an ambiguous product branch.
+                    finish_auto_promotion_pass(&iceberg_namespace, &table, outcome);
                     note_auto_promotion_declines(&iceberg_namespace, &table, &report.declined);
                     let (ceiling, ceiling_truncated) =
                         declined_keys(&report.declined, AutoPromotionDeclineReason::ColumnCeiling);
@@ -2577,7 +2583,7 @@ impl Compactor {
                         declined_name_collision_truncated = collisions_truncated,
                         declined_mixed_type = ?mixed,
                         declined_mixed_type_truncated = mixed_truncated,
-                        "auto-promotion pass finished"
+                        "auto-promotion pass details"
                     );
                 }
                 Err(error) => {
@@ -7121,6 +7127,16 @@ fn note_auto_promotion_pass(iceberg_namespace: &str, table: &str, outcome: &'sta
     .increment(1);
 }
 
+fn finish_auto_promotion_pass(iceberg_namespace: &str, table: &str, outcome: &'static str) {
+    tracing::info!(
+        %iceberg_namespace,
+        %table,
+        outcome,
+        "auto-promotion pass finished"
+    );
+    note_auto_promotion_pass(iceberg_namespace, table, outcome);
+}
+
 fn note_auto_promotion_declines(
     iceberg_namespace: &str,
     table: &str,
@@ -8057,10 +8073,82 @@ mod auto_promotion_knob_tests {
 #[cfg(test)]
 mod auto_promotion_telemetry_tests {
     use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
 
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(Arc::clone(&self.0))
+        }
+    }
+
+    #[test]
+    fn completed_pass_emits_small_attributed_marker_before_counter() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(captured.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            finish_auto_promotion_pass("tenant_acme", "logs-bench", "promoted");
+        });
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let mut lines = log.lines();
+        let line = lines.next().expect("one completion marker");
+        assert!(lines.next().is_none(), "unexpected extra log line: {log}");
+        assert!(line.contains("auto-promotion pass finished"), "{line}");
+        assert!(line.contains("iceberg_namespace=tenant_acme"), "{line}");
+        assert!(line.contains("table=logs-bench"), "{line}");
+        assert!(line.contains("outcome=\"promoted\""), "{line}");
+
+        let completed = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .find(|(key, _, _, _)| {
+                key.key().name() == "siglake_auto_promotion_passes_total"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "table" && label.value() == "logs-bench")
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "outcome" && label.value() == "promoted")
+            })
+            .expect("completion counter");
+        assert!(matches!(completed.3, DebugValue::Counter(1)));
+    }
 
     #[test]
     fn per_table_series_distinguish_disabled_never_run_and_every_outcome() {

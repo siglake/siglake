@@ -34,6 +34,7 @@ opendal = { workspace = true }
 parquet = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

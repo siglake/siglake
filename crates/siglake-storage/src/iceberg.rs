@@ -3785,6 +3785,11 @@ pub fn preregister_auto_promotion_cost_series(iceberg_namespace: &str, table: &s
     );
     for name in [
         "siglake_compactor_promotion_backfill_bins_total",
+        "siglake_compactor_promotion_backfill_files_selected_total",
+        "siglake_compactor_promotion_backfill_bytes_selected_total",
+        "siglake_compactor_promotion_backfill_bins_started_total",
+        "siglake_compactor_promotion_backfill_files_started_total",
+        "siglake_compactor_promotion_backfill_bytes_started_total",
         "siglake_compactor_promotion_backfill_files_total",
         "siglake_compactor_promotion_backfill_bytes_in_total",
         "siglake_compactor_promotion_backfill_bytes_out_total",
@@ -3793,6 +3798,10 @@ pub fn preregister_auto_promotion_cost_series(iceberg_namespace: &str, table: &s
     }
     let _ = metrics::histogram!(
         "siglake_compactor_promotion_backfill_duration_seconds",
+        "table" => table.to_string()
+    );
+    let _ = metrics::gauge!(
+        "siglake_compactor_promotion_backfill_bins_inflight",
         "table" => table.to_string()
     );
 }
@@ -22213,6 +22222,16 @@ impl IcebergContext {
                 "stage" => stage
             )
             .increment(nanos);
+            if let Ok(attribution) = RECLUSTER_BIN_ATTRIBUTION.try_with(Clone::clone) {
+                metrics::counter!(
+                    "siglake_compactor_bin_merge_stage_nanos_total",
+                    "table" => attribution.table,
+                    "kind" => attribution.kind,
+                    "path" => path.label(),
+                    "stage" => stage
+                )
+                .increment(nanos);
+            }
         }
         let (input, assemble, write) = stages.shares();
         tracing::debug!(
@@ -23797,19 +23816,30 @@ impl IcebergContext {
                         .unwrap_or(0);
                     let slice: Vec<DataFile> =
                         candidates.iter().map(|&i| group[i].clone()).collect();
+                    let selected_bytes = slice
+                        .iter()
+                        .map(|file| file.file_size_in_bytes())
+                        .sum::<u64>();
                     metrics::counter!(
                         "siglake_compactor_promotion_backfill_bins_total",
                         "table" => table_label.clone()
                     )
                     .increment(1);
+                    metrics::counter!(
+                        "siglake_compactor_promotion_backfill_files_selected_total",
+                        "table" => table_label.clone()
+                    )
+                    .increment(slice.len() as u64);
+                    metrics::counter!(
+                        "siglake_compactor_promotion_backfill_bytes_selected_total",
+                        "table" => table_label.clone()
+                    )
+                    .increment(selected_bytes);
                     tracing::info!(
                         table = %table_label,
                         files = slice.len(),
-                        bytes_in = slice
-                            .iter()
-                            .map(|file| file.file_size_in_bytes())
-                            .sum::<u64>(),
-                        "promotion backfill: rewriting pre-promotion files"
+                        bytes_in = selected_bytes,
+                        "promotion backfill selected"
                     );
                     scored.push(ScoredBin {
                         score: 0,
@@ -23920,20 +23950,39 @@ impl IcebergContext {
                 return Ok(None);
             }
             let bin_files = bin.files.len();
+            let bin_bytes = bin
+                .files
+                .iter()
+                .map(|file| file.file_size_in_bytes())
+                .sum::<u64>();
             let bin_level = bin.level;
             let bin_kind = bin.kind;
             let bin_start = std::time::Instant::now();
+            let mut promotion_flight = (bin_kind == ScoredBinKind::Backfill).then(|| {
+                PromotionBackfillInFlight::start(table_label.clone(), bin_files, bin_bytes)
+            });
             // Account this bin's uploads to the COMPACTION class so they cannot
             // starve the drain's (and vice versa). See `UploadClass`.
-            let stats = iceberg_storage_opendal::with_upload_class(
-                iceberg_storage_opendal::UploadClass::Compaction,
-                ice.recluster_files(table_ident, bin.files, bloom_columns),
-            )
-            .await?;
+            let attribution = ReclusterBinAttribution {
+                table: table_label.clone(),
+                kind: bin_kind.label(),
+            };
+            let stats = RECLUSTER_BIN_ATTRIBUTION
+                .scope(
+                    attribution,
+                    iceberg_storage_opendal::with_upload_class(
+                        iceberg_storage_opendal::UploadClass::Compaction,
+                        ice.recluster_files(table_ident, bin.files, bloom_columns),
+                    ),
+                )
+                .await?;
             if let Some(on_bin) = opts.on_bin.as_ref() {
                 on_bin();
             }
             let bin_secs = bin_start.elapsed().as_secs_f64();
+            if let Some(flight) = promotion_flight.as_mut() {
+                flight.finish(&stats, bin_secs);
+            }
             // PER-BIN progress. The pass-level counters
             // (`recluster_files_removed_total`, `..._passes_total`) increment only
             // when a whole pass COMPLETES, and a pass is up to `MAX_BINS` bins --
@@ -34315,6 +34364,184 @@ fn plan_chunk_fetches(chunk: &[crate::merge::MergeRun]) -> ChunkFetchPlan {
 struct BinOpts {
     preempt: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
     on_bin: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone)]
+struct ReclusterBinAttribution {
+    table: String,
+    kind: &'static str,
+}
+
+tokio::task_local! {
+    static RECLUSTER_BIN_ATTRIBUTION: ReclusterBinAttribution;
+}
+
+struct PromotionBackfillInFlight {
+    table: String,
+    files: usize,
+    bytes_in: u64,
+    gauge: metrics::Gauge,
+    finished: bool,
+}
+
+impl PromotionBackfillInFlight {
+    fn start(table: String, files: usize, bytes_in: u64) -> Self {
+        metrics::counter!(
+            "siglake_compactor_promotion_backfill_bins_started_total",
+            "table" => table.clone()
+        )
+        .increment(1);
+        metrics::counter!(
+            "siglake_compactor_promotion_backfill_files_started_total",
+            "table" => table.clone()
+        )
+        .increment(files as u64);
+        metrics::counter!(
+            "siglake_compactor_promotion_backfill_bytes_started_total",
+            "table" => table.clone()
+        )
+        .increment(bytes_in);
+        let gauge = metrics::gauge!(
+            "siglake_compactor_promotion_backfill_bins_inflight",
+            "table" => table.clone()
+        );
+        gauge.increment(1.0);
+        tracing::info!(%table, files, bytes_in, "promotion backfill started");
+        Self {
+            table,
+            files,
+            bytes_in,
+            gauge,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, stats: &ReclusterStats, seconds: f64) {
+        self.finished = true;
+        tracing::info!(
+            table = %self.table,
+            files = self.files,
+            rows = stats.rows,
+            bytes_in = stats.bytes_in,
+            bytes_out = stats.bytes_out,
+            seconds,
+            "promotion backfill committed"
+        );
+    }
+}
+
+impl Drop for PromotionBackfillInFlight {
+    fn drop(&mut self) {
+        self.gauge.decrement(1.0);
+        if !self.finished {
+            tracing::warn!(
+                table = %self.table,
+                files = self.files,
+                bytes_in = self.bytes_in,
+                "promotion backfill stopped before commit"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod promotion_backfill_telemetry_tests {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    use super::*;
+
+    fn labelled(key: &metrics::Key, name: &str, label: &str, value: &str) -> bool {
+        key.name() == name
+            && key
+                .labels()
+                .any(|candidate| candidate.key() == label && candidate.value() == value)
+    }
+
+    #[test]
+    fn unfinished_backfill_retains_admission_and_clears_inflight_gauge() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let flight = PromotionBackfillInFlight::start("logs-bench".into(), 5, 2_547_825_294);
+            drop(flight);
+        }
+
+        let samples = snapshotter.snapshot().into_vec();
+        for (name, expected) in [
+            ("siglake_compactor_promotion_backfill_bins_started_total", 1),
+            (
+                "siglake_compactor_promotion_backfill_files_started_total",
+                5,
+            ),
+            (
+                "siglake_compactor_promotion_backfill_bytes_started_total",
+                2_547_825_294,
+            ),
+        ] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| labelled(key.key(), name, "table", "logs-bench"))
+                .unwrap_or_else(|| panic!("missing {name}: {samples:?}"));
+            assert!(matches!(sample.3, DebugValue::Counter(value) if value == expected));
+        }
+        let inflight = samples
+            .iter()
+            .find(|(key, _, _, _)| {
+                labelled(
+                    key.key(),
+                    "siglake_compactor_promotion_backfill_bins_inflight",
+                    "table",
+                    "logs-bench",
+                )
+            })
+            .expect("inflight gauge");
+        assert!(matches!(inflight.3, DebugValue::Gauge(value) if value.into_inner() == 0.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn backfill_merge_phases_keep_table_and_kind_attribution() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        {
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            RECLUSTER_BIN_ATTRIBUTION
+                .scope(
+                    ReclusterBinAttribution {
+                        table: "logs-bench".into(),
+                        kind: "backfill",
+                    },
+                    async {
+                        IcebergContext::record_merge_stages_inner(
+                            MergePathKind::SliceStreaming,
+                            crate::merge::MergeStageNanos {
+                                input: 11,
+                                assemble: 7,
+                                write: 29,
+                            },
+                        );
+                    },
+                )
+                .await;
+        }
+
+        let samples = snapshotter.snapshot().into_vec();
+        for (stage, expected) in [("input", 11), ("assemble", 7), ("write", 29)] {
+            let sample = samples
+                .iter()
+                .find(|(key, _, _, _)| {
+                    labelled(
+                        key.key(),
+                        "siglake_compactor_bin_merge_stage_nanos_total",
+                        "table",
+                        "logs-bench",
+                    ) && labelled(key.key(), key.key().name(), "kind", "backfill")
+                        && labelled(key.key(), key.key().name(), "stage", stage)
+                })
+                .unwrap_or_else(|| panic!("missing {stage} backfill phase: {samples:?}"));
+            assert!(matches!(sample.3, DebugValue::Counter(value) if value == expected));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

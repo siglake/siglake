@@ -1695,7 +1695,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   the required attributed promotion log was missing, so the original reader
   reported `not_assessed`. These adverse results remain failures; no successful
   young-table or mature-table cost qualification is claimed. A small attachment
-  control does not establish those properties either.
+  control does not establish those properties either. The retained opt-in log
+  shows an unfinished 2.55 GB promotion-backfill bin overlapping the growing
+  sealed queue, but does not retain that bin's input/assembly/write split. The
+  current source records selected, started, in-flight and committed backfill
+  work plus per-kind merge phases; a matched rerun is still required before a
+  scheduling repair or performance claim.
   Setting the threshold to zero stops new automatic declarations; it does not
   undo columns or stop backfill for promotions already declared explicitly or
   automatically.
