@@ -189,8 +189,12 @@ claims. It does not say the feature should be on. Missing:
 2. **The backfill wave.** Each promotion makes every live file eligible for a
    re-clustering rewrite. On a large table that is a whole-table rewrite per
    promotion wave, competing with the drain for the same compactor. The cost is
-   now attributable per committed backfill bin, but nothing paces promotions
-   against it and #5065 has not measured a wave against S3.
+   attributable per selected, started, in-flight and committed backfill bin,
+   including input, assembly and write phases for each table and bin kind.
+   Nothing paces promotions against the drain. #5065's Young11 run admitted an
+   unfinished 2.55 GB backfill while sealed pending rose from 168 to 1,663; its
+   exact phase split was not retained. See
+   [`20261025-auto-promotion-young11-root-cause.md`](../results/release-validation/20261025-auto-promotion-young11-root-cause.md).
 3. **Reach and scope.** The pass runs on the compactor's own namespace and its
    managed indexes. On a multi-tenant install nothing extends it to the
    `tenant_*` namespaces the drain commits into, and the 300 s cadence gate is
@@ -211,8 +215,9 @@ availability sibling is zero on disabled and already-at-cap paths, which still
 perform no data-file reads. `siglake_auto_promotion_columns{kind="used|limit"}`
 publishes usage against the effective configured cap per Iceberg namespace and
 table. The packaged dashboard reads all of these and
-`SiglakeAutoPromotionNearCeiling` warns at 80%. One INFO line per sampled pass
-retains bounded key names by refusal reason and an exact truncation count.
+`SiglakeAutoPromotionNearCeiling` warns at 80%. A small INFO completion marker
+precedes the pass counter; a separate details line retains bounded key names by
+refusal reason and an exact truncation count.
 `siglake_auto_promotion_declined_total{reason}` counts the same refusals. A
 literal dotted parent has its one-level leaves counted as `dotted_parent`
 declines instead of emitting synthesized paths which the v2 extractor resolves
@@ -222,13 +227,20 @@ to NULL.
 the sampling reads per Iceberg namespace and table, while
 `siglake_auto_promotion_pass_duration_seconds` records one duration per sampled
 pass. A round prices the rewrite wave from
+`siglake_compactor_promotion_backfill_files_selected_total`,
+`siglake_compactor_promotion_backfill_bytes_selected_total`, the corresponding
+`*_started_total` series, and
+`siglake_compactor_promotion_backfill_bins_inflight`, together with
 `siglake_compactor_promotion_backfill_files_total`, the paired
 `siglake_compactor_promotion_backfill_bytes_in_total` and
 `siglake_compactor_promotion_backfill_bytes_out_total`, and
 `siglake_compactor_promotion_backfill_duration_seconds`; those series are
-recorded per committed backfill bin and retain the table label.
+recorded per committed backfill bin and retain the table label. The separate
+`siglake_compactor_bin_merge_stage_nanos_total{table,kind,path,stage}` series
+attributes input, assembly and write time for a completed bin. The aggregate
+merge-stage series remains unchanged.
 
-Those five cost series are pre-registered at zero as well (#6482), by the same
+Those cost series are pre-registered at zero as well (#6482), by the same
 discovery loop and for every table it finds, whether or not the feature is on:
 the sampling duration per Iceberg namespace and table, the backfill family per
 table. `siglake_compactor_promotion_backfill_bins_total{table}`, which counts

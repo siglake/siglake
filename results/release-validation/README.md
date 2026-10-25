@@ -8,6 +8,14 @@ Raw metrics and logs live in the run's durable artifact directory; they are not
 benchmark leaderboard inputs. Preserve failed attempts and subsequent reruns.
 The public operations docs are the release-wide coverage ledger.
 
+## October 25, 2026
+
+The [Young11 auto-promotion investigation](20261025-auto-promotion-young11-root-cause.md)
+attributes the adverse freshness result to an unfinished 2.55 GB promotion
+backfill overlapping the growing sealed queue. The retained run does not split
+that bin's input, assembly and write time, so the report adds measurement and
+does not claim a scheduling repair or re-grade the failed result.
+
 ## October 19, 2026
 
 The public **v0.3.0 anonymous smoke passed** on the exact tagged source `f958aaa`.
