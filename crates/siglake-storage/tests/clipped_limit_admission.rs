@@ -74,6 +74,19 @@ async fn table_with(ice: &IcebergContext, needles: impl Fn(usize) -> usize) {
     }
 }
 
+/// A large-file version of [`table_with`] for the producer run-ahead
+/// regression. Every row qualifies, so the complete residual predicate fills
+/// `LIMIT 100` in the first source batch while the file still has many batches
+/// available for a coalesce pump to decode speculatively.
+async fn dense_table_with_rows(ice: &IcebergContext, rows_per_file: usize) {
+    for file in 0..FILES {
+        let events: Vec<Event> = (0..rows_per_file)
+            .map(|row| Event::now(payload(file, row, true)))
+            .collect();
+        ice.append_events(&events).await.unwrap();
+    }
+}
+
 /// What the query server builds for `SELECT … WHERE <residual> LIMIT n` with no
 /// `ORDER BY`: `ClippedScanLimit` and neither ordering extension. `wave` is the
 /// admission ramp factor under test; `0` is the pre-#4865 scan.
@@ -504,6 +517,84 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
          the median of {PAIRS} pairs: gated {gated_median} ungated {ungated_median}, \
          decoded bytes (gated, ungated) {decoded:?} \
          (files gated {gated_files} ungated {ungated_files})"
+    );
+}
+
+/// #7339: staging partition starts is insufficient when the admitted producer
+/// can run ahead through `CoalescePartitionsExec`'s partition-sized channel.
+///
+/// Both arms use the same 16-file snapshot and complete residual predicate.
+/// The control disables clipped admission and therefore keeps DataFusion's
+/// ordinary parallel coalescer. The candidate uses the production admission
+/// hint, which now also replaces that coalescer with a one-batch channel. The
+/// result is unordered by contract, so exactness is cardinality, predicate
+/// membership, distinct source rows, and the same qualifying multiset domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_batch_coalesce_bounds_dense_residual_producer_runahead() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 100;
+    const DENSE_ROWS_PER_FILE: usize = 20_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    dense_table_with_rows(&ice, DENSE_ROWS_PER_FILE).await;
+
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let bounded_ctx = clipped_context(LIMIT, 2);
+    ice.register_with_datafusion(&bounded_ctx).await.unwrap();
+    let control_ctx = clipped_context(LIMIT, 0);
+    ice.register_with_datafusion(&control_ctx).await.unwrap();
+
+    let bounded_plan = bounded_ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let control_plan = control_ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    assert_eq!(bounded_plan.name(), "ClippedLimitCoalesceExec");
+    assert_eq!(control_plan.name(), "CoalescePartitionsExec");
+
+    let bounded = run_arm(&bounded_ctx, &sql, "raw").await;
+    let control = run_arm(&control_ctx, &sql, "raw").await;
+    eprintln!(
+        "CLIPPED-BACKPRESSURE bounded={:?} drain={:?} control={:?} drain={:?}",
+        bounded.work, bounded.drain, control.work, control.drain
+    );
+
+    for (name, run) in [("bounded", &bounded), ("control", &control)] {
+        assert_eq!(run.rows.len(), LIMIT, "{name} must fill the limit");
+        assert_all_qualify(&run.rows, &sql);
+        assert_eq!(
+            run.rows.iter().collect::<HashSet<_>>().len(),
+            LIMIT,
+            "{name} must return distinct source rows"
+        );
+    }
+    assert_eq!(bounded.work.partitions, control.work.partitions);
+    assert!(
+        bounded.work.files_read <= 2,
+        "the bounded arm must cancel before opening the wide scan: {:?}",
+        bounded.work
+    );
+    assert!(
+        control.work.files_read > 2,
+        "the ordinary coalescer must reproduce wide producer run-ahead: {:?}",
+        control.work
+    );
+    assert!(
+        bounded.work.decoded_bytes * 2 <= control.work.decoded_bytes,
+        "one-batch backpressure must remove producer run-ahead: bounded {:?}, control {:?}",
+        bounded.work,
+        control.work
     );
 }
 
