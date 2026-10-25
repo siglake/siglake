@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -184,6 +185,18 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
         .await
         .unwrap();
     let planning = planning_started.elapsed();
+    run_planned_arm(ctx, plan, planning, column).await
+}
+
+/// Drain and settle an already-built plan. Supplying the plan lets a control
+/// replace one physical node without changing any session option or replanning
+/// against different state.
+async fn run_planned_arm(
+    ctx: &SessionContext,
+    plan: Arc<dyn ExecutionPlan>,
+    planning: Duration,
+    column: &str,
+) -> Run {
     let scans = scan_nodes(&plan);
     assert_eq!(scans.len(), 1, "one scan leaf expected in {plan:?}");
     let partitions = scans[0]
@@ -193,11 +206,13 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
 
     let drain_started = std::time::Instant::now();
     let rows = {
-        // The shared runtime and nothing else: the session options under test
-        // are already on `ctx`.
+        // Build a fresh execution context from the same session state that
+        // produced this arm's plan.
+        let task_ctx = siglake_storage::bounded_task_context_from(
+            datafusion::execution::TaskContext::from(&ctx.state()),
+        );
         #[allow(clippy::disallowed_methods)]
-        let mut stream = execute_stream(plan.clone(), siglake_storage::bounded_task_context())
-            .expect("execute the scan");
+        let mut stream = execute_stream(plan.clone(), task_ctx).expect("execute the scan");
         let mut rows = Vec::new();
         while let Some(batch) = stream.next().await {
             let batch = batch.unwrap();
@@ -215,8 +230,8 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
 
     let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(30)).await;
     assert!(
-        settle.complete,
-        "arm must settle before it is read: {settle:?}"
+        settle.complete && settle.live_partitions == 0,
+        "arm must fully settle before it is read: {settle:?}"
     );
 
     let metrics = scans[0].metrics().unwrap().aggregate_by_name();
@@ -240,6 +255,38 @@ async fn run_arm(ctx: &SessionContext, sql: &str, column: &str) -> Run {
             bytes_scanned: sum("bytes_scanned"),
         },
     }
+}
+
+/// Test-local pre-#7339 control. The production optimizer first builds the
+/// complete wave-2 plan, then this replaces only its clipped coalescer with
+/// DataFusion's standard implementation while preserving the child and fetch.
+fn replace_clipped_coalescer_with_standard(
+    plan: Arc<dyn ExecutionPlan>,
+) -> (Arc<dyn ExecutionPlan>, usize) {
+    let mut replacements = 0;
+    let old_children: Vec<_> = plan.children().into_iter().cloned().collect();
+    let mut changed = false;
+    let mut new_children = Vec::with_capacity(old_children.len());
+    for child in old_children {
+        let (replacement, child_replacements) =
+            replace_clipped_coalescer_with_standard(child.clone());
+        changed |= !Arc::ptr_eq(&child, &replacement);
+        replacements += child_replacements;
+        new_children.push(replacement);
+    }
+    let plan = if changed {
+        plan.with_new_children(new_children).unwrap()
+    } else {
+        plan
+    };
+
+    if plan.name() != "ClippedLimitCoalesceExec" {
+        return (plan, replacements);
+    }
+    let children = plan.children();
+    assert_eq!(children.len(), 1, "clipped coalescer must have one child");
+    let standard = CoalescePartitionsExec::new(children[0].clone()).with_fetch(plan.fetch());
+    (Arc::new(standard), replacements + 1)
 }
 
 /// Scheduler-free #7000 arm: visit ticket-ordered groups one at a time until
@@ -520,17 +567,18 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
     );
 }
 
-/// #7339: staging partition starts is insufficient when the admitted producer
-/// can run ahead through `CoalescePartitionsExec`'s partition-sized channel.
+/// #7339/#7341: staging partition starts alone leaves avoidable work when an
+/// admitted producer runs ahead through DataFusion's standard coalescer.
 ///
-/// Both arms use the same 16-file snapshot and complete residual predicate.
-/// The control disables clipped admission and therefore keeps DataFusion's
-/// ordinary parallel coalescer. The candidate uses the production admission
-/// hint, which now also replaces that coalescer with a one-batch channel. The
-/// result is unordered by contract, so exactness is cardinality, predicate
-/// membership, distinct source rows, and the same qualifying multiset domain.
+/// Both arms use fresh plans with the same 16-file snapshot, SQL, complete
+/// residual predicate, wave-2 admission, fetch and reader-cache bypass. The
+/// test-local control replaces exactly one production clipped coalescer with
+/// DataFusion's standard coalescer. The production node combines a one-batch
+/// shared channel with eager limit termination, so this attributes only their
+/// combined effect. The result is unordered by contract, so exactness is
+/// cardinality, predicate membership and distinct source rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_batch_coalesce_bounds_dense_residual_producer_runahead() {
+async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
 
     const LIMIT: usize = 100;
@@ -541,11 +589,12 @@ async fn one_batch_coalesce_bounds_dense_residual_producer_runahead() {
     dense_table_with_rows(&ice, DENSE_ROWS_PER_FILE).await;
 
     let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
-    let bounded_ctx = clipped_context(LIMIT, 2);
+    let bounded_ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
     ice.register_with_datafusion(&bounded_ctx).await.unwrap();
-    let control_ctx = clipped_context(LIMIT, 0);
+    let control_ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
     ice.register_with_datafusion(&control_ctx).await.unwrap();
 
+    let bounded_planning_started = std::time::Instant::now();
     let bounded_plan = bounded_ctx
         .sql(&sql)
         .await
@@ -553,21 +602,38 @@ async fn one_batch_coalesce_bounds_dense_residual_producer_runahead() {
         .create_physical_plan()
         .await
         .unwrap();
-    let control_plan = control_ctx
+    let bounded_planning = bounded_planning_started.elapsed();
+    let control_planning_started = std::time::Instant::now();
+    let production_control_plan = control_ctx
         .sql(&sql)
         .await
         .unwrap()
         .create_physical_plan()
         .await
         .unwrap();
+    let control_planning = control_planning_started.elapsed();
+    let (control_plan, replacements) =
+        replace_clipped_coalescer_with_standard(production_control_plan);
+    assert_eq!(replacements, 1, "control must replace exactly one node");
     assert_eq!(bounded_plan.name(), "ClippedLimitCoalesceExec");
     assert_eq!(control_plan.name(), "CoalescePartitionsExec");
+    assert_eq!(bounded_plan.fetch(), control_plan.fetch());
+    assert_eq!(bounded_plan.fetch(), Some(LIMIT));
+    assert_eq!(
+        datafusion::physical_plan::displayable(bounded_plan.children()[0].as_ref())
+            .indent(false)
+            .to_string(),
+        datafusion::physical_plan::displayable(control_plan.children()[0].as_ref())
+            .indent(false)
+            .to_string(),
+        "the arms must have identical physical plans below the coalescer"
+    );
 
-    let bounded = run_arm(&bounded_ctx, &sql, "raw").await;
-    let control = run_arm(&control_ctx, &sql, "raw").await;
+    let control = run_planned_arm(&control_ctx, control_plan, control_planning, "raw").await;
+    let bounded = run_planned_arm(&bounded_ctx, bounded_plan, bounded_planning, "raw").await;
     eprintln!(
-        "CLIPPED-BACKPRESSURE bounded={:?} drain={:?} control={:?} drain={:?}",
-        bounded.work, bounded.drain, control.work, control.drain
+        "CLIPPED-BACKPRESSURE-SAME-WAVE2 control={:?} drain={:?} bounded={:?} drain={:?}",
+        control.work, control.drain, bounded.work, bounded.drain
     );
 
     for (name, run) in [("bounded", &bounded), ("control", &control)] {
@@ -580,19 +646,24 @@ async fn one_batch_coalesce_bounds_dense_residual_producer_runahead() {
         );
     }
     assert_eq!(bounded.work.partitions, control.work.partitions);
-    assert!(
-        bounded.work.files_read <= 2,
-        "the bounded arm must cancel before opening the wide scan: {:?}",
+    assert_eq!(
+        bounded.work.files_read, 1,
+        "the replacement must finish from the first admitted reader: {:?}",
         bounded.work
     );
     assert!(
-        control.work.files_read > 2,
-        "the ordinary coalescer must reproduce wide producer run-ahead: {:?}",
+        control.work.files_read > bounded.work.files_read,
+        "the same-wave standard coalescer must reproduce avoidable reader start: {:?}",
         control.work
     );
+    assert_eq!(
+        bounded.work.decoded_bytes, control.work.decoded_bytes,
+        "the isolated fixture does not support a decoded-work reduction claim"
+    );
     assert!(
-        bounded.work.decoded_bytes * 2 <= control.work.decoded_bytes,
-        "one-batch backpressure must remove producer run-ahead: bounded {:?}, control {:?}",
+        bounded.work.object_store_reads < control.work.object_store_reads
+            && bounded.work.bytes_scanned * 3 <= control.work.bytes_scanned * 2,
+        "bounded buffering plus eager limit termination must reduce early physical reads: bounded {:?}, control {:?}",
         bounded.work,
         control.work
     );

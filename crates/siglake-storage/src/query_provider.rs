@@ -6550,14 +6550,18 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
 /// DataFusion's partition coalescer.
 ///
 /// `CoalescePartitionsExec` sizes its shared batch channel to the input
-/// partition count. That is useful for an ordinary parallel scan, but defeats
-/// the staged start above it: one admitted producer can fill the whole channel
-/// with already-filtered batches before the root observes its first batch and
-/// cancels at the limit. Those raw batches also advance [`ScanAdmission`], so
-/// the buffered work can open more readers. This equivalent coalescer keeps
-/// one batch in the shared channel. A sender can decode at most the batch it is
-/// trying to send ahead of that, while empty/sparse inputs retain the existing
-/// terminal and paced-batch progress rules.
+/// partition count. This replacement keeps one batch in the shared channel.
+/// Each active sender can still hold one batch while its send is pending;
+/// staged admission and cancellation bound how many senders become active.
+/// Empty and sparse inputs retain the existing terminal and paced-batch
+/// progress rules.
+///
+/// This is a combined repair: DataFusion 53.1's `ObservedStream` polls its
+/// input before checking the fetch and retains that input until drop, whereas
+/// [`LimitStream`] clears its input as soon as the fetch is reached. The
+/// same-wave control observed one fewer reader and fewer fetched bytes, but no
+/// decoded-byte reduction, so the code does not attribute that work reduction
+/// to channel capacity alone.
 #[derive(Debug)]
 struct ClippedLimitCoalesceExec {
     input: Arc<dyn ExecutionPlan>,
