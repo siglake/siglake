@@ -50,8 +50,8 @@ The compactor selected both bins while sealed backlog was below the default
 256-segment preemption gate. Concurrent dispatch checks the gate before each
 spawned bin starts. Once several bins have started, a later gate crossing does
 not cancel them. Sealed pending rose from 168 to 1,663 while the drain and the
-large rewrite overlapped. This is the exact queue and scheduling path behind
-the delayed visibility. The run does not identify how the unfinished bin split
+large rewrite overlapped. This establishes overlap between the growing queue and admitted rewrite work;
+it does not isolate the cause of delayed visibility. The run does not identify how the unfinished bin split
 time between object reads, Parquet decode, merge assembly, encode, and upload.
 
 The SQL probe was not the delay. All 440 polls returned HTTP 200. The longest
@@ -97,8 +97,11 @@ The in-flight gauge uses a drop guard, so success, error, watchdog cancellation,
 and task cancellation all release it. Start, commit, and stopped-before-commit
 events retain the table, file count, and input bytes. Merge phase counters now
 also carry table and bin kind on a new series, preserving the existing aggregate
-series. A matched run can attribute a backfill bin's input, assembly, and write
-time without borrowing timing from ordinary merge bins.
+series. The phase series is emitted only after merge output closes, before catalog
+commit; unfinished merges contribute no phase sample. It aggregates by table,
+bin kind, path, and stage, so concurrent backfill bins are not individually
+distinguishable. It separates completed backfill merge work from ordinary
+merge work without establishing the unfinished bin's phase split.
 
 ## Remaining qualification
 
