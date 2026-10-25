@@ -1687,13 +1687,16 @@ spawns per partition. The groups partition one file set and the shape
 advertises no ordering, so the union is unchanged; the price is that a
 partition index no longer names a file set, and `partition_statistics` reports
 unknown per partition (table-wide stays exact) while a ramp is active.
-The partition coalescer for this shape also has a one-batch shared channel. The
-ordinary DataFusion coalescer buffers one batch per input partition; an admitted
-producer could fill that channel before the root observed its first filtered
-batch and stopped at the limit, decoding more batches and advancing the staged
-start while cancellation was already inevitable. The one-batch channel applies
-backpressure after one buffered batch and one sender-held batch. Other query
-shapes keep DataFusion's ordinary parallel coalescer.
+The partition coalescer for this shape also has a one-batch shared channel and
+eagerly drops its input when the fetch is reached. The ordinary DataFusion
+coalescer buffers one batch per input partition and retains its input until the
+stream is dropped. The replacement holds one batch in its shared channel plus
+up to one pending-send batch per active sender; admission and cancellation
+determine how many senders become active. A same-wave control observed one
+fewer reader and fewer fetched bytes, but equal decoded bytes, so this is a
+combined buffering and cancellation bound rather than a capacity-only or local
+latency claim. Other query shapes keep DataFusion's ordinary parallel
+coalescer.
 Observable via
 `siglake_query_scan_clipped_admission_total{outcome}` and
 `siglake_query_scan_clipped_admission_wait_seconds`; `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE=0`

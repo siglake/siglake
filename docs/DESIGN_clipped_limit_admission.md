@@ -239,32 +239,49 @@ respectively. Each `keyword` response opened all 15 cached readers and decoded
 27.9--28.9 MB despite returning 100 rows. Cost estimation averaged only
 0.126--0.158 ms, so it was no longer the material phase.
 
-The remaining avoidable work was between admission and cancellation.
+The local control below found avoidable work between admission and
+cancellation.
 DataFusion's `CoalescePartitionsExec` sizes its shared channel to the input
 partition count. A producer runs the complete residual filter in its partition
-task, sends a filtered batch into that channel, and immediately polls the scan
-again while the root has not yet observed the first batch. With 15 partitions,
-one admitted producer could buffer many filtered batches. Its raw source
-batches also paid paced admission credits, opening more readers before the
-global limit dropped the plan.
+task and sends filtered batches into that channel. Its DataFusion 53.1
+`ObservedStream` also polls the receiver before checking the fetch and retains
+the receiver until drop. The original wave-0 comparison changed admission at
+the same time and therefore did not establish how much work either behavior
+added on top of shipped wave 2.
 
-The clipped shape now substitutes an equivalent coalescer whose shared channel
-holds one batch. At most one batch is buffered and one is held by a blocked
-sender; the root then observes the first filtered batch and cancellation closes
-the senders. This changes neither the filter nor the `LIMIT`: every admitted
-partition still runs the complete predicate, sparse predicates retain the same
-batch and terminal admission credits, and unordered SQL continues to permit
-any qualifying rows.
+The clipped shape now substitutes a coalescer whose shared channel holds one
+batch and whose limit wrapper eagerly drops its input when the fetch is
+reached. One batch can wait in the shared channel, and each active sender can
+hold one more while its send is pending; admission and cancellation determine
+how many senders become active. This changes neither the filter nor the
+`LIMIT`: every admitted partition still runs the complete predicate, sparse
+predicates retain the same batch and terminal admission credits, and unordered
+SQL continues to permit any qualifying rows. Because DataFusion's standard
+coalescer retains its input until stream drop, the same-wave control below
+measures the combined effect of bounded buffering and eager limit termination;
+it does not attribute all reduced work to channel capacity alone.
 
-`one_batch_coalesce_bounds_dense_residual_producer_runahead` holds a 16-file
-snapshot and dense residual predicate fixed. The bounded arm returned 100
-distinct qualifying rows while opening one reader and decoding 138,364 bytes;
-the ordinary-coalesce control returned the same cardinality and predicate
-domain while opening 16 readers and decoding 691,820 bytes. Drain time was
-7.65 ms versus 12.35 ms in that diagnostic run; the work counters, rather than
-one local timing pair, are the regression oracle. This local result does not
-qualify the AWS ceilings. The unchanged matched field qualification remains
-required.
+`bounded_coalesce_and_eager_limit_bound_dense_residual_runahead` holds a
+16-file snapshot, SQL, dense residual predicate, wave-2 admission, fetch and
+reader-cache bypass fixed. Fresh plans and execution state are used in each
+arm. A test-local rewrite changes exactly one node in the control from the
+production clipped coalescer to DataFusion's standard coalescer. The latest
+pre-correction run did not isolate that change: its production arm opened one
+reader and decoded 138,364 bytes, while its wave-0 control opened six and
+decoded 415,092 bytes; both returned 100 distinct qualifying rows. Drain time
+was 8.42 ms versus 4.09 ms, so it was not a local speedup. The executed
+same-wave control also returned 100 distinct qualifying rows and fully settled
+both plans. The standard arm opened two readers, made seven object-store reads
+and fetched 3,349,138 bytes; the replacement opened one reader, made four reads
+and fetched 1,687,906 bytes. Both decoded 138,364 bytes. Drain time was 7.35 ms
+for the standard arm and 5.45 ms for the replacement on the first execution;
+the final focused passing execution measured 7.86 ms and 4.11 ms with the same
+work counters. The physical-read counters, rather than these local timing pairs,
+are the regression oracle.
+This evidence supports the combined buffering and eager-termination repair; it
+does not support the earlier decoded-work attribution, a capacity-only cause,
+or a local or AWS latency guarantee. The unchanged matched field qualification
+remains required.
 
 ## Local measurement
 
