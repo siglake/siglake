@@ -1705,6 +1705,12 @@ fewer reader and fewer fetched bytes, but equal decoded bytes, so this is a
 combined buffering and cancellation bound rather than a capacity-only or local
 latency claim. Other query shapes keep DataFusion's ordinary parallel
 coalescer.
+The execution profile's `df_output_rows` adds `output_rows` across every plan
+node; it is operator throughput rather than a count of unique source or result
+rows. On this clipped shape, each contributing partition adds one 8,192-row
+repartition batch and up to 100 filtered rows, while the root adds its global
+100 once. Per-node metrics and the scan leaf remain the sources for evaluating
+LIMIT termination and scan work.
 Observable via
 `siglake_query_scan_clipped_admission_total{outcome}` and
 `siglake_query_scan_clipped_admission_wait_seconds`; `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE=0`
