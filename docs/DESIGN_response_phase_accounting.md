@@ -85,16 +85,17 @@ The two frames are therefore separated rather than merged:
 
 ## What the reader needs
 
-The named reader is the benchmark harness:
+The named reader is the separately maintained `siglake-benchmarks` tooling. At
+revision `b708051`:
 
-- `bench/run_queries.py:1028` archives `stats.phases` verbatim into the record,
-  and `:1158` already reads `x-siglake-server-micros` off the response per run.
-- `bench/plan_phase_attribution.py:552` reads `phases.plan_micros` and checks
-  it against the log's `physical_plan_ms`, joined by `query_execution_id`; it
-  gets `register`, `logical_plan` and `estimate` from the log alone. A log the
-  round did not capture, or one whose ids are ambiguous, reads NOT ASSESSED.
-- `bench/degrade.sh:222` prints the four phase fields from the body only — no
-  headers, no log.
+- `run_queries.py:1412-1413` archives `stats.phases` verbatim into the record,
+  and `:1557` reads `x-siglake-server-micros` off the response per run.
+- `plan_phase_attribution.py:551,625` reads `phases.plan_micros` and checks it
+  against the log's `physical_plan_ms`, joined by `query_execution_id`; it gets
+  `register`, `logical_plan` and `estimate` from the log alone. A log the round
+  did not capture, or one whose ids are ambiguous, reads NOT ASSESSED.
+- `degrade.sh:222` prints the four phase fields from the body without headers
+  or log data.
 
 What none of them can do today is say, from one request's artifacts, how much
 of the server's time the four phases fail to name. That subtraction is what
@@ -105,7 +106,7 @@ aggregated medians, which locates nothing.
 
 **A. Carry every phase in the body.** Ten more fields (rewrite, cache probe,
 session, register, logical, estimate, battery, admission, probe, plan stats) to
-mirror the log. It duplicates a source the harness already parses, so the two
+mirror the log. It duplicates a source the reader already parses, so the two
 can disagree — `plan_phase_attribution.py` already checks one such pair and
 refuses the decomposition when they differ. Every field is permanent API
 surface, is replayed on a hit, is persisted in job rows, and is charged per
@@ -120,7 +121,7 @@ the body. It says nothing about the request that received the body.
 **C. B, plus the request's own total in a header.** `x-siglake-handler-micros`
 stamped after serialization, and `x-siglake-result-cache` naming the outcome so
 a reader can tell a replay from an execution. The header is per-request by
-construction, and the harness already reads one header per run.
+construction, and the reader already reads one header per run.
 
 ## Recommendation: C
 
@@ -177,7 +178,7 @@ out, and does not leave the question unasked.
 
 What C gives up: a reader with the body and the headers alone still cannot see
 WHICH phase the remainder is in. That decomposition stays in the query-server
-log, where the harness already reads it. The remainder's size is what tells a
+log, where the reader already reads it. The remainder's size is what tells a
 reader whether they need the log at all — 0.7 ms of 3.9 locally, 2.58 ms of
 17.99 on the round.
 
@@ -229,6 +230,6 @@ never a median of one column minus a median of another:
   round, most of the named non-scan time is planning, which no clipped-coalescer
   work touches (#7456).
 - Whether `x-siglake-server-micros` should be corrected or retired. It measures
-  a span that includes the client's request-side transport, which the harness
+  a span that includes the client's request-side transport, which the reader
   reads as engine time (#7456). A handler-total header gives that reader
   something better, but the existing header's fate is not decided here.
