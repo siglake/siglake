@@ -40,6 +40,19 @@ ignore = [
     # rustls-pemfile 2.2.0: unmaintained, no patched release. Sole parent is
     # axum-server 0.7.3; object_store 0.13.2 no longer pulls it in.
     "RUSTSEC-2025-0134",
+    # zstd 0.13.3: the affected stream with_context constructors are unused;
+    # callers here and in the locked parents use fresh streams or the separate
+    # bulk API. Those parents require 0.13, while the fix starts at 0.14.3.
+    "RUSTSEC-2026-0391",
+    # zstd-safe 7.2.4: the affected Seekable API is compiled only by its
+    # optional seekable feature, which is absent from the resolved graph.
+    "RUSTSEC-2026-0398",
+    # zstd-safe 7.2.4: the affected legacy-frame decoder is compiled only by
+    # the legacy feature. All direct zstd dependencies disable default features.
+    "RUSTSEC-2026-0403",
+    # zstd-sys 2.0.16: the affected allocator shim exists only on wasm32.
+    # Siglake's supported binaries and deployment images target native Linux.
+    "RUSTSEC-2026-0410",
 ]
 
 [bans]
