@@ -15,7 +15,9 @@ use siglake_query_server::{
     serve, serve_tls, AppState, AuditService, AuthConfig, JobStore, OidcVerifier, QueryScanConfig,
     ServerLimits, TlsConfig,
 };
-use siglake_storage::{configure_query_scan_tuning, iceberg::IcebergContext, QueryScanTuning};
+use siglake_storage::{
+    configure_query_scan_tuning, iceberg::IcebergContext, PredicatePushdownControl, QueryScanTuning,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -528,6 +530,9 @@ async fn run() -> Result<()> {
         // #4959's per-file attribution is a local qualification gate with no
         // response or operator surface; the server never turns it on.
         file_attribution_prototype: false,
+        // #7457's pushdown attribution arms exist only for the local
+        // measurement fixture; the server always runs shipped policy.
+        predicate_pushdown_control: PredicatePushdownControl::Production,
     });
     tracing::info!(
         target_partitions = query_scan.target_partitions,

@@ -165,6 +165,7 @@ struct EffectiveReaderTuning {
     reversed_chunk_rows: Option<usize>,
     bypass_reader_caches: bool,
     ordered_drain_buffer_bytes: Option<u64>,
+    row_selection_enabled: bool,
 }
 
 /// What the Iceberg reader will actually do with byte ranges on one scan, as
@@ -2773,7 +2774,11 @@ impl SiglakeIcebergTableScan {
             .get_extension::<PreferredScanOrder>()
             .map(|order| order.field.clone())
             .unwrap_or_else(|| Arc::from(CANONICAL_EVENT_TIME_FIELD));
-        let predicates = PredicateConverter::new(&schema).convert_filters(filters);
+        let tuning = crate::current_query_scan_tuning();
+        let predicates = (tuning.predicate_pushdown_control
+            != crate::PredicatePushdownControl::SuppressReaderPredicate)
+            .then(|| PredicateConverter::new(&schema).convert_filters(filters))
+            .flatten();
         let text_tokenizers = loaded_table_index_config(&table)
             .map_err(|e| DataFusionError::External(e.into()))?
             .map(|config| text_field_tokenizers(&config))
@@ -2813,7 +2818,6 @@ impl SiglakeIcebergTableScan {
         let expected_promotion_version = siglake_core::promotion_extractor_version(&promoted);
         let mut promoted_prune =
             extract_promoted_prune(filters, &promoted_utf8_columns_from(promoted));
-        let tuning = crate::current_query_scan_tuning();
         // Per-request distributed-query shard, injected as a SessionConfig
         // extension by the query-server (absent for ordinary single-pod scans).
         let shard = state.config().get_extension::<ScanShard>().map(|a| *a);
@@ -3292,7 +3296,7 @@ impl SiglakeIcebergTableScan {
                 futures::stream::iter(std::iter::once(Ok(task))).boxed();
             let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
                 .with_data_file_concurrency_limit(1)
-                .with_row_selection_enabled(true)
+                .with_row_selection_enabled(reader_tuning.row_selection_enabled)
                 .with_scan_counters(Some(scan_counters))
                 .with_file_opened_observer(Some(Arc::new(move |task| {
                     file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
@@ -5630,7 +5634,7 @@ fn open_task_batch_stream_uncached(
     // predicate is present, so predicate-free scans pay nothing.
     let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
         .with_data_file_concurrency_limit(1)
-        .with_row_selection_enabled(true)
+        .with_row_selection_enabled(reader_tuning.row_selection_enabled)
         .with_scan_counters(Some(scan_counters))
         .with_file_opened_observer(Some(Arc::new(move |_task| {
             if let Some(identity) = &opened_identity {
@@ -6342,7 +6346,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 // composes with the raw-bloom + predicate row-group filtering —
                 // those narrow row groups first, then the page index prunes rows
                 // within the survivors.
-                .with_row_selection_enabled(true)
+                .with_row_selection_enabled(reader_tuning.row_selection_enabled)
                 .with_scan_counters(Some(scan_counters.clone()))
                 .with_file_opened_observer(Some(Arc::new(move |task| {
                     file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
@@ -6843,8 +6847,8 @@ impl TableProvider for SiglakeStaticTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DFResult<Vec<TableProviderFilterPushDown>> {
-        let file_cache_enabled =
-            effective_file_cache_tuning(crate::current_query_scan_tuning()).enabled();
+        let tuning = crate::current_query_scan_tuning();
+        let file_cache_enabled = effective_file_cache_tuning(tuning).enabled();
         let text_tokenizers = loaded_table_index_config(&self.table)
             .map_err(|e| DataFusionError::External(e.into()))?
             .map(|config| text_field_tokenizers(&config))
@@ -6853,8 +6857,13 @@ impl TableProvider for SiglakeStaticTableProvider {
         filters
             .iter()
             .map(|expr| {
-                pushdown_kind(expr, &self.schema, &text_tokenizers, &promoted)
-                    .map(|kind| filter_pushdown_with_file_cache(kind, file_cache_enabled))
+                pushdown_kind(expr, &self.schema, &text_tokenizers, &promoted).map(|kind| {
+                    filter_pushdown_for_control(
+                        kind,
+                        file_cache_enabled,
+                        tuning.predicate_pushdown_control,
+                    )
+                })
             })
             .collect()
     }
@@ -6868,6 +6877,26 @@ impl TableProvider for SiglakeStaticTableProvider {
         Err(DataFusionError::NotImplemented(
             "write operations are not supported on SiglakeStaticTableProvider".into(),
         ))
+    }
+}
+
+fn filter_pushdown_for_control(
+    kind: TableProviderFilterPushDown,
+    file_cache_enabled: bool,
+    control: crate::PredicatePushdownControl,
+) -> TableProviderFilterPushDown {
+    match control {
+        crate::PredicatePushdownControl::Production => {
+            filter_pushdown_with_file_cache(kind, file_cache_enabled)
+        }
+        crate::PredicatePushdownControl::RetainResidual
+        | crate::PredicatePushdownControl::RetainResidualWithoutRowSelection
+        | crate::PredicatePushdownControl::SuppressReaderPredicate => match kind {
+            TableProviderFilterPushDown::Exact | TableProviderFilterPushDown::Inexact => {
+                TableProviderFilterPushDown::Inexact
+            }
+            TableProviderFilterPushDown::Unsupported => TableProviderFilterPushDown::Unsupported,
+        },
     }
 }
 
@@ -7579,6 +7608,8 @@ fn effective_reader_tuning(
             ordered_drain_buffer_bytes: tuning
                 .ordered_drain_buffer_bytes
                 .or(ordered_tuning.ordered_drain_buffer_bytes),
+            row_selection_enabled: tuning.predicate_pushdown_control
+                != crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
         };
     }
     let enable_range = match (
@@ -7604,6 +7635,8 @@ fn effective_reader_tuning(
         ordered_drain_buffer_bytes: tuning
             .ordered_drain_buffer_bytes
             .or(ordered_tuning.ordered_drain_buffer_bytes),
+        row_selection_enabled: tuning.predicate_pushdown_control
+            != crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
     }
 }
 
@@ -9216,6 +9249,26 @@ mod tests {
             TableProviderFilterPushDown::Exact,
             "the cache-disabled exact fast path must remain available"
         );
+        for control in [
+            crate::PredicatePushdownControl::RetainResidual,
+            crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
+            crate::PredicatePushdownControl::SuppressReaderPredicate,
+        ] {
+            assert_eq!(
+                filter_pushdown_for_control(TableProviderFilterPushDown::Exact, false, control),
+                TableProviderFilterPushDown::Inexact,
+                "the attribution controls must retain DataFusion's residual"
+            );
+        }
+        assert_eq!(
+            filter_pushdown_for_control(
+                TableProviderFilterPushDown::Unsupported,
+                false,
+                crate::PredicatePushdownControl::SuppressReaderPredicate,
+            ),
+            TableProviderFilterPushDown::Unsupported,
+            "the control must not claim support for an unsupported expression"
+        );
 
         let range = col("status")
             .gt_eq(lit(500_i64))
@@ -9898,6 +9951,7 @@ mod tests {
                 batch_size: None,
                 range_coalesce_bytes: None,
                 range_fetch_concurrency: None,
+                row_selection_enabled: true,
                 ..Default::default()
             }
         );
@@ -9911,6 +9965,17 @@ mod tests {
                 override_applied: false,
             }
         );
+        let without_selection = effective_reader_tuning(
+            crate::QueryScanTuning {
+                predicate_pushdown_control:
+                    crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
+                ..Default::default()
+            },
+            200,
+            500_000_000,
+            OrderedScanTuning::default(),
+        );
+        assert!(!without_selection.row_selection_enabled);
     }
 
     #[test]
@@ -10016,6 +10081,7 @@ mod tests {
                 batch_size: Some(65_536),
                 range_coalesce_bytes: Some(4 * 1024 * 1024),
                 range_fetch_concurrency: Some(32),
+                row_selection_enabled: true,
                 ..Default::default()
             }
         );
@@ -10038,6 +10104,7 @@ mod tests {
                 batch_size: Some(65_536),
                 range_coalesce_bytes: None,
                 range_fetch_concurrency: None,
+                row_selection_enabled: true,
                 ..Default::default()
             }
         );
@@ -10048,6 +10115,7 @@ mod tests {
                 batch_size: Some(65_536),
                 range_coalesce_bytes: Some(4 * 1024 * 1024),
                 range_fetch_concurrency: Some(32),
+                row_selection_enabled: true,
                 ..Default::default()
             }
         );
