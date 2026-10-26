@@ -118,17 +118,21 @@ pub fn tokenize(raw: &str) -> Vec<String> {
 }
 
 fn default_tokenize(raw: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for piece in raw.split(|c: char| !c.is_ascii_alphanumeric()) {
-        if piece.len() < MIN_TOKEN_LEN {
-            continue;
-        }
-        out.push(piece.to_ascii_lowercase());
-        if out.len() >= MAX_TOKENS_PER_ROW {
-            break;
-        }
-    }
-    out
+    default_token_slices(raw)
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Borrow the pieces consumed by the canonical default tokenizer before case
+/// folding. The iterator has the same split, minimum-length, ordering, and
+/// first-64 cap as [`Tokenizer::Default`], without allocating per token.
+///
+/// Callers comparing these slices with the owned output of [`tokenize`] must
+/// use ASCII-insensitive comparison.
+pub fn default_token_slices(raw: &str) -> impl Iterator<Item = &str> {
+    raw.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|piece| piece.len() >= MIN_TOKEN_LEN)
+        .take(MAX_TOKENS_PER_ROW)
 }
 
 fn lite_stem(token: &str) -> Option<String> {
@@ -545,6 +549,20 @@ mod tests {
         );
         assert_eq!(Tokenizer::Stem.tokenize("ping"), vec!["ping".to_string()]);
         assert_eq!(Tokenizer::Stem.tokenize("sing"), vec!["sing".to_string()]);
+    }
+
+    #[test]
+    fn borrowed_default_tokens_match_the_owned_contract() {
+        let mut capped = (0..70)
+            .map(|i| format!("Token{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        capped.push_str(" café x AB 500");
+        let borrowed = default_token_slices(&capped)
+            .map(str::to_ascii_lowercase)
+            .collect::<Vec<_>>();
+        assert_eq!(borrowed, Tokenizer::Default.tokenize(&capped));
+        assert_eq!(borrowed.len(), MAX_TOKENS_PER_ROW);
     }
 
     #[test]
