@@ -71,7 +71,7 @@ pub use oidc::OidcVerifier;
 // Test seam only (`#[doc(hidden)]` at its definition in `sql.rs`): the result
 // store is a process-wide static, so a measurement's phases cannot otherwise
 // start from a stated state.
-pub use sql::reset_result_cache_for_test;
+pub use sql::{reset_result_cache_for_test, HANDLER_MICROS_HEADER, RESULT_CACHE_HEADER};
 pub use tenants::TenantRegistry;
 
 /// Server-side per-tier ceilings. Per-request overrides clamp against

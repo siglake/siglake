@@ -273,20 +273,20 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   cannot prove its lifetime. Keeping a mixed file costs metadata and object
   storage until its last live reference retires, but preserves the Iceberg
   interoperability boundary.
-- **A SQL response's phase block names part of its request, and is provenance
-  of an execution rather than timing of the request that received it.**
-  `stats.phases` carries physical plan, buffer delta, collect and render. The
-  rest of the handler's time — rewrite, the result-cache probe, the session
-  build, registration, logical planning, cost estimation, the fast-path
-  battery, admission, the plan-stats walk, the cache fill, the plan text and
-  serialization — is named in the `sql query profile` and `sql execution
-  profile` log lines (#7456, `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`) and not
-  in the body, so a reader with the response alone is short 16–21% of the
-  handler's total locally and 2.58 / 2.19 ms on the 2026-10-26 round's clipped
-  shapes. A result-cache hit and a batch job result both return a stored body,
-  phases and all, so those numbers describe whichever execution filled the
-  entry. `docs/DESIGN_response_phase_accounting.md` settles what a response
-  could carry and recommends a shape; no field has been added.
+- **A SQL response's phase remainder is not decomposed in the body.**
+  `stats.phases` carries physical plan, buffer delta, collect and render, plus
+  `execution_micros` and the server-computed `other_micros` remainder. Rewrite,
+  the result-cache probe, session build, registration, logical planning, cost
+  estimation, admission, plan-stat collection, cache fill, plan text and
+  serialization remain separate only in the `sql query profile` and `sql
+  execution profile` log lines (#7456,
+  `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`). A result-cache hit or batch job
+  result replays the filling execution's phase block. The serving request's
+  `x-siglake-handler-micros` and `x-siglake-result-cache` headers are separate;
+  no ordering is promised between a replayed execution total and the new
+  request's handler clock. Tier-1 fast paths and truncated responses omit the
+  two execution fields, and streamed NDJSON has no phase envelope or handler
+  header.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index

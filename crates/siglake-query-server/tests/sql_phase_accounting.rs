@@ -28,7 +28,9 @@ use axum::body::{to_bytes, Body};
 use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use siglake_core::Event;
-use siglake_query_server::{router, AppState, AuthConfig, SERVER_MICROS_HEADER};
+use siglake_query_server::{
+    router, AppState, AuthConfig, HANDLER_MICROS_HEADER, SERVER_MICROS_HEADER,
+};
 use siglake_storage::iceberg::IcebergContext;
 use tower::util::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -164,6 +166,8 @@ async fn needle_table(ice: &IcebergContext) {
 struct Observed {
     wall_ms: f64,
     server_header_ms: f64,
+    handler_micros: u64,
+    phases: serde_json::Value,
 }
 
 async fn post_records(app: &Router, query: &str) -> Observed {
@@ -189,6 +193,12 @@ async fn post_records(app: &Router, query: &str) -> Observed {
         .and_then(|v| v.parse::<f64>().ok())
         .expect("every API response carries the server-micros header")
         / 1000.0;
+    let handler_micros = response
+        .headers()
+        .get(HANDLER_MICROS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .expect("buffered SQL responses carry the handler-micros header");
     let bytes = to_bytes(response.into_body(), 64 * 1024 * 1024)
         .await
         .unwrap();
@@ -197,9 +207,12 @@ async fn post_records(app: &Router, query: &str) -> Observed {
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
     assert_eq!(status, StatusCode::OK, "query failed: {query}");
     assert!(!bytes.is_empty());
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     Observed {
         wall_ms,
         server_header_ms,
+        handler_micros,
+        phases: body["stats"]["phases"].clone(),
     }
 }
 
@@ -263,6 +276,17 @@ async fn sql_request_time_is_fully_attributed() {
         let accounted = sum(&terminal, HANDLER_PHASES);
         let execute = terminal.timings["execute_ms"];
         let execution_sum = sum(&execution, EXECUTION_PHASES);
+        let response_execution = observed.phases["execution_micros"].as_u64().unwrap();
+        let response_other = observed.phases["other_micros"].as_u64().unwrap();
+        let response_named: u64 = [
+            "plan_micros",
+            "buffer_delta_micros",
+            "collect_micros",
+            "render_micros",
+        ]
+        .into_iter()
+        .map(|name| observed.phases[name].as_u64().unwrap())
+        .sum();
         println!(
             "{request:<4} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3}",
             observed.wall_ms,
@@ -304,6 +328,26 @@ async fn sql_request_time_is_fully_attributed() {
         assert!(
             execution_sum <= execute + 0.05,
             "execution phases {execution_sum:.3} exceed execute_ms {execute:.3}"
+        );
+        assert!(
+            response_named <= response_execution,
+            "named response phases {response_named} exceed execution {response_execution}"
+        );
+        assert_eq!(
+            response_other + response_named,
+            response_execution,
+            "the response remainder must close its execution clock"
+        );
+        assert!(
+            response_execution <= observed.handler_micros,
+            "execution {response_execution} exceeds handler header {}",
+            observed.handler_micros
+        );
+        assert!(
+            observed.handler_micros as f64 / 1000.0 <= observed.server_header_ms,
+            "handler header {}us exceeds server header {:.3}ms",
+            observed.handler_micros,
+            observed.server_header_ms
         );
 
         // 3. The boundaries the round's attribution got wrong. Serialization

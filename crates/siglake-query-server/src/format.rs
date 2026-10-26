@@ -315,6 +315,14 @@ pub struct ScanDetail {
 /// `collect_micros` (its work happens on the workers).
 #[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq, utoipa::ToSchema)]
 pub struct PhaseStats {
+    /// Executing request's handler clock when this response body was sealed.
+    /// Replayed bodies retain the filling execution's value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_micros: Option<u64>,
+    /// Portion of `execution_micros` not covered by the named phases in this
+    /// block. Computed by the server with saturating subtraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_micros: Option<u64>,
     /// Physical planning (single-pod) or logical planning + classification
     /// (coordinator).
     pub plan_micros: u64,

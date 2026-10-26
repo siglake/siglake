@@ -24,7 +24,7 @@ use axum::http::{header, Method, Request, StatusCode};
 use axum::Router;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
 use siglake_core::Event;
-use siglake_query_server::{router, AppState, AuthConfig};
+use siglake_query_server::{router, AppState, AuthConfig, RESULT_CACHE_HEADER};
 use siglake_storage::iceberg::IcebergContext;
 use tower::util::ServiceExt;
 
@@ -68,7 +68,7 @@ async fn needle_table(ice: &IcebergContext) {
     }
 }
 
-async fn post_records(app: &Router, query: &str) -> serde_json::Value {
+async fn post_records(app: &Router, query: &str) -> (serde_json::Value, String) {
     let body = serde_json::json!({ "query": query });
     let response = app
         .clone()
@@ -83,6 +83,12 @@ async fn post_records(app: &Router, query: &str) -> serde_json::Value {
         .await
         .unwrap();
     let status = response.status();
+    let cache_outcome = response
+        .headers()
+        .get(RESULT_CACHE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("buffered SQL responses carry the result-cache header")
+        .to_string();
     let bytes = to_bytes(response.into_body(), 64 * 1024 * 1024)
         .await
         .unwrap();
@@ -92,7 +98,7 @@ async fn post_records(app: &Router, query: &str) -> serde_json::Value {
         "{query}: {}",
         String::from_utf8_lossy(&bytes)
     );
-    serde_json::from_slice(&bytes).unwrap()
+    (serde_json::from_slice(&bytes).unwrap(), cache_outcome)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -108,26 +114,28 @@ async fn a_cached_answer_replays_the_filling_execution_phases() {
 
     let sql = "SELECT host, raw FROM events WHERE raw LIKE '%needle-3%' LIMIT 50";
 
-    let executed = post_records(&app, sql).await;
+    let (executed, filling_header) = post_records(&app, sql).await;
     let filling = outcomes(&snapshotter);
     assert_eq!(
         filling.get("hit").copied().unwrap_or(0),
         0,
         "the first request cannot hit an empty cache: {filling:?}"
     );
+    assert_eq!(filling_header, "insert");
     let executed_phases = executed["stats"]["phases"].clone();
     assert!(
         executed_phases.is_object(),
         "an executed records response carries its phase block: {executed}"
     );
 
-    let replayed = post_records(&app, sql).await;
+    let (replayed, replay_header) = post_records(&app, sql).await;
     let serving = outcomes(&snapshotter);
     assert_eq!(
         serving.get("hit").copied().unwrap_or(0),
         1,
         "the repeat must be served from the result cache: {serving:?}"
     );
+    assert_eq!(replay_header, "hit");
 
     // The rows are the same answer, by design. The phases are the same NUMBERS,
     // which is a different claim: the second request planned nothing and
@@ -137,4 +145,6 @@ async fn a_cached_answer_replays_the_filling_execution_phases() {
         replayed["stats"]["phases"], executed_phases,
         "a cache hit replays the stored phase block verbatim"
     );
+    assert!(executed_phases["execution_micros"].is_u64());
+    assert!(executed_phases["other_micros"].is_u64());
 }

@@ -5,6 +5,7 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use std::time::Instant;
 
 use crate::auth::CallerIdentity;
 use crate::error::ApiError;
@@ -108,7 +109,11 @@ pub async fn status(
     tag = "jobs",
     params(("id" = String, Path, description = "Job id (UUIDv7).")),
     responses(
-        (status = 200, description = "Result rows.", body = RecordsResponse),
+        (status = 200, description = "Result rows.", body = RecordsResponse,
+         headers(
+             ("x-siglake-handler-micros" = u64, description = "Handler wall time for this result fetch."),
+             ("x-siglake-result-cache" = String, description = "Always off for a persisted job result; the body's phases belong to its original execution."),
+         )),
         (status = 400, description = "Malformed job id.", body = ApiErrorBody),
         (status = 401, description = "Missing or invalid credentials.", body = ApiErrorBody),
         (status = 403, description = "Tenant refused before the handler runs. This \
@@ -133,6 +138,7 @@ pub async fn result(
     Extension(identity): Extension<CallerIdentity>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
+    let started = Instant::now();
     let id = JobId::parse(&id).map_err(|_| ApiError::bad_request("invalid job_id"))?;
     owned_job(&state, &identity, id).await?;
     let res = state
@@ -159,7 +165,10 @@ pub async fn result(
             let body = res
                 .body
                 .ok_or_else(|| ApiError::internal("succeeded job has no result body"))?;
-            Ok((StatusCode::OK, Json(body)).into_response())
+            let mut response = (StatusCode::OK, Json(body)).into_response();
+            crate::sql::set_handler_micros_header(&mut response, started);
+            crate::sql::set_result_cache_header(&mut response, "off");
+            Ok(response)
         }
     }
 }

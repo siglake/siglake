@@ -10,7 +10,9 @@ use chrono::Utc;
 use serde_json::Value;
 
 use siglake_core::Event;
-use siglake_query_server::{router, AppState, AuthConfig, JobStore};
+use siglake_query_server::{
+    router, AppState, AuthConfig, JobStore, HANDLER_MICROS_HEADER, RESULT_CACHE_HEADER,
+};
 use siglake_storage::iceberg::IcebergContext;
 
 macro_rules! require_loopback {
@@ -152,6 +154,8 @@ async fn batch_job_completes_and_returns_result() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+    assert!(resp.headers().contains_key(HANDLER_MICROS_HEADER));
+    assert_eq!(resp.headers()[RESULT_CACHE_HEADER], "off");
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["row_count"], 1);
     assert_eq!(body["rows"].as_array().unwrap()[0]["n"], 10);

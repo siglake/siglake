@@ -250,6 +250,8 @@ fn retained_heap_bytes_tracks_the_allocator() {
             bytes_scanned: 1 << 20,
             spill_bytes: 0,
             phases: Some(Box::new(PhaseStats {
+                execution_micros: Some(5_500),
+                other_micros: Some(208),
                 plan_micros: 900,
                 buffer_delta_micros: 12,
                 collect_micros: 4_000,

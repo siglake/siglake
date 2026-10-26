@@ -3284,6 +3284,31 @@ mod reconciliation_tests {
 #[cfg(test)]
 mod result_cap_tests {
     use super::*;
+
+    #[test]
+    fn persisted_response_without_execution_totals_still_deserializes() {
+        let legacy = json!({
+            "columns": ["n"],
+            "row_count": 1,
+            "rows": [{"n": 1}],
+            "truncated": false,
+            "stats": {
+                "rows_scanned": 1,
+                "bytes_scanned": 8,
+                "spill_bytes": 0,
+                "phases": {
+                    "plan_micros": 2,
+                    "buffer_delta_micros": 0,
+                    "collect_micros": 3,
+                    "render_micros": 1
+                }
+            }
+        });
+        let response: RecordsResponse = serde_json::from_value(legacy).unwrap();
+        let phases = response.stats.unwrap().phases.unwrap();
+        assert_eq!(phases.execution_micros, None);
+        assert_eq!(phases.other_micros, None);
+    }
     use serde::Serializer;
     use serde_json::json;
 

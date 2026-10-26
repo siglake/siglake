@@ -55,6 +55,57 @@ use crate::limits::{Priority, RequestLimits, ResolvedLimits};
 use crate::openapi_dto::{ApiErrorBody, BatchSubmitResponse, SqlSuccess};
 use crate::AppState;
 
+/// Per-request SQL handler time, stamped after a buffered response is encoded.
+pub const HANDLER_MICROS_HEADER: &str = "x-siglake-handler-micros";
+/// Whether this request replayed, filled, missed, or bypassed the result cache.
+pub const RESULT_CACHE_HEADER: &str = "x-siglake-result-cache";
+
+pub(crate) fn set_result_cache_header(response: &mut Response, outcome: &'static str) {
+    response.headers_mut().insert(
+        RESULT_CACHE_HEADER,
+        axum::http::HeaderValue::from_static(outcome),
+    );
+}
+
+pub(crate) fn set_handler_micros_header(response: &mut Response, started: Instant) {
+    let micros = started.elapsed().as_micros();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&micros.to_string()) {
+        response.headers_mut().insert(HANDLER_MICROS_HEADER, value);
+    }
+}
+
+fn stamp_buffered_sql_headers(
+    result: &mut Result<Response, ApiError>,
+    format: QueryFormat,
+    started: Instant,
+) {
+    if format == QueryFormat::Ndjson {
+        return;
+    }
+    let Ok(response) = result else {
+        return;
+    };
+    set_handler_micros_header(response, started);
+    if !response.headers().contains_key(RESULT_CACHE_HEADER) {
+        set_result_cache_header(response, "off");
+    }
+}
+
+fn execution_remainder(execution_micros: u64, named_micros: u64) -> u64 {
+    if named_micros > execution_micros {
+        tracing::error!(
+            named_micros,
+            execution_micros,
+            "named response phases exceed the execution clock"
+        );
+    }
+    debug_assert!(
+        named_micros <= execution_micros,
+        "named response phases ({named_micros}) exceed execution ({execution_micros})"
+    );
+    execution_micros.saturating_sub(named_micros)
+}
+
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 pub struct SqlRequest {
     pub query: String,
@@ -3436,7 +3487,7 @@ pub(crate) async fn finish_result_cache(
     cache_ctx: SqlResultCacheCtx,
     eligibility: CacheEligibility,
     body: Option<CachedBody>,
-) {
+) -> bool {
     // Sized BEFORE the lock and before the WAL re-proof: a body that cannot be
     // stored anyway must not pay a directory listing, and the listing must not
     // be paid inside the process-wide cache mutex.
@@ -3467,19 +3518,51 @@ pub(crate) async fn finish_result_cache(
         None => None,
     };
     let mut cache = sql_result_cache().lock().await;
-    if let Some(entry) = insertable {
+    let inserted = if let Some(entry) = insertable {
         cache.insert(cache_ctx.key.clone(), entry);
         metrics::counter!(
             "siglake_query_sql_result_cache_requests_total",
             "outcome" => "insert"
         )
         .increment(1);
-    }
+        true
+    } else {
+        false
+    };
     // Removal and wake happen in `SqlResultCacheCtx::drop`, which runs here when
     // `cache_ctx` falls out of scope AND on every path that used to skip this
     // call. Doing it by hand is what left markers behind.
     drop(cache);
     drop(cache_ctx);
+    inserted
+}
+
+async fn render_fast_path_records(
+    body: Arc<crate::format::RecordsResponse>,
+    status: StatusCode,
+    cache_ctx: Option<SqlResultCacheCtx>,
+) -> Response {
+    let outcome = if let Some(cache_ctx) = cache_ctx {
+        if body.truncated {
+            finish_result_cache(cache_ctx, CacheEligibility::SQL, None).await;
+            "miss"
+        } else if finish_result_cache(
+            cache_ctx,
+            CacheEligibility::SQL,
+            Some(CachedBody::Records(Arc::clone(&body))),
+        )
+        .await
+        {
+            "insert"
+        } else {
+            "miss"
+        }
+    } else {
+        "off"
+    };
+    let mut response = (status, Json(body.as_ref())).into_response();
+    set_result_cache_header(&mut response, outcome);
+    response
 }
 
 #[cfg(test)]
@@ -4327,6 +4410,10 @@ pub(crate) async fn plan_client_sql(
          content(
              (SqlSuccess = "application/json"),
              (String = "application/x-ndjson"),
+         ),
+         headers(
+             ("x-siglake-handler-micros" = u64, description = "Handler wall time for this buffered response; omitted for streamed NDJSON."),
+             ("x-siglake-result-cache" = String, description = "Serving request cache outcome: hit, miss, insert, or off; omitted for streamed NDJSON."),
          )),
         (status = 202, description = "Admitted and queued on the dedicated runtime \
             when the request set `priority: \"batch\"`. Poll the returned URLs. \
@@ -4385,12 +4472,16 @@ pub async fn handle(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let format = req.format.unwrap_or_default();
     let execution_id = siglake_storage::QueryExecutionId::next();
-    siglake_storage::with_query_execution_id(
+    let mut result = siglake_storage::with_query_execution_id(
         execution_id,
         Box::pin(handle_scoped(state, identity, req)),
     )
-    .await
+    .await;
+    stamp_buffered_sql_headers(&mut result, format, started);
+    result
 }
 
 async fn handle_scoped(
@@ -4517,6 +4608,10 @@ async fn handle_scoped(
          content(
              (SqlSuccess = "application/json"),
              (String = "application/x-ndjson"),
+         ),
+         headers(
+             ("x-siglake-handler-micros" = u64, description = "Handler wall time for this buffered response; omitted for streamed NDJSON."),
+             ("x-siglake-result-cache" = String, description = "Serving request cache outcome: hit, miss, insert, or off; omitted for streamed NDJSON."),
          )),
         (status = 202, description = "Admitted and queued on the dedicated runtime \
             when `priority: \"batch\"`; returns 429 instead if the shared admission \
@@ -4567,13 +4662,17 @@ pub async fn handle_local(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
+    let started = Instant::now();
+    let format = req.format.unwrap_or_default();
     let execution_id = siglake_storage::current_query_execution_id()
         .unwrap_or_else(siglake_storage::QueryExecutionId::next);
-    siglake_storage::with_query_execution_id(
+    let mut result = siglake_storage::with_query_execution_id(
         execution_id,
         Box::pin(handle_local_inner(state, identity, req, None, None, None)),
     )
-    .await
+    .await;
+    stamp_buffered_sql_headers(&mut result, format, started);
+    result
 }
 
 async fn handle_local_inner(
@@ -4790,8 +4889,9 @@ async fn handle_local_inner(
             } else {
                 StatusCode::OK
             };
-            let result_meta: Result<Response, ApiError> =
-                Ok((status, Json(body.as_ref())).into_response());
+            let mut response = (status, Json(body.as_ref())).into_response();
+            set_result_cache_header(&mut response, "hit");
+            let result_meta: Result<Response, ApiError> = Ok(response);
             if let Some(cost) = cost.as_ref() {
                 emit_terminal_audit(
                     state.audit.as_ref(),
@@ -5028,21 +5128,13 @@ async fn handle_local_inner(
                 // request and fills the cache entry. It used to be copied
                 // twice — once into the store, once into the response (#2304).
                 let body = Arc::new(body);
-                if let Some(cache_ctx) = cache_ctx.clone() {
-                    finish_result_cache(
-                        cache_ctx,
-                        CacheEligibility::SQL,
-                        Some(CachedBody::Records(Arc::clone(&body))),
-                    )
-                    .await;
-                }
                 let status = if body.truncated {
                     StatusCode::PAYLOAD_TOO_LARGE
                 } else {
                     StatusCode::OK
                 };
                 let result_meta: Result<Response, ApiError> =
-                    Ok((status, Json(body.as_ref())).into_response());
+                    Ok(render_fast_path_records(body, status, cache_ctx.clone()).await);
                 emit_terminal_audit(
                     state.audit.as_ref(),
                     &identity,
@@ -5069,16 +5161,8 @@ async fn handle_local_inner(
                     None,
                 );
                 let body = Arc::new(body);
-                if let Some(cache_ctx) = cache_ctx.clone() {
-                    finish_result_cache(
-                        cache_ctx,
-                        CacheEligibility::SQL,
-                        Some(CachedBody::Records(Arc::clone(&body))),
-                    )
-                    .await;
-                }
                 let result_meta: Result<Response, ApiError> =
-                    Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+                    Ok(render_fast_path_records(body, StatusCode::OK, cache_ctx.clone()).await);
                 emit_terminal_audit(
                     state.audit.as_ref(),
                     &identity,
@@ -5112,16 +5196,8 @@ async fn handle_local_inner(
                     None,
                 );
                 let body = Arc::new(body);
-                if let Some(cache_ctx) = cache_ctx.clone() {
-                    finish_result_cache(
-                        cache_ctx,
-                        CacheEligibility::SQL,
-                        Some(CachedBody::Records(Arc::clone(&body))),
-                    )
-                    .await;
-                }
                 let result_meta: Result<Response, ApiError> =
-                    Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+                    Ok(render_fast_path_records(body, StatusCode::OK, cache_ctx.clone()).await);
                 emit_terminal_audit(
                     state.audit.as_ref(),
                     &identity,
@@ -5155,16 +5231,8 @@ async fn handle_local_inner(
                     None,
                 );
                 let body = Arc::new(body);
-                if let Some(cache_ctx) = cache_ctx.clone() {
-                    finish_result_cache(
-                        cache_ctx,
-                        CacheEligibility::SQL,
-                        Some(CachedBody::Records(Arc::clone(&body))),
-                    )
-                    .await;
-                }
                 let result_meta: Result<Response, ApiError> =
-                    Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+                    Ok(render_fast_path_records(body, StatusCode::OK, cache_ctx.clone()).await);
                 emit_terminal_audit(
                     state.audit.as_ref(),
                     &identity,
@@ -5198,16 +5266,8 @@ async fn handle_local_inner(
                     None,
                 );
                 let body = Arc::new(body);
-                if let Some(cache_ctx) = cache_ctx.clone() {
-                    finish_result_cache(
-                        cache_ctx,
-                        CacheEligibility::SQL,
-                        Some(CachedBody::Records(Arc::clone(&body))),
-                    )
-                    .await;
-                }
                 let result_meta: Result<Response, ApiError> =
-                    Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+                    Ok(render_fast_path_records(body, StatusCode::OK, cache_ctx.clone()).await);
                 emit_terminal_audit(
                     state.audit.as_ref(),
                     &identity,
@@ -5242,16 +5302,8 @@ async fn handle_local_inner(
                     None,
                 );
                 let body = Arc::new(body);
-                if let Some(cache_ctx) = cache_ctx.clone() {
-                    finish_result_cache(
-                        cache_ctx,
-                        CacheEligibility::SQL,
-                        Some(CachedBody::Records(Arc::clone(&body))),
-                    )
-                    .await;
-                }
                 let result_meta: Result<Response, ApiError> =
-                    Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+                    Ok(render_fast_path_records(body, StatusCode::OK, cache_ctx.clone()).await);
                 emit_terminal_audit(
                     state.audit.as_ref(),
                     &identity,
@@ -5278,16 +5330,8 @@ async fn handle_local_inner(
                     None,
                 );
                 let body = Arc::new(body);
-                if let Some(cache_ctx) = cache_ctx.clone() {
-                    finish_result_cache(
-                        cache_ctx,
-                        CacheEligibility::SQL,
-                        Some(CachedBody::Records(Arc::clone(&body))),
-                    )
-                    .await;
-                }
                 let result_meta: Result<Response, ApiError> =
-                    Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+                    Ok(render_fast_path_records(body, StatusCode::OK, cache_ctx.clone()).await);
                 emit_terminal_audit(
                     state.audit.as_ref(),
                     &identity,
@@ -5503,15 +5547,8 @@ async fn handle_local_inner(
                 None,
             );
             let body = Arc::new(body);
-            if let Some(cache_ctx) = cache_ctx.clone() {
-                finish_result_cache(
-                    cache_ctx,
-                    CacheEligibility::SQL,
-                    Some(CachedBody::Records(Arc::clone(&body))),
-                )
-                .await;
-            }
-            let result = Ok((StatusCode::OK, Json(body.as_ref())).into_response());
+            let result =
+                Ok(render_fast_path_records(body, StatusCode::OK, cache_ctx.clone()).await);
             emit_terminal_audit(
                 state.audit.as_ref(),
                 &identity,
@@ -7219,6 +7256,8 @@ fn attach_fast_path_phases(
 ) {
     if let Some(stats) = body.stats.as_mut() {
         stats.phases = Some(Box::new(crate::format::PhaseStats {
+            execution_micros: None,
+            other_micros: None,
             plan_micros,
             buffer_delta_micros,
             collect_micros: battery_started.elapsed().as_micros() as u64,
@@ -11492,6 +11531,7 @@ async fn execute_with_limits(
                     residual_fallback,
                     execution_id,
                     numeric_probe,
+                    started,
                 )
                 .await
             }
@@ -11613,6 +11653,7 @@ async fn render_records(
     residual_fallback: Option<DataFrame>,
     execution_id: siglake_storage::QueryExecutionId,
     numeric_probe: NumericTopKProbe,
+    started: Instant,
 ) -> Result<Response, ApiError> {
     let plan_started = Instant::now();
     // Before `create_physical_plan`, which consumes the DataFrame: execution
@@ -11678,6 +11719,7 @@ async fn render_records(
                         None,
                         execution_id,
                         numeric_probe,
+                        started,
                     ))
                     .await;
                 }
@@ -11756,6 +11798,8 @@ async fn render_records(
         // #85: single-pod wall attribution (plan → execute → render, plus the
         // buffer-delta load that preceded execution).
         phases: Some(Box::new(crate::format::PhaseStats {
+            execution_micros: None,
+            other_micros: None,
             plan_micros: plan_elapsed.as_micros() as u64,
             buffer_delta_micros,
             collect_micros: collect_elapsed.as_micros() as u64,
@@ -11774,24 +11818,47 @@ async fn render_records(
     } else {
         StatusCode::OK
     };
+    if !body.truncated {
+        let phases = body
+            .stats
+            .as_mut()
+            .and_then(|stats| stats.phases.as_mut())
+            .expect("records scan response has phase stats");
+        let execution_micros = started.elapsed().as_micros() as u64;
+        let named_micros = phases
+            .plan_micros
+            .saturating_add(phases.buffer_delta_micros)
+            .saturating_add(phases.collect_micros)
+            .saturating_add(phases.render_micros);
+        phases.execution_micros = Some(execution_micros);
+        phases.other_micros = Some(execution_remainder(execution_micros, named_micros));
+    }
     // One allocation from here on: the same body answers this request and
     // fills the cache entry, rather than being deep-copied into it (#2304).
     let body = Arc::new(body);
     // Charging the entry walks the retained body (`retained_heap_bytes`), so
     // this is not free even though nothing is copied.
     let cache_fill_started = Instant::now();
-    if let Some(cache_ctx) = cache_ctx {
+    let cache_outcome = if let Some(cache_ctx) = cache_ctx {
         if body.truncated {
             finish_result_cache(cache_ctx, CacheEligibility::SQL, None).await;
+            "miss"
         } else {
-            finish_result_cache(
+            if finish_result_cache(
                 cache_ctx,
                 CacheEligibility::SQL,
                 Some(CachedBody::Records(Arc::clone(&body))),
             )
-            .await;
+            .await
+            {
+                "insert"
+            } else {
+                "miss"
+            }
         }
-    }
+    } else {
+        "off"
+    };
     let cache_fill_elapsed = cache_fill_started.elapsed();
     // DataFusion's `one_line()` writes a trailing newline. Remove it before
     // handing the field to tracing so the keyed head and its timings stay in
@@ -11808,7 +11875,8 @@ async fn render_records(
     // encodes the body eagerly, so its cost is inside the handler's `total_ms`
     // and has to be named here to be named at all (#7456).
     let serialize_started = Instant::now();
-    let response = (status, Json(body.as_ref())).into_response();
+    let mut response = (status, Json(body.as_ref())).into_response();
+    set_result_cache_header(&mut response, cache_outcome);
     let serialize_elapsed = serialize_started.elapsed();
     tracing::info!(
         endpoint = "sql",
@@ -12131,6 +12199,7 @@ mod tests {
                 bytes: 1234,
                 reads: 3,
             },
+            Instant::now(),
         )
         .await
         .unwrap();
@@ -17564,7 +17633,7 @@ mod tests {
         let single = "SELECT count(*) AS n FROM events WHERE host = 'pred-sub-control'";
         match decide(single).await.unwrap() {
             SqlResultCacheDecision::Leader(ctx) => {
-                finish_result_cache(ctx, CacheEligibility::SQL, None).await
+                finish_result_cache(ctx, CacheEligibility::SQL, None).await;
             }
             SqlResultCacheDecision::Hit(_) => panic!("nothing was ever inserted"),
             SqlResultCacheDecision::Skip => {
@@ -18695,6 +18764,10 @@ async fn shard_scoped(
          content(
              (RecordsResponse = "application/json"),
              (String = "application/x-ndjson"),
+         ),
+         headers(
+             ("x-siglake-handler-micros" = u64, description = "Handler wall time for this buffered response; omitted for streamed NDJSON."),
+             ("x-siglake-result-cache" = String, description = "Serving request cache outcome: hit, miss, insert, or off; omitted for streamed NDJSON."),
          )),
         (status = 400, description = "Empty or unparseable SQL, a statement that is \
             not a read (DDL, DML and session statements — `CREATE`, `COPY … TO`, \
@@ -18756,12 +18829,16 @@ pub async fn distributed(
              for the first answer)",
         ));
     };
+    let started = Instant::now();
+    let format = req.format.unwrap_or_default();
     let execution_id = siglake_storage::QueryExecutionId::next();
-    siglake_storage::with_query_execution_id(
+    let mut result = siglake_storage::with_query_execution_id(
         execution_id,
         Box::pin(distributed_inner(state, identity, req, None, None, peers)),
     )
-    .await
+    .await;
+    stamp_buffered_sql_headers(&mut result, format, started);
+    result
 }
 
 #[tracing::instrument(skip_all, fields(otel.kind = "internal", query = %req.query))]
@@ -19304,6 +19381,13 @@ async fn distributed_inner(
             }
             QueryFormat::Records => {
                 let render_started = Instant::now();
+                let shard_wall_micros = coord_stats
+                    .shard_wall_micros
+                    .iter()
+                    .copied()
+                    .max()
+                    .unwrap_or(0);
+                let merge_micros = coord_stats.merge_micros;
                 // #7420: the coordinator's own plan schema, which is the
                 // client's query — never a shard partial's, whose columns a
                 // rewritten worker SQL may rename or add to.
@@ -19322,6 +19406,8 @@ async fn distributed_inner(
                     bytes_scanned: coord_stats.totals.bytes_scanned,
                     spill_bytes: coord_stats.totals.spill_bytes,
                     phases: Some(Box::new(crate::format::PhaseStats {
+                        execution_micros: None,
+                        other_micros: None,
                         plan_micros: coord_stats.plan_micros,
                         buffer_delta_micros,
                         collect_micros: 0,
@@ -19340,6 +19426,20 @@ async fn distributed_inner(
                     scan: coord_stats.scan.map(Box::new),
                     ..Default::default()
                 });
+                let phases = body
+                    .stats
+                    .as_mut()
+                    .and_then(|stats| stats.phases.as_mut())
+                    .expect("coordinator records response has phase stats");
+                let execution_micros = start.elapsed().as_micros() as u64;
+                let named_micros = phases
+                    .plan_micros
+                    .saturating_add(phases.buffer_delta_micros)
+                    .saturating_add(phases.render_micros)
+                    .saturating_add(shard_wall_micros)
+                    .saturating_add(merge_micros);
+                phases.execution_micros = Some(execution_micros);
+                phases.other_micros = Some(execution_remainder(execution_micros, named_micros));
                 Ok((StatusCode::OK, Json(body)).into_response())
             }
         }
