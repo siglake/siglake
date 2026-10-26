@@ -1309,6 +1309,14 @@ Compaction is continuous and coexists with sustained writes — validated
 through 200 GB and 1 TB sustained-ingest rounds
 (`docs/DESIGN_continuous_compaction_and_ingest.md`):
 
+Commit accumulation also applies to `siglake compactor --once`. By default, a
+sealed queue below 32 MiB remains deferred until its oldest file-modification
+age reaches 10 seconds. The command can therefore exit successfully with
+`committed 0 segment(s)` while sealed files remain; that output describes the
+pass, not an empty queue. After stopping an ingester, set
+`SIGLAKE_COMMIT_BATCH_TARGET_MB=0` when one pass must drain the available queue
+immediately.
+
 - **Leveled ladder.** Files are size-classed into levels (defaults
   L0 <128 MiB <L1 <1 GiB <L2 <8 GiB <L3); each compaction merges a bounded
   fan-in (≤64) of one level's files toward the next level's size through a
