@@ -273,6 +273,20 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   cannot prove its lifetime. Keeping a mixed file costs metadata and object
   storage until its last live reference retires, but preserves the Iceberg
   interoperability boundary.
+- **A SQL response's phase block names part of its request, and is provenance
+  of an execution rather than timing of the request that received it.**
+  `stats.phases` carries physical plan, buffer delta, collect and render. The
+  rest of the handler's time — rewrite, the result-cache probe, the session
+  build, registration, logical planning, cost estimation, the fast-path
+  battery, admission, the plan-stats walk, the cache fill, the plan text and
+  serialization — is named in the `sql query profile` and `sql execution
+  profile` log lines (#7456, `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`) and not
+  in the body, so a reader with the response alone is short 16–21% of the
+  handler's total locally and 2.58 / 2.19 ms on the 2026-10-26 round's clipped
+  shapes. A result-cache hit and a batch job result both return a stored body,
+  phases and all, so those numbers describe whichever execution filled the
+  entry. `docs/DESIGN_response_phase_accounting.md` settles what a response
+  could carry and recommends a shape; no field has been added.
 - **A maintenance process's cache budgets are readable at startup, not on
   `/metrics`.** The compactor, the ingest server and the `siglake` maintenance
   subcommands resolve their own budgets now — zero for the two text-index
