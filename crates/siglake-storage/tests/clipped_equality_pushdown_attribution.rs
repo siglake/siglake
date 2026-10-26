@@ -144,6 +144,20 @@ struct Run {
     decoded_bytes: usize,
 }
 
+impl Run {
+    /// Footer/index work follows opened files, including a reader cancelled
+    /// before it reaches a row group.
+    fn per_opened_file(&self, value: usize) -> usize {
+        value / self.files_read.max(1)
+    }
+
+    /// Data and decode work follows row groups that reached the reader. A
+    /// wave-2 reader may open a file and stop before contributing either.
+    fn per_row_group(&self, value: usize) -> usize {
+        value / self.row_groups_read.max(1)
+    }
+}
+
 async fn run(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Run {
     let scans = scan_nodes(&plan);
     assert_eq!(scans.len(), 1, "one scan leaf expected");
@@ -415,11 +429,20 @@ async fn clipped_equality_reader_pushdown_attribution() {
             suppressed.decoded_bytes,
         );
         assert_eq!(
-            pushed.object_store_reads, without_selection.object_store_reads,
-            "column and offset indexes are preloaded in both reader arms"
+            pushed.per_opened_file(pushed.bytes_index),
+            without_selection.per_opened_file(without_selection.bytes_index),
+            "column and offset index bytes per opened file must match"
         );
-        assert_eq!(pushed.bytes_index, without_selection.bytes_index);
-        assert_eq!(pushed.decoded_bytes, without_selection.decoded_bytes);
+        assert_eq!(
+            pushed.per_row_group(pushed.bytes_data_requested),
+            without_selection.per_row_group(without_selection.bytes_data_requested),
+            "requested data bytes per row group must match"
+        );
+        assert_eq!(
+            pushed.per_row_group(pushed.decoded_bytes),
+            without_selection.per_row_group(without_selection.decoded_bytes),
+            "decoded bytes per row group must match"
+        );
         assert_eq!(
             pushed.rows_pruned_selection, 0,
             "interleaved labels give every page a matching min/max"

@@ -105,6 +105,13 @@ case, or a matched selective/clustered control showing that the residual-only
 route also wins there. This investigation adds no public knob and makes no
 production policy change.
 
+#7500 ran those layouts:
+[Clipped equality-pushdown layouts](CLIPPED_EQUALITY_PUSHDOWN_LAYOUTS_2026-10-26.md).
+The sign reverses. At 0.2% selectivity with nothing pruned the reader predicate
+saves 11.7 ms, and a clustered label that prunes to one planned file saves
+41.1 ms, so the boundary above holds for this fixture only and must not be
+applied unconditionally.
+
 ## Reproduction
 
 ```sh
