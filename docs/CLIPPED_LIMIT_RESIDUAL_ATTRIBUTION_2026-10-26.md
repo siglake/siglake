@@ -13,8 +13,8 @@ Artifacts, read-only:
   — `{restored-original,matched-baseline,matched-candidate}/` and the three
   `siglake-query-server-*-stderr.log` captures
 
-(`…` is
-`/home/todd/workspace/loglake-manager/var/investigations/20261023-engine-7106-qualification-7204`.)
+(`…` is the retained investigation directory
+`20261023-engine-7106-qualification-7204`.)
 
 Node: `m6i.4xlarge`, 16 CPUs, 4 GiB query pod, result cache off,
 `TF_VAR_peer_count=2`. Table: 15 live files, 98,466,115 rows.
