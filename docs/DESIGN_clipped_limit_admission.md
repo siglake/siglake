@@ -94,8 +94,9 @@ Liveness for the unordered case: if tickets are waiting then `admitted <
 partitions`, the tickets below `admitted` are all registered, and each pays at
 least the credit it owes by ending. Tickets are handed out modulo the partition
 count, so a caller that executes a single partition takes ticket 0 and runs at
-once, and a plan executed a second time finds the ramp already open — it
-degrades to the ungated behavior rather than blocking.
+once. Each clipped coalescer execution owns a fresh ramp. Direct scan callers
+that bypass the coalescer share a fallback ramp whose wrapped tickets keep
+repeated calls live.
 
 ## Which group starts first (#6979)
 
@@ -363,16 +364,17 @@ bloom-pruned first partition, a term with too few matches and a sparse term
 never fill the fetch, so nothing closes and the ramp opens on credits as
 before.
 
-The close records the registration sequence it covers. It therefore applies to
-the partitions of the execution that filled the fetch and not to a later
-execution of the same plan node, which registers above that sequence and keeps
-the full ramp, credits included. A partition of the same execution that
-registers after the close — a producer task the scheduler had not yet run —
-stays queued until teardown drops it, which is the state that costs nothing.
+The clipped coalescer creates a fresh ramp state for each `execute` call and
+passes it to its scan children through their task context. Ticket allocation,
+credits, close state and wakeups all belong to that execution. A concurrent or
+later execution of the same physical plan therefore keeps its own full ramp,
+and a producer task that registers after its own execution closes ends without
+opening its reader.
 
 `a_closed_ramp_pays_no_terminal_credit_and_starts_no_reader` and
-`a_closed_ramp_still_gates_and_wakes_a_later_execution` in `query_provider.rs`
-hand-poll that interleaving, so neither depends on load.
+`closing_one_execution_does_not_affect_another_execution` in
+`query_provider.rs` hand-poll the close/credit interleaving and isolate two
+executions of one plan, so neither depends on load.
 `a_filled_clipped_limit_starts_no_further_reader` gates the outcome on the
 dense 16-file fixture: 100 distinct qualifying rows out of one file read.
 
