@@ -23,7 +23,8 @@
 //! or `WHERE CAST(attr_get(attributes,'http.status_code') AS INT) >= 500`.
 
 use std::any::Any;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use arrow_array::builder::{BooleanBuilder, StringBuilder};
@@ -36,7 +37,7 @@ use datafusion::logical_expr::{
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use regex::Regex;
-use siglake_bloom::Tokenizer;
+use siglake_bloom::{default_token_slices, Tokenizer};
 
 pub const KV_EXTRACT_FN: &str = "kv_extract";
 pub const ATTR_GET_FN: &str = "attr_get";
@@ -197,18 +198,14 @@ impl ScalarUDFImpl for MatchUdf {
             ColumnarValue::Scalar(query) => {
                 let query = query_scalar_string(query, self.name)?;
                 let query_tokens = tokenize_query_literal(self.name, tokenizer, &query)?;
+                let matcher = PreparedMatch::new(self.mode, tokenizer, &query_tokens);
                 let mut builder = BooleanBuilder::with_capacity(n);
                 for i in 0..n {
                     if cells.is_null(i) {
                         builder.append_value(false);
                         continue;
                     }
-                    builder.append_value(match_raw(
-                        self.mode,
-                        tokenizer,
-                        cells.value(i),
-                        &query_tokens,
-                    ));
+                    builder.append_value(matcher.matches(cells.value(i)));
                 }
                 Ok(ColumnarValue::Array(Arc::new(builder.finish())))
             }
@@ -228,12 +225,8 @@ impl ScalarUDFImpl for MatchUdf {
                     }
                     let query = queries.value(i);
                     let query_tokens = tokenize_query_literal(self.name, tokenizer, query)?;
-                    builder.append_value(match_raw(
-                        self.mode,
-                        tokenizer,
-                        cells.value(i),
-                        &query_tokens,
-                    ));
+                    let matcher = PreparedMatch::new(self.mode, tokenizer, &query_tokens);
+                    builder.append_value(matcher.matches(cells.value(i)));
                 }
                 Ok(ColumnarValue::Array(Arc::new(builder.finish())))
             }
@@ -275,7 +268,122 @@ fn tokenize_query_literal(name: &str, tokenizer: Tokenizer, query: &str) -> DfRe
     Ok(tokens)
 }
 
-fn match_raw(mode: MatchMode, tokenizer: Tokenizer, raw: &str, query_tokens: &[String]) -> bool {
+#[derive(Clone, Copy)]
+struct AsciiLower<'a>(&'a str);
+
+impl PartialEq for AsciiLower<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(other.0)
+    }
+}
+
+impl Eq for AsciiLower<'_> {}
+
+impl Hash for AsciiLower<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for byte in self.0.bytes() {
+            state.write_u8(byte.to_ascii_lowercase());
+        }
+    }
+}
+
+enum DefaultTermMatch<'a> {
+    One(&'a str),
+    Many {
+        masks: HashMap<AsciiLower<'a>, u64>,
+        required: u64,
+    },
+}
+
+impl<'a> DefaultTermMatch<'a> {
+    fn new(query_tokens: &'a [String]) -> Self {
+        let first = query_tokens
+            .first()
+            .expect("match query tokenization is validated before preparation");
+        if query_tokens.iter().all(|term| term == first) {
+            return Self::One(first);
+        }
+
+        let mut masks = HashMap::with_capacity(query_tokens.len());
+        for term in query_tokens {
+            let next_mask = 1_u64 << masks.len();
+            masks.entry(AsciiLower(term)).or_insert(next_mask);
+        }
+        let required = if masks.len() == u64::BITS as usize {
+            u64::MAX
+        } else {
+            (1_u64 << masks.len()) - 1
+        };
+        Self::Many { masks, required }
+    }
+
+    fn any(&self, raw: &str) -> bool {
+        match self {
+            Self::One(term) => {
+                default_token_slices(raw).any(|cell| cell.eq_ignore_ascii_case(term))
+            }
+            Self::Many { masks, .. } => {
+                default_token_slices(raw).any(|cell| masks.contains_key(&AsciiLower(cell)))
+            }
+        }
+    }
+
+    fn all(&self, raw: &str) -> bool {
+        match self {
+            Self::One(term) => {
+                default_token_slices(raw).any(|cell| cell.eq_ignore_ascii_case(term))
+            }
+            Self::Many { masks, required } => {
+                let mut found = 0_u64;
+                for cell in default_token_slices(raw) {
+                    if let Some(mask) = masks.get(&AsciiLower(cell)) {
+                        found |= mask;
+                        if found == *required {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+struct PreparedMatch<'a> {
+    mode: MatchMode,
+    tokenizer: Tokenizer,
+    query_tokens: &'a [String],
+    default_terms: Option<DefaultTermMatch<'a>>,
+}
+
+impl<'a> PreparedMatch<'a> {
+    fn new(mode: MatchMode, tokenizer: Tokenizer, query_tokens: &'a [String]) -> Self {
+        let default_terms = (tokenizer == Tokenizer::Default
+            && matches!(mode, MatchMode::AllTerms | MatchMode::AnyTerm))
+        .then(|| DefaultTermMatch::new(query_tokens));
+        Self {
+            mode,
+            tokenizer,
+            query_tokens,
+            default_terms,
+        }
+    }
+
+    fn matches(&self, raw: &str) -> bool {
+        match (&self.default_terms, self.mode) {
+            (Some(terms), MatchMode::AllTerms) => terms.all(raw),
+            (Some(terms), MatchMode::AnyTerm) => terms.any(raw),
+            _ => match_raw_fallback(self.mode, self.tokenizer, raw, self.query_tokens),
+        }
+    }
+}
+
+fn match_raw_fallback(
+    mode: MatchMode,
+    tokenizer: Tokenizer,
+    raw: &str,
+    query_tokens: &[String],
+) -> bool {
     let cell_tokens = tokenizer.tokenize(raw);
     match mode {
         MatchMode::AllTerms => {
@@ -447,11 +555,64 @@ fn extract_first(re: &Regex, raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::time::Duration;
+
     use arrow_array::BooleanArray;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::datatypes::Field;
     use datafusion::common::scalar::ScalarValue;
     use datafusion::logical_expr::ScalarFunctionArgs;
+
+    struct CountingAllocator;
+
+    thread_local! {
+        static TRACK_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
+        static ALLOCATION_COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn record_allocation(ptr: *mut u8) {
+        if !ptr.is_null() && TRACK_ALLOCATIONS.get() {
+            ALLOCATION_COUNT.set(ALLOCATION_COUNT.get() + 1);
+        }
+    }
+
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            record_allocation(ptr);
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc_zeroed(layout) };
+            record_allocation(ptr);
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let ptr = unsafe { System.realloc(ptr, layout, new_size) };
+            record_allocation(ptr);
+            ptr
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn allocations<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        ALLOCATION_COUNT.set(0);
+        TRACK_ALLOCATIONS.set(true);
+        let value = f();
+        TRACK_ALLOCATIONS.set(false);
+        let count = ALLOCATION_COUNT.get();
+        (value, count)
+    }
 
     fn invoke(raw: &[&str], key: &str) -> Vec<Option<String>> {
         let udf = KvExtractUdf::new();
@@ -895,6 +1056,194 @@ mod tests {
         assert_eq!(
             tokenize_query_literal(MATCH_TERMS_FN, Tokenizer::Default, input).unwrap(),
             siglake_bloom::tokenize(input)
+        );
+    }
+
+    #[test]
+    fn prepared_match_is_exactly_the_previous_matcher() {
+        let capped = (0..70)
+            .map(|i| format!("Token{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let corpus = [
+            "Queen checkout completed in 17ms",
+            "QUEEN,checkout; retrying",
+            "short a AB 12 and café",
+            "timeouts connecting classes",
+            "connection refused by peer",
+            "healthy",
+            &capped,
+        ];
+        let cases = [
+            (Tokenizer::Default, "queen"),
+            (Tokenizer::Default, "queen queen"),
+            (Tokenizer::Default, "queen checkout"),
+            (Tokenizer::Default, "token63 token69"),
+            (Tokenizer::Raw, "queen checkout"),
+            (Tokenizer::Stem, "timeout connect"),
+        ];
+        let modes = [
+            MatchMode::AllTerms,
+            MatchMode::AnyTerm,
+            MatchMode::Phrase,
+            MatchMode::Prefix,
+        ];
+
+        for (tokenizer, query) in cases {
+            let query_tokens = tokenizer.tokenize(query);
+            for mode in modes {
+                let prepared = PreparedMatch::new(mode, tokenizer, &query_tokens);
+                for raw in corpus {
+                    assert_eq!(
+                        prepared.matches(raw),
+                        match_raw_fallback(mode, tokenizer, raw, &query_tokens),
+                        "mode={mode:?} tokenizer={tokenizer:?} query={query:?} raw={raw:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_match_handles_all_64_distinct_query_terms() {
+        let query = (0..64)
+            .map(|i| format!("term{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let raw = query.to_ascii_uppercase();
+        let query_tokens = Tokenizer::Default.tokenize(&query);
+        let prepared = PreparedMatch::new(MatchMode::AllTerms, Tokenizer::Default, &query_tokens);
+        assert!(prepared.matches(&raw));
+        assert_eq!(
+            prepared.matches(&raw),
+            match_raw_fallback(MatchMode::AllTerms, Tokenizer::Default, &raw, &query_tokens)
+        );
+    }
+
+    fn match_cost_corpus() -> Vec<String> {
+        (0..512)
+            .map(|row| {
+                let needle = if row % 5 == 0 { " queen" } else { " healthy" };
+                format!(
+                    "2026-10-26T12:00:00Z service=checkout request completed{needle} status=200 row={row:04}"
+                )
+            })
+            .collect()
+    }
+
+    fn run_match_corpus(corpus: &[String], mut matches: impl FnMut(&str) -> bool) -> usize {
+        corpus
+            .iter()
+            .filter(|raw| std::hint::black_box(matches(std::hint::black_box(raw))))
+            .count()
+    }
+
+    #[test]
+    fn default_term_paths_allocate_nothing_per_cell() {
+        let corpus = match_cost_corpus();
+        for (mode, query) in [
+            (MatchMode::AllTerms, "queen"),
+            (MatchMode::AllTerms, "queen checkout"),
+            (MatchMode::AnyTerm, "absent queen"),
+        ] {
+            let query_tokens = Tokenizer::Default.tokenize(query);
+            let prepared = PreparedMatch::new(mode, Tokenizer::Default, &query_tokens);
+
+            let (optimized_hits, optimized_allocations) =
+                allocations(|| run_match_corpus(&corpus, |raw| prepared.matches(raw)));
+            let (reference_hits, reference_allocations) = allocations(|| {
+                run_match_corpus(&corpus, |raw| {
+                    match_raw_fallback(mode, Tokenizer::Default, raw, &query_tokens)
+                })
+            });
+
+            assert_eq!(
+                optimized_hits, reference_hits,
+                "mode={mode:?} query={query}"
+            );
+            assert_eq!(optimized_allocations, 0, "mode={mode:?} query={query}");
+            assert!(
+                reference_allocations >= corpus.len(),
+                "the reference must expose its per-cell allocation: {reference_allocations} allocations for {} cells; mode={mode:?} query={query}",
+                corpus.len()
+            );
+        }
+    }
+
+    fn process_cpu() -> Duration {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+        assert_eq!(rc, 0, "read process CPU clock");
+        Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    }
+
+    fn cpu_sample(mut f: impl FnMut() -> usize) -> (usize, Duration) {
+        let start = process_cpu();
+        let mut hits = 0;
+        for _ in 0..200 {
+            hits += std::hint::black_box(f());
+        }
+        (hits, process_cpu() - start)
+    }
+
+    /// Identical-corpus, single-process CPU control for the allocation rewrite.
+    /// The previous matcher is retained as the exact-result and cost oracle;
+    /// process CPU excludes scheduler wait, and both arms use the same wrapper.
+    ///
+    /// Run with:
+    /// `cargo test --release -p siglake-query-server default_match_cpu_control -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn default_match_cpu_control() {
+        let corpus = match_cost_corpus();
+        let query_tokens = Tokenizer::Default.tokenize("queen");
+        let prepared = PreparedMatch::new(MatchMode::AllTerms, Tokenizer::Default, &query_tokens);
+        let optimized = || run_match_corpus(&corpus, |raw| prepared.matches(raw));
+        let reference = || {
+            run_match_corpus(&corpus, |raw| {
+                match_raw_fallback(MatchMode::AllTerms, Tokenizer::Default, raw, &query_tokens)
+            })
+        };
+
+        std::hint::black_box(optimized());
+        std::hint::black_box(reference());
+        let mut optimized_samples = Vec::with_capacity(7);
+        let mut reference_samples = Vec::with_capacity(7);
+        let mut optimized_hits = 0;
+        let mut reference_hits = 0;
+        for sample in 0..7 {
+            if sample % 2 == 0 {
+                let (hits, cpu) = cpu_sample(&reference);
+                reference_hits = hits;
+                reference_samples.push(cpu);
+                let (hits, cpu) = cpu_sample(&optimized);
+                optimized_hits = hits;
+                optimized_samples.push(cpu);
+            } else {
+                let (hits, cpu) = cpu_sample(&optimized);
+                optimized_hits = hits;
+                optimized_samples.push(cpu);
+                let (hits, cpu) = cpu_sample(&reference);
+                reference_hits = hits;
+                reference_samples.push(cpu);
+            }
+        }
+        optimized_samples.sort_unstable();
+        reference_samples.sort_unstable();
+        let optimized_median = optimized_samples[optimized_samples.len() / 2];
+        let reference_median = reference_samples[reference_samples.len() / 2];
+        let ratio = optimized_median.as_secs_f64() / reference_median.as_secs_f64();
+        eprintln!(
+            "default match CPU: optimized={optimized_median:?} reference={reference_median:?} ratio={ratio:.3}"
+        );
+
+        assert_eq!(optimized_hits, reference_hits);
+        assert!(
+            ratio <= 0.5,
+            "optimized/reference CPU ratio {ratio:.3} exceeded 0.500"
         );
     }
 

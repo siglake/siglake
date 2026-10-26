@@ -2399,6 +2399,33 @@ line.
 and `crates/siglake-query-server/tests/query_execution_attribution.rs` pin
 the concurrent, early-`LIMIT` and streaming cases.
 
+**A records request's time is fully attributed, and the clocks nest.** The
+terminal `sql query profile` line carries one field per phase between the
+request clock's start and the line itself — resolve, rewrite, buffer delta,
+result-cache probe, session build, registration, logical plan, estimate,
+fast-path battery, admission, numeric probe, execute — plus
+`unattributed_ms`, which is the total minus that sum. `execute_ms` is split
+again on the execution profile: physical plan, collect, plan stats, render,
+cache fill, plan text, serialize. Response serialization is inside the
+handler's `total_ms`, not after it: `Json::into_response` encodes the body
+before the terminal line is written.
+
+`/api/v1/sql` resolves and rewrites in `handle_scoped` before deciding whether
+to fan out, and hands the results to the local path; `RequestClock` carries
+those two durations (`PreludePhases`) so they are charged to the request
+rather than vanishing into the no-op branch downstream.
+
+`x-siglake-server-micros` is a strictly wider clock than `total_ms`, and the
+difference is not all compute: the header's middleware starts when the request
+head has been parsed, while the handler's starts after the `Json` extractor has
+read the body off the socket. A client that splits those writes charges the
+interval to the header alone.
+`crates/siglake-query-server/tests/sql_phase_accounting.rs` pins the nesting
+and the sum per request;
+`crates/siglake-query-server/tests/sql_server_micros_boundary.rs` pins the
+header's transport term over a real socket. `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`
+has the measured split.
+
 **Configuration for instrumented processes is the standard OTel environment,
 and it is off by default.**
 

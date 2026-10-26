@@ -6561,6 +6561,7 @@ dependencies = [
  "hickory-resolver",
  "iceberg",
  "jsonwebtoken",
+ "libc",
  "metrics",
  "metrics-util",
  "opentelemetry",
