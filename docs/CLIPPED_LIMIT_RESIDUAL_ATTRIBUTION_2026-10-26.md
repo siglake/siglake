@@ -111,6 +111,15 @@ Of the unattributed remainder the log names `register` 0.61, `logical` 0.13 and
 counter: the server's own `total_ms` (17.99 / 10.50) is already below the
 `server_micros` the client records (18.85 / 11.40).
 
+> Corrected by #7456. That last sentence reads the remainder as ONE term
+> sitting above `total_ms`; it is two. 0.87 ms (keyword) and 0.45 ms
+> (substring) are inside `total_ms`, in handler phases that had no timer —
+> response serialization among them, which runs before the terminal line.
+> The 0.86 / 0.90 ms above `total_ms` is the server header's wider span, which
+> also covers reading the request body off the socket.
+> `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md` has the boundaries and the
+> per-request measurement.
+
 So roughly 3.7 ms per request on both shapes is spent outside the scan. Against
 a 10 ms ceiling, a scan reduced to zero still leaves substring at about 3.7 ms
 and no margin for the decode the shape actually needs.
@@ -194,8 +203,15 @@ the round's passing rows rather than its failing ones. It is unexplained here.
 - That the ceilings are reachable on this layout. The 10 ms figures come from
   #4329's scanned-path measurements (keyword 6.1 ms, substring 4.5 ms on
   14 × 7.34M rows); this round's fixed non-scan overhead alone is ~3.7 ms.
-- What the 1.3–1.7 ms of server time below `total_ms` and above the recorded
-  phases is spent on.
+- ~~What the 1.3–1.7 ms of server time below `total_ms` and above the recorded
+  phases is spent on.~~ Answered by #7456, which also corrects the boundary
+  this bullet assumed: it is two terms, not one. About 0.87 ms (keyword) and
+  0.45 ms (substring) is INSIDE `total_ms`, in phases that had no timer —
+  rewrite, result-cache probe, session build, plan-stats summarize and response
+  serialization, which runs before the terminal line rather than after it. The
+  remaining 0.86 / 0.90 ms is the header's own wider span, which includes
+  request-body receipt off the socket. See
+  `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`.
 - Why the coalescer does not complete once one partition has supplied the
   fetch. Over every clipped execution in the candidate capture,
   `df_output_rows − leaf_rows_scanned` is an exact integer multiple of
@@ -218,8 +234,10 @@ settings fixed and fails on the old behaviour, per #7446:
    on the first hit. Oracle: a local CPU measurement against the retained
    62× `LIKE` ratio, plus exact-result controls over the existing UDF tests.
    Bounded by substring's 12.08 ms — it cannot close the keyword row alone.
-2. **Fixed per-request overhead.** Name the 1.3–1.7 ms the phase counters miss
-   before proposing anything against it.
+2. **Fixed per-request overhead.** Named by #7456 — see
+   `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`. The non-scan time that a repair
+   could act on is planning (`physical_plan` + `logical` + `estimate`), not the
+   accounting residual.
 3. **Pushdown decode.** The `region` control above, on its own card.
 
 None of these is argued from this document to close #7106's qualification. The

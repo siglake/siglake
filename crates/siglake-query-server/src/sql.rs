@@ -205,6 +205,22 @@ const SQL_RESULT_CACHE_MAX_ROWS: usize = 128;
 /// `SIGLAKE_QUERY_ADMISSION_BUDGET_BYTES` through `JaegerCeilings::names`.
 const NAME_LIST_CACHE_MAX_BYTES: usize = 512 * 1024;
 
+/// Preparation the transparent endpoint did before handing a request to the
+/// local path, so the terminal profile line can account for it.
+///
+/// `/api/v1/sql` resolves the tenant context and rewrites the query in
+/// `handle_scoped`, then passes both to `handle_local_inner` as
+/// `pre_resolved_ice` / `pre_rewritten_query`. The local path's own `resolve`
+/// and `rewrite` phases are then no-ops, so without this the work shows up as
+/// nothing at all — it is inside `total_ms` and in no phase field. Measured
+/// locally at 0.12 ms per request on a release build over a small table
+/// (#7456); it scales with the SQL, which the rewrite parses.
+#[derive(Clone, Copy, Default)]
+struct PreludePhases {
+    resolve: std::time::Duration,
+    rewrite: std::time::Duration,
+}
+
 /// One wall-clock budget carried across handler handoffs.
 ///
 /// The transparent endpoint resolves and rewrites before deciding whether a
@@ -214,6 +230,9 @@ const NAME_LIST_CACHE_MAX_BYTES: usize = 512 * 1024;
 struct RequestClock {
     started: Instant,
     deadline: tokio::time::Instant,
+    /// What the endpoint spent before the handoff. Zero when the request
+    /// entered the local path directly.
+    prelude: PreludePhases,
 }
 
 impl RequestClock {
@@ -222,6 +241,7 @@ impl RequestClock {
         Self {
             deadline: tokio::time::Instant::from_std(started + timeout),
             started,
+            prelude: PreludePhases::default(),
         }
     }
 }
@@ -4391,8 +4411,9 @@ async fn handle_scoped(
         return handle_local_inner(state, identity, req, None, None, None).await;
     }
 
-    let clock = RequestClock::new(resolved.timeout);
+    let mut clock = RequestClock::new(resolved.timeout);
     let unknown_cost = CostReport::unknown_after_timeout();
+    let resolve_started = Instant::now();
     let ice = apply_timeout(
         async {
             state
@@ -4406,6 +4427,11 @@ async fn handle_scoped(
         clock.started,
     )
     .await?;
+    // No `record_phase_metric` here: the local path records `resolve_ice` for
+    // this request (and now charges it this duration), so a second observation
+    // would double-count the one histogram.
+    clock.prelude.resolve = resolve_started.elapsed();
+    let rewrite_started = Instant::now();
     let effective_query = apply_timeout(
         apply_query_rewrites_for_serving(
             &ice,
@@ -4421,6 +4447,7 @@ async fn handle_scoped(
         clock.started,
     )
     .await?;
+    clock.prelude.rewrite = rewrite_started.elapsed();
     // #967: capture the membership ONCE, here, and hand it to the coordinator
     // path. Under SRV discovery this is `None` until the first usable answer —
     // that pod runs locally, which is correct and merely slower.
@@ -4580,7 +4607,9 @@ async fn handle_local_inner(
     let clock = request_clock.unwrap_or(RequestClock {
         started: start,
         deadline: tokio::time::Instant::from_std(start + resolved.timeout),
+        prelude: PreludePhases::default(),
     });
+    let prelude = clock.prelude;
     // One wall-clock budget covers planning and execution. Work before the
     // timeout wrapper below consumes this same deadline rather than giving the
     // render/collect phase a fresh budget.
@@ -4608,8 +4637,12 @@ async fn handle_local_inner(
     } else {
         apply_timeout(resolve, &resolved, &unknown_cost, deadline, start).await?
     };
-    let resolve_elapsed = resolve_started.elapsed();
+    // Plus whatever `/api/v1/sql` already spent resolving before the handoff:
+    // the branch above is a no-op in that case, and the histogram is about the
+    // request, not about which function did the work.
+    let resolve_elapsed = resolve_started.elapsed() + prelude.resolve;
     record_phase_metric("sql", "resolve_ice", resolve_elapsed);
+    let rewrite_started = Instant::now();
     let rewrite = async {
         match pre_rewritten_query {
             Some(query) => Ok(query),
@@ -4631,6 +4664,7 @@ async fn handle_local_inner(
     } else {
         apply_timeout(rewrite, &resolved, &unknown_cost, deadline, start).await?
     };
+    let rewrite_elapsed = rewrite_started.elapsed() + prelude.rewrite;
 
     // Batch path: submit + return 202. Hand the query off to the
     // dedicated batch runtime so it doesn't steal interactive cores. Above the
@@ -4707,6 +4741,7 @@ async fn handle_local_inner(
     // too. Cancelling it cannot orphan a marker: nothing awaits between the
     // insert into the in-flight map and the `Leader` return, and every other
     // exit is covered by `SqlResultCacheCtx::drop`.
+    let cache_probe_started = Instant::now();
     let cache_ctx = match under_request_deadline!(prepare_result_cache_with_bindings(
         &ice,
         &effective_query.sql,
@@ -4772,6 +4807,11 @@ async fn handle_local_inner(
             return result_meta;
         }
     };
+    // Log field only, here and for the phases below: the terminal line is the
+    // reader, and a `phase` label value nobody scrapes is a series with no
+    // reader.
+    let cache_probe_elapsed = cache_probe_started.elapsed();
+    let session_started = Instant::now();
 
     // Selectivity-aware ordered policy: measured BEFORE the session is built
     // so the provider sees the hint at physical-plan time. Local whole-table
@@ -4874,6 +4914,7 @@ async fn handle_local_inner(
         }
         datafusion::prelude::SessionContext::new_with_state(hinted)
     };
+    let session_elapsed = session_started.elapsed();
     let register_started = Instant::now();
     // Registration reads table metadata (and, with buffering on, lists WAL
     // segments) — catalog and object-store work that a slow backend can stretch
@@ -5340,6 +5381,12 @@ async fn handle_local_inner(
         }
     }
 
+    // What the battery cost the requests it did NOT answer. Every fast path
+    // above returns, so reaching here means each one was tried and declined;
+    // `attach_fast_path_phases` reports the cost on the answered requests and
+    // this reports it on the rest.
+    let battery_elapsed = battery_started.elapsed();
+
     // PRE-FLIGHT REJECTION GOES *AFTER* THE FAST-PATH BATTERY.
     //
     // It used to run before it, so a query was refused for the bytes a naive
@@ -5395,6 +5442,7 @@ async fn handle_local_inner(
         return Err(ApiError::cost_rejected(msg, &cost));
     }
 
+    let admission_started = Instant::now();
     let _admission = if req.dry_run {
         None
     } else {
@@ -5420,9 +5468,12 @@ async fn handle_local_inner(
         }
     };
 
+    let admission_elapsed = admission_started.elapsed();
+
     // This path reads data, unlike the metadata battery. It runs only AFTER
     // normal admission, under the same request deadline and memory pool.
     // NDJSON, batch and shard routes deliberately retain their original plan.
+    let probe_started = Instant::now();
     let mut numeric_probe = NumericTopKProbe::default();
     if !req.dry_run
         && format == QueryFormat::Records
@@ -5474,7 +5525,9 @@ async fn handle_local_inner(
             return result;
         }
     }
+    let probe_elapsed = probe_started.elapsed();
 
+    let mut execute_elapsed = std::time::Duration::ZERO;
     let result = if req.dry_run {
         Ok((StatusCode::OK, Json(cost.clone())).into_response())
     } else {
@@ -5499,7 +5552,8 @@ async fn handle_local_inner(
             start,
         )
         .await;
-        record_phase_metric("sql", "execute", execute_started.elapsed());
+        execute_elapsed = execute_started.elapsed();
+        record_phase_metric("sql", "execute", execute_elapsed);
         result
     };
     if let Some(cache_ctx) = cache_ctx {
@@ -5508,6 +5562,26 @@ async fn handle_local_inner(
         }
     }
 
+    // Per-request phase accounting, summed on the request rather than across
+    // independently aggregated medians (#7456). Everything between the clock's
+    // start and this line belongs to exactly one field below, so
+    // `unattributed_ms` is the bookkeeping the handler does not name — not a
+    // phase that has gone missing. Negative values are impossible by
+    // construction; saturating subtraction keeps a clock that went backwards
+    // from panicking in a log line.
+    let total_elapsed = start.elapsed();
+    let accounted = resolve_elapsed
+        + rewrite_elapsed
+        + std::time::Duration::from_micros(buffer_delta_micros)
+        + cache_probe_elapsed
+        + session_elapsed
+        + register_elapsed
+        + logical_elapsed
+        + estimate_elapsed
+        + battery_elapsed
+        + admission_elapsed
+        + probe_elapsed
+        + execute_elapsed;
     tracing::info!(
         endpoint = "sql",
         // The join key for this execution's scan events. NOT a boundary: on
@@ -5522,11 +5596,20 @@ async fn handle_local_inner(
         priority = resolved.priority.label(),
         status = response_status_label(&result),
         resolve_ms = resolve_elapsed.as_secs_f64() * 1000.0,
+        rewrite_ms = rewrite_elapsed.as_secs_f64() * 1000.0,
+        buffer_delta_ms = buffer_delta_micros as f64 / 1000.0,
+        cache_probe_ms = cache_probe_elapsed.as_secs_f64() * 1000.0,
+        session_ms = session_elapsed.as_secs_f64() * 1000.0,
         register_ms = register_elapsed.as_secs_f64() * 1000.0,
         registered_tables,
         logical_plan_ms = logical_elapsed.as_secs_f64() * 1000.0,
         estimate_ms = estimate_elapsed.as_secs_f64() * 1000.0,
-        total_ms = start.elapsed().as_secs_f64() * 1000.0,
+        battery_ms = battery_elapsed.as_secs_f64() * 1000.0,
+        admission_ms = admission_elapsed.as_secs_f64() * 1000.0,
+        probe_ms = probe_elapsed.as_secs_f64() * 1000.0,
+        execute_ms = execute_elapsed.as_secs_f64() * 1000.0,
+        unattributed_ms = total_elapsed.saturating_sub(accounted).as_secs_f64() * 1000.0,
+        total_ms = total_elapsed.as_secs_f64() * 1000.0,
         query = %compact_query(&effective_query.sql),
         "sql query profile"
     );
@@ -11644,8 +11727,12 @@ async fn render_records(
     };
     let collect_elapsed = collect_started.elapsed();
     record_phase_metric("sql", "collect", collect_elapsed);
+    // Walks every node's metric set, so it is request work rather than
+    // bookkeeping that rounds to nothing on a wide plan (#7456).
+    let stats_started = Instant::now();
     let runtime = crate::midflight::summarize_plan_runtime(&plan);
     record_runtime_metrics("sql", "records", &runtime);
+    let stats_elapsed = stats_started.elapsed();
 
     let render_started = Instant::now();
     // #7420: the executed plan's schema is what the caller asked for (aliases,
@@ -11690,6 +11777,9 @@ async fn render_records(
     // One allocation from here on: the same body answers this request and
     // fills the cache entry, rather than being deep-copied into it (#2304).
     let body = Arc::new(body);
+    // Charging the entry walks the retained body (`retained_heap_bytes`), so
+    // this is not free even though nothing is copied.
+    let cache_fill_started = Instant::now();
     if let Some(cache_ctx) = cache_ctx {
         if body.truncated {
             finish_result_cache(cache_ctx, CacheEligibility::SQL, None).await;
@@ -11702,11 +11792,24 @@ async fn render_records(
             .await;
         }
     }
+    let cache_fill_elapsed = cache_fill_started.elapsed();
     // DataFusion's `one_line()` writes a trailing newline. Remove it before
     // handing the field to tracing so the keyed head and its timings stay in
     // one physical stderr record.
+    //
+    // Timed because this is the profile line paying for itself: the display
+    // walks and formats the whole executed plan on every records request,
+    // whether or not anything reads the field.
+    let plan_text_started = Instant::now();
     let root_plan = displayable(plan.as_ref()).one_line().to_string();
     let root_plan = root_plan.trim_end_matches(['\r', '\n']);
+    let plan_text_elapsed = plan_text_started.elapsed();
+    // Serialization runs BEFORE this line, not after it: `Json::into_response`
+    // encodes the body eagerly, so its cost is inside the handler's `total_ms`
+    // and has to be named here to be named at all (#7456).
+    let serialize_started = Instant::now();
+    let response = (status, Json(body.as_ref())).into_response();
+    let serialize_elapsed = serialize_started.elapsed();
     tracing::info!(
         endpoint = "sql",
         query_execution_id = execution_id.0,
@@ -11722,10 +11825,14 @@ async fn render_records(
         spilled_bytes = runtime.spilled_bytes,
         physical_plan_ms = plan_elapsed.as_secs_f64() * 1000.0,
         collect_ms = collect_elapsed.as_secs_f64() * 1000.0,
+        plan_stats_ms = stats_elapsed.as_secs_f64() * 1000.0,
         render_ms = render_elapsed.as_secs_f64() * 1000.0,
+        cache_fill_ms = cache_fill_elapsed.as_secs_f64() * 1000.0,
+        plan_text_ms = plan_text_elapsed.as_secs_f64() * 1000.0,
+        serialize_ms = serialize_elapsed.as_secs_f64() * 1000.0,
         "sql execution profile"
     );
-    Ok((status, Json(body.as_ref())).into_response())
+    Ok(response)
 }
 
 async fn render_ndjson(
