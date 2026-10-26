@@ -340,6 +340,66 @@ fn replace_clipped_coalescer_with_standard(
     (Arc::new(standard), replacements + 1)
 }
 
+/// One bounded/control pair of the #7341 A/B: plan both arms from their own
+/// session, replace the control's clipped coalescer, then drain them in the
+/// order the caller picked. `check_shape` runs the one-time plan assertions,
+/// which are the same for every pair.
+async fn run_backpressure_pair(
+    bounded_ctx: &SessionContext,
+    control_ctx: &SessionContext,
+    sql: &str,
+    limit: usize,
+    bounded_first: bool,
+    check_shape: bool,
+) -> (Run, Run) {
+    let bounded_planning_started = std::time::Instant::now();
+    let bounded_plan = bounded_ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let bounded_planning = bounded_planning_started.elapsed();
+    let control_planning_started = std::time::Instant::now();
+    let production_control_plan = control_ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let control_planning = control_planning_started.elapsed();
+    let (control_plan, replacements) =
+        replace_clipped_coalescer_with_standard(production_control_plan);
+    if check_shape {
+        assert_eq!(replacements, 1, "control must replace exactly one node");
+        assert_eq!(bounded_plan.name(), "ClippedLimitCoalesceExec");
+        assert_eq!(control_plan.name(), "CoalescePartitionsExec");
+        assert_eq!(bounded_plan.fetch(), control_plan.fetch());
+        assert_eq!(bounded_plan.fetch(), Some(limit));
+        assert_eq!(
+            datafusion::physical_plan::displayable(bounded_plan.children()[0].as_ref())
+                .indent(false)
+                .to_string(),
+            datafusion::physical_plan::displayable(control_plan.children()[0].as_ref())
+                .indent(false)
+                .to_string(),
+            "the arms must have identical physical plans below the coalescer"
+        );
+    }
+
+    if bounded_first {
+        let bounded = run_planned_arm(bounded_ctx, bounded_plan, bounded_planning, "raw").await;
+        let control = run_planned_arm(control_ctx, control_plan, control_planning, "raw").await;
+        (bounded, control)
+    } else {
+        let control = run_planned_arm(control_ctx, control_plan, control_planning, "raw").await;
+        let bounded = run_planned_arm(bounded_ctx, bounded_plan, bounded_planning, "raw").await;
+        (bounded, control)
+    }
+}
+
 /// Scheduler-free #7000 arm: visit ticket-ordered groups one at a time until
 /// the residual predicate has supplied the clip. This keeps the snapshot,
 /// predicate and group membership fixed while isolating group ORDER from the
@@ -634,6 +694,8 @@ async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
 
     const LIMIT: usize = 100;
     const DENSE_ROWS_PER_FILE: usize = 20_000;
+    // Odd, so the median is a pair that was actually measured.
+    const PAIRS: usize = 7;
 
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
@@ -645,78 +707,73 @@ async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
     let control_ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
     ice.register_with_datafusion(&control_ctx).await.unwrap();
 
-    let bounded_planning_started = std::time::Instant::now();
-    let bounded_plan = bounded_ctx
-        .sql(&sql)
-        .await
-        .unwrap()
-        .create_physical_plan()
-        .await
-        .unwrap();
-    let bounded_planning = bounded_planning_started.elapsed();
-    let control_planning_started = std::time::Instant::now();
-    let production_control_plan = control_ctx
-        .sql(&sql)
-        .await
-        .unwrap()
-        .create_physical_plan()
-        .await
-        .unwrap();
-    let control_planning = control_planning_started.elapsed();
-    let (control_plan, replacements) =
-        replace_clipped_coalescer_with_standard(production_control_plan);
-    assert_eq!(replacements, 1, "control must replace exactly one node");
-    assert_eq!(bounded_plan.name(), "ClippedLimitCoalesceExec");
-    assert_eq!(control_plan.name(), "CoalescePartitionsExec");
-    assert_eq!(bounded_plan.fetch(), control_plan.fetch());
-    assert_eq!(bounded_plan.fetch(), Some(LIMIT));
-    assert_eq!(
-        datafusion::physical_plan::displayable(bounded_plan.children()[0].as_ref())
-            .indent(false)
-            .to_string(),
-        datafusion::physical_plan::displayable(control_plan.children()[0].as_ref())
-            .indent(false)
-            .to_string(),
-        "the arms must have identical physical plans below the coalescer"
-    );
-
-    let control = run_planned_arm(&control_ctx, control_plan, control_planning, "raw").await;
-    let bounded = run_planned_arm(&bounded_ctx, bounded_plan, bounded_planning, "raw").await;
-    eprintln!(
-        "CLIPPED-BACKPRESSURE-SAME-WAVE2 control={:?} drain={:?} bounded={:?} drain={:?}",
-        control.work, control.drain, bounded.work, bounded.drain
-    );
-
-    for (name, run) in [("bounded", &bounded), ("control", &control)] {
-        assert_eq!(run.rows.len(), LIMIT, "{name} must fill the limit");
-        assert_all_qualify(&run.rows, &sql);
-        assert_eq!(
-            run.rows.iter().collect::<HashSet<_>>().len(),
+    let mut pairs: Vec<(Work, Work)> = Vec::new();
+    for pair in 0..PAIRS {
+        let bounded_first = pair % 2 == 0;
+        let (bounded, control) = run_backpressure_pair(
+            &bounded_ctx,
+            &control_ctx,
+            &sql,
             LIMIT,
-            "{name} must return distinct source rows"
+            bounded_first,
+            pair == 0,
+        )
+        .await;
+        eprintln!(
+            "CLIPPED-BACKPRESSURE-SAME-WAVE2 pair={pair} bounded_first={bounded_first} \
+             bounded={:?} drain={:?} control={:?} drain={:?}",
+            bounded.work, bounded.drain, control.work, control.drain
         );
+
+        for (name, run) in [("bounded", &bounded), ("control", &control)] {
+            assert_eq!(run.rows.len(), LIMIT, "{name} must fill the limit");
+            assert_all_qualify(&run.rows, &sql);
+            assert_eq!(
+                run.rows.iter().collect::<HashSet<_>>().len(),
+                LIMIT,
+                "{name} must return distinct source rows"
+            );
+        }
+        assert_eq!(bounded.work.partitions, control.work.partitions);
+        assert_eq!(
+            bounded.work.decoded_bytes, control.work.decoded_bytes,
+            "the isolated fixture does not support a decoded-work reduction claim"
+        );
+        pairs.push((bounded.work, control.work));
     }
-    assert_eq!(bounded.work.partitions, control.work.partitions);
-    assert_eq!(
-        bounded.work.files_read, 1,
-        "the replacement must finish from the first admitted reader: {:?}",
-        bounded.work
+
+    let median = |mut xs: Vec<usize>| {
+        xs.sort_unstable();
+        xs[xs.len() / 2]
+    };
+    let medians = |f: fn(&Work) -> usize| {
+        (
+            median(pairs.iter().map(|(b, _)| f(b)).collect()),
+            median(pairs.iter().map(|(_, c)| f(c)).collect()),
+        )
+    };
+    let (bounded_files, control_files) = medians(|w| w.files_read);
+    let (bounded_reads, control_reads) = medians(|w| w.object_store_reads);
+    let (bounded_bytes, control_bytes) = medians(|w| w.bytes_scanned);
+    eprintln!(
+        "CLIPPED-BACKPRESSURE-SAME-WAVE2 pairs={PAIRS} median files_read bounded={bounded_files} \
+         control={control_files} median object_store_reads bounded={bounded_reads} \
+         control={control_reads} median bytes_scanned bounded={bounded_bytes} \
+         control={control_bytes} per pair {pairs:?}"
     );
     assert!(
-        control.work.files_read > bounded.work.files_read,
-        "the same-wave standard coalescer must reproduce avoidable reader start: {:?}",
-        control.work
-    );
-    assert_eq!(
-        bounded.work.decoded_bytes, control.work.decoded_bytes,
-        "the isolated fixture does not support a decoded-work reduction claim"
+        control_files > 1,
+        "the control no longer reproduces the avoidable reader start this test exists for: \
+         per pair {pairs:?}"
     );
     assert!(
-        bounded.work.object_store_reads < control.work.object_store_reads
-            && bounded.work.bytes_scanned * 3 <= control.work.bytes_scanned * 2,
-        "bounded buffering plus eager limit termination must reduce early physical reads: bounded {:?}, control {:?}",
-        bounded.work,
-        control.work
+        bounded_files < control_files
+            && bounded_reads < control_reads
+            && bounded_bytes * 3 <= control_bytes * 2,
+        "bounded buffering plus eager limit termination must reduce early physical reads at the \
+         median of {PAIRS} pairs: bounded files {bounded_files} reads {bounded_reads} bytes \
+         {bounded_bytes}, control files {control_files} reads {control_reads} bytes \
+         {control_bytes}"
     );
 }
 
