@@ -638,24 +638,37 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
 /// combined effect. The result is unordered by contract, so exactness is
 /// cardinality, predicate membership and distinct source rows.
 ///
-/// Graded at the MEDIAN of seven pairs, for the reason the admission A/B above
-/// gives: all three counters this compares — `files_read`, `object_store_reads`
-/// and `bytes_scanned` — move when a partition wins a scheduling race with the
-/// root stream closing, because a file counts as read the moment its footer
-/// lands. A single pair grades that race. The original single-pair form, which
-/// asserted the bounded arm read exactly one file, passed on an idle lane and
-/// went red on the gate with both arms at two files (#7458 run 3230); running
-/// the whole target reproduces it locally, and one such draw put the bounded
-/// arm at four files against the control's three. The medians do not move: on
-/// an idle lane and with 24 spinners against 32 cores, every pair measured
-/// bounded 1 file / 4 reads / 1,687,906 bytes against control 2 / 7 /
-/// 3,349,138. With the production coalescer taken out of BOTH arms the medians
-/// are equal and the assertion fails, so the shape still grades the mechanism.
+/// #7485: a by-hand measurement, not a gate. All three counters it compares —
+/// `files_read`, `object_store_reads` and `bytes_scanned` — move when a
+/// partition wins a scheduling race with the root stream closing. A file counts
+/// as read the moment its footer lands, and the early `LIMIT`'s own terminal
+/// event pays the credit that admits the next reader (`finish` in
+/// `crates/siglake-storage/src/query_provider.rs`, which widens the ramp for
+/// liveness however a partition ended). Whether that reader opens its file
+/// before teardown reaches it is a timing margin, so what these counters
+/// separate is the margin, not the mechanism.
+///
+/// The margin is reliable on an idle lane and is gone on a loaded one. The
+/// original single-pair form, which asserted the bounded arm read exactly one
+/// file, went red on hosted CI with the bounded arm at two files against the
+/// control's one (ci run 40332380261). #7458 then graded it at the median of
+/// seven pairs, measuring every pair at bounded 1 file / 4 reads / 1,687,906
+/// bytes against control 2 / 7 / 3,349,138 on an idle 32-core lane; that form
+/// still tied at 2 files / 7 reads on the same lane at load 42, with the sign
+/// flipping between pairs (bounded 1 against control 2 in one pair, 2 against 1
+/// in another). Run it on an idle lane when the #7341 repair is in question.
+/// Taking the production coalescer out of BOTH arms leaves the medians equal
+/// and fails the assertion, so the shape does grade the mechanism when the
+/// margin survives.
+///
+/// `bounded_coalesce_fills_a_dense_residual_limit_exactly` keeps the part of
+/// this shape that does not depend on the scheduler in the gate.
 ///
 /// `decoded_bytes` is equal in both arms by assertion: this fixture answers
 /// the limit from one source batch, so the repair moves footer fetches and
 /// reader starts, not decoded work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scheduling-race measurement; run alone on an idle lane with --ignored --nocapture"]
 async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
 
@@ -741,6 +754,50 @@ async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
          median of {PAIRS} pairs: bounded files {bounded_files} reads {bounded_reads} bytes \
          {bounded_bytes}, control files {control_files} reads {control_reads} bytes \
          {control_bytes}"
+    );
+}
+
+/// The gated half of the measurement above: what the production clipped
+/// coalescer must return on the dense residual shape, with no counter it does
+/// not control. Every row qualifies and the first source batch carries far more
+/// than `LIMIT`, so a one-batch shared channel plus eager limit termination has
+/// to fill the limit from one batch without duplicating or dropping rows while
+/// the partitions it cancelled are still tearing down. Unordered by contract,
+/// so exactness is cardinality, predicate membership and distinct source rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_coalesce_fills_a_dense_residual_limit_exactly() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 100;
+    const DENSE_ROWS_PER_FILE: usize = 20_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    dense_table_with_rows(&ice, DENSE_ROWS_PER_FILE).await;
+
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+
+    let planning_started = std::time::Instant::now();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let planning = planning_started.elapsed();
+    assert_eq!(plan.name(), "ClippedLimitCoalesceExec");
+    assert_eq!(plan.fetch(), Some(LIMIT));
+
+    let run = run_planned_arm(&ctx, plan, planning, "raw").await;
+    assert_eq!(run.rows.len(), LIMIT, "the clipped limit must be filled");
+    assert_all_qualify(&run.rows, &sql);
+    assert_eq!(
+        run.rows.iter().collect::<HashSet<_>>().len(),
+        LIMIT,
+        "the clipped limit must be filled from distinct source rows"
     );
 }
 
