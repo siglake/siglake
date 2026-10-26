@@ -2426,6 +2426,15 @@ and the sum per request;
 header's transport term over a real socket. `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`
 has the measured split.
 
+The RESPONSE carries four of those phases (`stats.phases`: physical plan,
+buffer delta, collect, render), and they describe the execution that produced
+the body rather than the request that received it — a result-cache hit and a
+batch job result both return a stored body with its phases intact, which
+`crates/siglake-query-server/tests/sql_phase_provenance.rs` pins through the
+cache's own `outcome` counter. What a response could carry instead, and why the
+request's own total belongs in a header rather than in a cacheable body, is in
+[`DESIGN_response_phase_accounting.md`](DESIGN_response_phase_accounting.md).
+
 **Configuration for instrumented processes is the standard OTel environment,
 and it is off by default.**
 
