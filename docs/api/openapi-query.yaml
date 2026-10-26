@@ -2759,6 +2759,15 @@ components:
           type: array
           items:
             type: string
+          description: |-
+            The columns the query projected, in projection order and under the
+            names the query gave them (aliases applied).
+
+            This is the result SCHEMA, independent of the rows: a column that is
+            null in every row is named here and absent from every row object, and
+            a query that matched no rows still declares what it projected, so a
+            caller can render an empty table's headers. Empty only when the query
+            projected nothing (`SELECT FROM events`).
         cost:
           oneOf:
           - type: "null"

@@ -357,6 +357,14 @@ pub struct DistPhaseStats {
 /// JSON envelope for `QueryFormat::Records`.
 #[derive(Debug, Serialize, Deserialize, Clone, utoipa::ToSchema)]
 pub struct RecordsResponse {
+    /// The columns the query projected, in projection order and under the
+    /// names the query gave them (aliases applied).
+    ///
+    /// This is the result SCHEMA, independent of the rows: a column that is
+    /// null in every row is named here and absent from every row object, and
+    /// a query that matched no rows still declares what it projected, so a
+    /// caller can render an empty table's headers. Empty only when the query
+    /// projected nothing (`SELECT FROM events`).
     pub columns: Vec<String>,
     pub row_count: usize,
     /// One JSON object per row, keyed by `columns`.
@@ -546,20 +554,48 @@ pub fn retained_heap_bytes(response: &RecordsResponse) -> usize {
 /// If `max_rows` is `Some(n)` and the total row count exceeds `n`,
 /// the envelope still serializes the first `n` rows, but `truncated`
 /// is set to `true` and `max_rows` carries the effective cap.
+///
+/// `columns` comes from the batch schema, so a zero-ROW batch already declares
+/// its names. A collect that returns no batches at all has no schema to read:
+/// prefer [`batches_to_records_with_schema`] there, which takes the query's
+/// final projected output schema for exactly that case.
 pub fn batches_to_records(
     batches: &[RecordBatch],
     max_rows: Option<usize>,
 ) -> Result<RecordsResponse> {
-    let columns: Vec<String> = batches
-        .first()
-        .map(|b| {
-            b.schema()
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    batches_to_records_with_schema(batches, max_rows, None)
+}
+
+/// [`batches_to_records`], with the query's final projected output schema as
+/// the fallback for an empty batch list.
+///
+/// #7420: `columns` is the served column SET, not a summary of the rows that
+/// came back — the renderer elides null fields from a row object, so a column
+/// that is null in every row is observable only here (the contract
+/// `tests/result_cache_schema_generation.rs` pins). A query that matched no
+/// rows is the same case taken to its limit: `SELECT host FROM events WHERE
+/// host = 'nope'` projected `host`, and a client reading `columns` to discover
+/// the result schema — a BI or integration layer rendering an empty table's
+/// headers — needs that name. Without `schema` the empty result was
+/// indistinguishable from `SELECT FROM events`, which projects nothing at all;
+/// a zero-field `schema` still renders `[]`, so that case stays distinct.
+///
+/// `schema` must be the FINAL output schema (aliases applied, projection
+/// order, post-merge for a distributed query), never the underlying table's or
+/// a shard partial's: `columns` would otherwise name fields the caller did not
+/// ask for and could not have received.
+pub fn batches_to_records_with_schema(
+    batches: &[RecordBatch],
+    max_rows: Option<usize>,
+    schema: Option<&arrow_schema::Schema>,
+) -> Result<RecordsResponse> {
+    fn names(schema: &arrow_schema::Schema) -> Vec<String> {
+        schema.fields().iter().map(|f| f.name().clone()).collect()
+    }
+    let columns: Vec<String> = match batches.first() {
+        Some(batch) => names(batch.schema().as_ref()),
+        None => schema.map(names).unwrap_or_default(),
+    };
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
     let (effective_batches, row_count, truncated) = match max_rows {
@@ -1396,6 +1432,52 @@ mod tests {
             .unwrap()
             .contains("operator failed"));
         assert!(marker.get("retry_after_secs").is_none());
+    }
+
+    /// #7420: an empty batch list carries no schema, so the renderer takes the
+    /// names from the query's output schema — and a zero-ROW batch, which does
+    /// carry one, keeps answering from itself.
+    #[test]
+    fn empty_results_take_their_columns_from_the_output_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("h", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+
+        let no_batches = batches_to_records_with_schema(&[], None, Some(schema.as_ref())).unwrap();
+        assert_eq!(no_batches.columns, ["h", "n"]);
+        assert_eq!(no_batches.row_count, 0);
+        assert_eq!(no_batches.rows, serde_json::json!([]));
+
+        // A zero-row batch is the already-working case; the fallback must not
+        // change which schema answers.
+        let zero_rows = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "from_the_batch",
+            DataType::Utf8,
+            true,
+        )])));
+        let rendered =
+            batches_to_records_with_schema(&[zero_rows], None, Some(schema.as_ref())).unwrap();
+        assert_eq!(rendered.columns, ["from_the_batch"]);
+        assert_eq!(rendered.row_count, 0);
+
+        // Nor for a result with rows.
+        let rows = float_batch(&[1.5], None);
+        let rendered =
+            batches_to_records_with_schema(&[rows], None, Some(schema.as_ref())).unwrap();
+        assert_eq!(rendered.columns, ["value"]);
+        assert_eq!(rendered.row_count, 1);
+
+        // A query that projected nothing stays empty: `columns` distinguishes
+        // "asked for no columns" from "asked for columns, matched no rows".
+        let nothing =
+            batches_to_records_with_schema(&[], None, Some(&Schema::new(Vec::<Field>::new())))
+                .unwrap();
+        assert!(nothing.columns.is_empty());
+
+        // No schema at all (a caller with nothing better to pass) is the
+        // pre-#7420 shape rather than an error.
+        assert!(batches_to_records(&[], None).unwrap().columns.is_empty());
     }
 
     #[test]

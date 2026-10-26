@@ -221,8 +221,15 @@ fn retained_heap_bytes_tracks_the_allocator() {
     check("4 cols x1 (4 KiB values)", Accuracy::Exact, || {
         wide_rows(4, 1, 4096)
     });
-    // Empty: `batches_to_records` renders `rows: []` with no columns.
+    // Empty: `rows: []`, with and without the column names a zero-row result
+    // declares (#7420) — the names are charged like any other string.
     check("empty", Accuracy::Exact, || body(Vec::new(), Vec::new()));
+    check("empty with columns", Accuracy::Exact, || {
+        body(
+            Vec::new(),
+            vec!["host".to_string(), "sourcetype".to_string()],
+        )
+    });
 
     // And the metadata a real SQL body carries — `cost`, `stats` and their
     // boxes — is charged too, not just the row tree.
