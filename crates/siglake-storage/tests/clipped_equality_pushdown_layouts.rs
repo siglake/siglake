@@ -28,6 +28,8 @@ use siglake_core::Event;
 use siglake_storage::iceberg::IcebergContext;
 use siglake_storage::{PredicatePushdownControl, QueryScanTuning, SiglakeIcebergTableScan};
 
+/// Logical 40,000-row append batches. The `events` table is day-partitioned,
+/// so an append that crosses midnight produces two physical Parquet files.
 const FILES: usize = 15;
 const ROWS_PER_FILE: usize = 40_000;
 const LIMIT: usize = 100;
@@ -555,6 +557,19 @@ async fn measure(layout: Layout) -> LayoutResult {
                 "{}: the no-selection arm keeps statistics but drops page selection",
                 layout.name()
             );
+            match layout {
+                Layout::RareClustered => assert_eq!(
+                    pushed.rows_pruned_selection,
+                    3 * 19_520 + 5_120,
+                    "three 40,000-row files prune 19,520 rows; the fourth target-bearing \
+                     file ends at the day boundary after 25,600 rows and prunes 5,120"
+                ),
+                Layout::RareClusteredSingleFile => assert_eq!(
+                    pushed.rows_pruned_selection, 19_520,
+                    "the 40,000-row target-bearing file prunes its 19,520-row second page"
+                ),
+                Layout::Interleaved | Layout::RareScattered => unreachable!(),
+            }
         } else {
             assert_eq!(
                 pushed.planned_partitions,
