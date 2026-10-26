@@ -5020,51 +5020,133 @@ impl ScanPartitionTracker {
 /// waiting then `admitted < partitions`, the tickets below `admitted` are all
 /// registered, and each of them pays at least the credit it owes by ending — so
 /// the credits reach `admitted` and the ramp widens even if not one batch is
-/// ever emitted. Tickets are handed out modulo the partition count, so a caller
-/// that executes a single partition takes ticket 0 and is admitted at once, and
-/// a plan executed a second time finds the ramp already open (it degrades to
-/// the ungated behavior rather than blocking).
+/// ever emitted. #7487 stops exactly one case of that: a credit paid after the
+/// clipped coalescer's fetch is filled has nobody to keep live, so
+/// [`Self::close_execution`] ends the queued partitions instead of starting
+/// them.
+/// Tickets are handed out modulo the partition count, so a caller that executes
+/// a single partition takes ticket 0 and is admitted at once. Each clipped
+/// coalescer execution owns a fresh ramp; direct scan callers share the fallback
+/// ramp and retain the ticket wrap that keeps repeated calls live.
 ///
 /// #6979: the ticket also NAMES the file group the stream reads, so which
 /// files the ramp opens first is fixed rather than raced. See `execute`.
 #[derive(Debug)]
 struct ScanAdmission {
+    /// Scope used by direct scan executions that have no clipped coalescer.
+    /// Production executions receive a fresh scope from their coalescer, so a
+    /// close can never affect another execution of the same physical plan.
+    unscoped_execution: Arc<ScanAdmissionExecution>,
+    partitions: usize,
+    wave: usize,
+}
+
+/// The close state for one execution of a clipped coalescer.
+#[derive(Debug)]
+struct ScanAdmissionExecution {
     /// Ticket counter; a ticket is `fetch_add % partitions`.
     next_ticket: std::sync::atomic::AtomicUsize,
     /// Highest ticket + 1 that may run. Monotone, capped at `partitions`.
     admitted: std::sync::atomic::AtomicUsize,
-    /// Credits paid by the current wave; widens and resets at `admitted`.
+    /// Cumulative credits paid by this execution.
     credits: std::sync::atomic::AtomicUsize,
-    /// Source batches seen across admitted partitions. Only every
-    /// [`SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT`]th batch pays a credit;
-    /// terminal events still pay immediately for liveness.
+    /// Source batches seen across admitted partitions.
     batches: std::sync::atomic::AtomicUsize,
-    partitions: usize,
-    wave: usize,
+    closed: std::sync::atomic::AtomicBool,
     notify: tokio::sync::Notify,
 }
 
-impl ScanAdmission {
-    fn new(partitions: usize, wave: usize) -> Self {
+impl ScanAdmissionExecution {
+    fn new() -> Self {
         Self {
             next_ticket: std::sync::atomic::AtomicUsize::new(0),
             admitted: std::sync::atomic::AtomicUsize::new(1),
             credits: std::sync::atomic::AtomicUsize::new(0),
             batches: std::sync::atomic::AtomicUsize::new(0),
-            partitions: partitions.max(1),
-            wave: wave.max(2),
+            closed: std::sync::atomic::AtomicBool::new(false),
             notify: tokio::sync::Notify::new(),
         }
     }
+}
 
-    fn register(&self) -> usize {
-        self.next_ticket
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            % self.partitions
+/// One partition's place in the ramp and the execution that owns it.
+#[derive(Debug, Clone)]
+struct ScanTicket {
+    ticket: usize,
+    execution: Arc<ScanAdmissionExecution>,
+}
+
+impl ScanAdmission {
+    fn new(partitions: usize, wave: usize) -> Self {
+        Self {
+            unscoped_execution: Arc::new(ScanAdmissionExecution::new()),
+            partitions: partitions.max(1),
+            wave: wave.max(2),
+        }
     }
 
+    fn register(&self) -> ScanTicket {
+        self.register_for(self.unscoped_execution.clone())
+    }
+
+    fn register_for(&self, execution: Arc<ScanAdmissionExecution>) -> ScanTicket {
+        let seq = execution
+            .next_ticket
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ScanTicket {
+            ticket: seq % self.partitions,
+            execution,
+        }
+    }
+
+    #[cfg(test)]
     fn is_admitted(&self, ticket: usize) -> bool {
-        ticket < self.admitted.load(std::sync::atomic::Ordering::Acquire)
+        ticket
+            < self
+                .unscoped_execution
+                .admitted
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn is_ticket_admitted(&self, ticket: &ScanTicket) -> bool {
+        ticket.ticket
+            < ticket
+                .execution
+                .admitted
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// #7487: the fetch this scan feeds is filled. Stop admitting.
+    ///
+    /// Called from the clipped coalescer's producer the moment its sends have
+    /// delivered the whole fetch, which is BEFORE the producer repolls its
+    /// input and therefore before any terminal credit that repoll can pay —
+    /// the credit this exists to suppress. The close covers only `execution`;
+    /// its waiters wake and end instead of starting.
+    ///
+    /// Liveness is not weakened, because it is no longer owed: the rows are in
+    /// the coalescer's channel, so its `LimitStream` answers the query from
+    /// what it already holds and the execution tears down. Another execution
+    /// of the same plan node has a distinct close state and keeps the full
+    /// ramp, credits included.
+    #[cfg(test)]
+    fn close(&self) {
+        self.close_execution(&self.unscoped_execution);
+    }
+
+    fn close_execution(&self, execution: &ScanAdmissionExecution) {
+        execution
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        execution.notify.notify_waiters();
+    }
+
+    /// Whether [`Self::close_execution`] covers this partition.
+    fn is_closed_for(&self, ticket: &ScanTicket) -> bool {
+        ticket
+            .execution
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Pay one credit and widen the ramp once the credits reach the admitted
@@ -5080,55 +5162,88 @@ impl ScanAdmission {
     /// partition is left to pay and the wave never completes. Cumulative
     /// credits against `admitted` cannot: the `admitted` partitions pay one
     /// credit each just by ending, which is exactly the threshold.
+    #[cfg(test)]
     fn advance(&self) {
+        self.advance_execution(&self.unscoped_execution);
+    }
+
+    fn advance_execution(&self, execution: &ScanAdmissionExecution) {
         use std::sync::atomic::Ordering::{AcqRel, Acquire};
-        let admitted = self.admitted.load(Acquire);
+        let admitted = execution.admitted.load(Acquire);
         if admitted >= self.partitions {
             return;
         }
-        if self.credits.fetch_add(1, AcqRel) + 1 < admitted {
+        if execution.credits.fetch_add(1, AcqRel) + 1 < admitted {
             return;
         }
-        self.admitted.fetch_max(
+        execution.admitted.fetch_max(
             admitted.saturating_mul(self.wave).min(self.partitions),
             AcqRel,
         );
-        self.notify.notify_waiters();
+        execution.notify.notify_waiters();
+    }
+
+    /// Pay a credit on behalf of the partition that took `ticket`, unless the
+    /// close covers it (#7487). Suppression is per execution: another execution
+    /// of the same physical plan owns its own ramp, so its credits and liveness
+    /// argument are unchanged.
+    fn advance_from(&self, ticket: &ScanTicket) {
+        if self.is_closed_for(ticket) {
+            return;
+        }
+        self.advance_execution(&ticket.execution);
     }
 
     /// Account one raw source batch, paying a ramp credit only at the bounded
     /// batch quantum. The residual predicate lives above this stream, so one
     /// source batch is not evidence that the clipped limit still needs another
     /// partition: common predicates need several batches to produce the final
-    /// `LIMIT` row. Terminal events bypass this pacing through [`Self::advance`]
-    /// so an empty or exhausted partition cannot stall the scan.
-    fn advance_after_batch(&self) {
-        if self.admitted.load(std::sync::atomic::Ordering::Acquire) >= self.partitions {
+    /// `LIMIT` row. Terminal events bypass this pacing through
+    /// [`Self::advance_execution`] so an empty or exhausted partition cannot
+    /// stall the scan.
+    fn advance_after_batch(&self, ticket: &ScanTicket) {
+        if ticket
+            .execution
+            .admitted
+            .load(std::sync::atomic::Ordering::Acquire)
+            >= self.partitions
+        {
             return;
         }
-        if (self
+        if (ticket
+            .execution
             .batches
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
             + 1)
         .is_multiple_of(SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT)
         {
-            self.advance();
+            self.advance_from(ticket);
         }
     }
 
-    /// Resolves once `ticket` may run.
-    async fn wait(&self, ticket: usize) {
+    /// Resolves once `ticket` may run, or once the close covers it and it must
+    /// not run at all. The caller distinguishes the two with `is_admitted`.
+    async fn wait(&self, ticket: ScanTicket) {
         loop {
             // Created BEFORE the check, as in `ScanPartitionTracker::wait_idle`:
             // an `advance` landing between the load and the await is observed by
             // the `Notified` rather than lost.
-            let notified = self.notify.notified();
-            if self.is_admitted(ticket) {
+            let notified = ticket.execution.notify.notified();
+            if self.is_ticket_admitted(&ticket) || self.is_closed_for(&ticket) {
                 return;
             }
             notified.await;
         }
     }
+}
+
+/// What a resolved gate means for the partition behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdmissionStart {
+    /// Poll the source: this partition is admitted (or was never gated).
+    Run,
+    /// End without reading: the clipped coalescer filled its fetch (#7487).
+    Closed,
 }
 
 /// Where one partition stream stands in the #4865 admission ramp.
@@ -5139,20 +5254,25 @@ enum AdmissionGate {
     /// so it has fetched nothing.
     Waiting {
         admission: Arc<ScanAdmission>,
+        ticket: ScanTicket,
         wait: BoxFuture<'static, ()>,
         since: Instant,
     },
     /// Running; its batches and its end widen the ramp for the others.
-    Admitted(Arc<ScanAdmission>),
+    Admitted(Arc<ScanAdmission>, ScanTicket),
+    /// #7487: woken by the close rather than by the ramp — the fetch this scan
+    /// feeds is filled, so this partition ends without reading anything.
+    Closed,
 }
 
 impl AdmissionGate {
-    fn admission(&self) -> Option<&Arc<ScanAdmission>> {
+    fn admission(&self) -> Option<(&Arc<ScanAdmission>, &ScanTicket)> {
         match self {
-            AdmissionGate::Open => None,
-            AdmissionGate::Waiting { admission, .. } | AdmissionGate::Admitted(admission) => {
-                Some(admission)
+            AdmissionGate::Open | AdmissionGate::Closed => None,
+            AdmissionGate::Waiting {
+                admission, ticket, ..
             }
+            | AdmissionGate::Admitted(admission, ticket) => Some((admission, ticket)),
         }
     }
 }
@@ -5364,27 +5484,49 @@ impl ScanDetailMetrics {
 }
 
 impl SourceMetricsStream {
-    /// Poll the #4865 admission ramp. `Ready` for every ungated shape and for
-    /// an already-admitted partition; `Pending` only while this partition is
-    /// still queued behind the ramp, in which case the waker is held by the
-    /// admission's `Notify`.
-    fn poll_admission(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let admitted_since = match &mut self.gate {
-            AdmissionGate::Open | AdmissionGate::Admitted(_) => return Poll::Ready(()),
+    /// Poll the #4865 admission ramp. `Ready(Run)` for every ungated shape and
+    /// for an already-admitted partition; `Pending` only while this partition
+    /// is still queued behind the ramp, in which case the waker is held by the
+    /// admission's `Notify`; `Ready(Closed)` when the wait ended because the
+    /// clipped coalescer filled its fetch (#7487) rather than because the ramp
+    /// reached this ticket.
+    fn poll_admission(&mut self, cx: &mut Context<'_>) -> Poll<AdmissionStart> {
+        let waited_since = match &mut self.gate {
+            AdmissionGate::Open | AdmissionGate::Admitted(..) => {
+                return Poll::Ready(AdmissionStart::Run);
+            }
+            AdmissionGate::Closed => return Poll::Ready(AdmissionStart::Closed),
             AdmissionGate::Waiting { wait, since, .. } => match wait.poll_unpin(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(()) => *since,
             },
         };
-        metrics::histogram!("siglake_query_scan_clipped_admission_wait_seconds")
-            .record(admitted_since.elapsed().as_secs_f64());
-        let admission = self
+        let (admission, ticket) = self
             .gate
             .admission()
-            .cloned()
+            .map(|(admission, ticket)| (admission.clone(), ticket.clone()))
             .expect("a Waiting gate carries its admission");
-        self.gate = AdmissionGate::Admitted(admission);
-        Poll::Ready(())
+        if !admission.is_ticket_admitted(&ticket) {
+            // Closed, not admitted: the rows this scan owed are already in the
+            // coalescer's channel. Returning without touching `inner` is what
+            // keeps the reader from opening its file — the whole point of the
+            // close — so nothing below this line may poll it.
+            tracing::debug!(
+                query_execution_id = self.query_execution_id,
+                scan_id = self.scan_id,
+                partition = self.partition,
+                ticket = ticket.ticket,
+                waited_ms = waited_since.elapsed().as_secs_f64() * 1000.0,
+                planned_files = self.planned_files,
+                "clipped admission closed before this partition started"
+            );
+            self.gate = AdmissionGate::Closed;
+            return Poll::Ready(AdmissionStart::Closed);
+        }
+        metrics::histogram!("siglake_query_scan_clipped_admission_wait_seconds")
+            .record(waited_since.elapsed().as_secs_f64());
+        self.gate = AdmissionGate::Admitted(admission, ticket);
+        Poll::Ready(AdmissionStart::Run)
     }
 
     fn finish(&mut self, error: Option<&DataFusionError>) {
@@ -5395,8 +5537,13 @@ impl SourceMetricsStream {
         // #4865 liveness: a partition that ends — exhausted, failed, or dropped
         // by an early `LIMIT` — widens the ramp, so the queued partitions cannot
         // be left waiting on a scan that has nothing left running.
-        if let Some(admission) = self.gate.admission() {
-            admission.advance();
+        //
+        // #7487: unless the coalescer has closed admission for this execution.
+        // Then the queued partitions are not owed liveness — their consumer
+        // has the rows it asked for — and paying here is what used to start a
+        // reader the query was about to cancel.
+        if let Some((admission, ticket)) = self.gate.admission() {
+            admission.advance_from(ticket);
         }
         let elapsed = self.started_at.elapsed();
         let stream_build_secs = self
@@ -5492,8 +5639,16 @@ impl Stream for SourceMetricsStream {
         // #4865: nothing below this point is polled until the ramp admits this
         // partition, and the reader fetches only on poll — so a waiting
         // partition costs no object-store read and no decode.
-        if self.poll_admission(cx).is_pending() {
-            return self.baseline.record_poll(Poll::Pending);
+        match self.poll_admission(cx) {
+            Poll::Pending => return self.baseline.record_poll(Poll::Pending),
+            Poll::Ready(AdmissionStart::Run) => {}
+            // #7487: the fetch is filled. End without polling `inner`, which
+            // folds this partition's (empty) counters and releases it from the
+            // tracker exactly as any other ending partition.
+            Poll::Ready(AdmissionStart::Closed) => {
+                self.finish(None);
+                return self.baseline.record_poll(Poll::Ready(None));
+            }
         }
         let poll = self.inner.as_mut().poll_next(cx);
         match &poll {
@@ -5502,8 +5657,8 @@ impl Stream for SourceMetricsStream {
                 // this stream may need several source batches to make the last
                 // LIMIT row. Pace the ramp instead of treating every raw batch
                 // as a reason to open another wave.
-                if let AdmissionGate::Admitted(admission) = &self.gate {
-                    admission.advance_after_batch();
+                if let AdmissionGate::Admitted(admission, ticket) = &self.gate {
+                    admission.advance_after_batch(ticket);
                 }
                 let now = Instant::now();
                 if self.first_batch_at.is_none() {
@@ -6030,11 +6185,19 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         // the union the parent coalesce + `GlobalLimitExec` truncates is the
         // same multiset of rows. Ticket allocation keeps its wrap, so the
         // liveness contract in [`ScanAdmission`] is untouched.
-        let admission_ticket = self
-            .admission
-            .as_ref()
-            .map(|admission| admission.register());
+        let admission_ticket = self.admission.as_ref().map(|admission| {
+            let execution = context
+                .session_config()
+                .get_extension::<ClippedAdmissionExecutions>()
+                .and_then(|executions| executions.execution_for(admission));
+            match execution {
+                Some(execution) => admission.register_for(execution),
+                None => admission.register(),
+            }
+        });
         let group = admission_ticket
+            .as_ref()
+            .map(|ticket| ticket.ticket)
             .filter(|ticket| *ticket < self.task_partitions.len())
             .unwrap_or(partition);
         let tasks = self.task_partitions[group].clone();
@@ -6410,19 +6573,21 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
         // fetch happens on the first poll of the stream the gate guards.
         let gate = match (&self.admission, admission_ticket) {
             (Some(admission), Some(ticket)) => {
-                let immediate = admission.is_admitted(ticket);
+                let immediate = admission.is_ticket_admitted(&ticket);
                 metrics::counter!(
                     "siglake_query_scan_clipped_admission_total",
                     "outcome" => if immediate { "immediate" } else { "queued" }
                 )
                 .increment(1);
                 if immediate {
-                    AdmissionGate::Admitted(admission.clone())
+                    AdmissionGate::Admitted(admission.clone(), ticket)
                 } else {
                     let waiting = admission.clone();
+                    let wait_ticket = ticket.clone();
                     AdmissionGate::Waiting {
                         admission: admission.clone(),
-                        wait: async move { waiting.wait(ticket).await }.boxed(),
+                        ticket,
+                        wait: async move { waiting.wait(wait_ticket).await }.boxed(),
                         since: Instant::now(),
                     }
                 }
@@ -6574,6 +6739,57 @@ struct ClippedLimitCoalesceExec {
     properties: Arc<PlanProperties>,
 }
 
+/// Per-`execute` close states for the admission ramps below one clipped
+/// coalescer. This travels in the child `TaskContext`, so concurrent executions
+/// of the same physical plan cannot observe one another's close.
+#[derive(Debug)]
+struct ClippedAdmissionExecutions {
+    entries: Vec<(Arc<ScanAdmission>, Arc<ScanAdmissionExecution>)>,
+}
+
+impl ClippedAdmissionExecutions {
+    fn new(admissions: &[Arc<ScanAdmission>]) -> Self {
+        Self {
+            entries: admissions
+                .iter()
+                .map(|admission| (admission.clone(), Arc::new(ScanAdmissionExecution::new())))
+                .collect(),
+        }
+    }
+
+    fn execution_for(&self, admission: &Arc<ScanAdmission>) -> Option<Arc<ScanAdmissionExecution>> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| Arc::ptr_eq(candidate, admission))
+            .map(|(_, execution)| execution.clone())
+    }
+
+    fn close(&self) {
+        for (admission, execution) in &self.entries {
+            admission.close_execution(execution);
+        }
+    }
+}
+
+/// Clone a task context while adding the execution-scoped admission state.
+/// `TaskContext` has no `Clone` implementation, so preserve each public field
+/// explicitly; this is the same context apart from the private extension.
+fn with_clipped_admission_executions(
+    context: &TaskContext,
+    executions: Arc<ClippedAdmissionExecutions>,
+) -> Arc<TaskContext> {
+    let config = context.session_config().clone().with_extension(executions);
+    Arc::new(TaskContext::new(
+        context.task_id(),
+        context.session_id(),
+        config,
+        context.scalar_functions().clone(),
+        context.aggregate_functions().clone(),
+        context.window_functions().clone(),
+        context.runtime_env(),
+    ))
+}
+
 impl ClippedLimitCoalesceExec {
     fn new(input: Arc<dyn ExecutionPlan>, fetch: Option<usize>) -> Self {
         let standard = CoalescePartitionsExec::new(input.clone()).with_fetch(fetch);
@@ -6654,11 +6870,31 @@ impl ExecutionPlan for ClippedLimitCoalesceExec {
             ));
         }
 
+        // #7487: the partitions this node's `LIMIT` cancels are its own input's
+        // admission ramp. Once the sends below have delivered the whole fetch,
+        // every queued partition is dead weight — the `LimitStream` answers
+        // from what the channel already holds — so close admission instead of
+        // letting the cancelled partitions' terminal credits start a reader
+        // teardown is about to abort. Collected once here, so the hot loop
+        // only touches an atomic.
+        let admissions = clipped_scan_admissions(&self.input);
+        let executions = Arc::new(ClippedAdmissionExecutions::new(&admissions));
+        let context = with_clipped_admission_executions(&context, executions.clone());
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let close = {
+            let executions = executions.clone();
+            move || {
+                executions.close();
+            }
+        };
         let mut builder = RecordBatchReceiverStream::builder(self.schema(), 1);
         for input_partition in 0..input_partitions {
             let input = self.input.clone();
             let context = context.clone();
             let output = builder.tx();
+            let fetch = self.fetch;
+            let delivered = delivered.clone();
+            let close = close.clone();
             builder.spawn(async move {
                 let mut stream = match input.execute(input_partition, context) {
                     Ok(stream) => stream,
@@ -6669,8 +6905,22 @@ impl ExecutionPlan for ClippedLimitCoalesceExec {
                 };
                 while let Some(item) = stream.next().await {
                     let is_error = item.is_err();
+                    let rows = match &item {
+                        Ok(batch) => batch.num_rows(),
+                        Err(_) => 0,
+                    };
                     if output.send(item).await.is_err() || is_error {
                         return Ok(());
+                    }
+                    // The batch is in the channel, so the `LimitStream` below
+                    // will see it. Counting AFTER the send, and before the
+                    // repoll on the next iteration, is what puts the close
+                    // ahead of this partition's own terminal credit.
+                    if let Some(fetch) = fetch {
+                        let before = delivered.fetch_add(rows, std::sync::atomic::Ordering::AcqRel);
+                        if before < fetch && before + rows >= fetch {
+                            close();
+                        }
                     }
                 }
                 Ok(())
@@ -6717,6 +6967,24 @@ fn contains_clipped_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
         return true;
     }
     plan.children().into_iter().any(contains_clipped_scan)
+}
+
+/// Every #4865 admission ramp below `plan`, so the node that owns the fetch
+/// can close them when it is filled (#7487). Normally one; a shape with two
+/// clipped scans under one fetch would close both, which is correct for the
+/// same reason it is correct for one — the fetch is the only consumer.
+fn clipped_scan_admissions(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<ScanAdmission>> {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    let mut admissions = Vec::new();
+    let _ = plan.apply(|node| {
+        if let Some(scan) = node.as_any().downcast_ref::<SiglakeIcebergTableScan>() {
+            if let Some(admission) = scan.admission.as_ref() {
+                admissions.push(admission.clone());
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    admissions
 }
 
 fn apply_clipped_limit_backpressure(
@@ -10265,7 +10533,7 @@ mod tests {
     #[test]
     fn the_admission_ramp_widens_one_wave_at_a_time() {
         let admission = ScanAdmission::new(15, 2);
-        let tickets: Vec<usize> = (0..15).map(|_| admission.register()).collect();
+        let tickets: Vec<usize> = (0..15).map(|_| admission.register().ticket).collect();
         assert_eq!(tickets, (0..15).collect::<Vec<_>>());
         assert!(admission.is_admitted(0));
         assert!(!admission.is_admitted(1));
@@ -10296,27 +10564,31 @@ mod tests {
     #[test]
     fn clipped_batches_are_paced_before_the_ramp_widens() {
         let admission = ScanAdmission::new(15, 2);
+        let ticket = admission.register();
         for batches in 1..SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT {
-            admission.advance_after_batch();
+            admission.advance_after_batch(&ticket);
             assert!(
                 !admission.is_admitted(1),
                 "batch {batches} must leave the scan on its first partition"
             );
         }
-        admission.advance_after_batch();
+        admission.advance_after_batch(&ticket);
         assert!(admission.is_admitted(1), "batch 8 admits the second ticket");
         assert!(!admission.is_admitted(2));
 
         for _ in SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT..64 {
-            admission.advance_after_batch();
+            admission.advance_after_batch(&ticket);
         }
         assert!(
             (0..15).all(|ticket| admission.is_admitted(ticket)),
             "64 source batches must reach full fan-out"
         );
-        admission.advance_after_batch();
+        admission.advance_after_batch(&ticket);
         assert_eq!(
-            admission.batches.load(std::sync::atomic::Ordering::Acquire),
+            admission
+                .unscoped_execution
+                .batches
+                .load(std::sync::atomic::Ordering::Acquire),
             64,
             "a full-fan-out scan keeps the one-load steady-state path"
         );
@@ -10328,13 +10600,14 @@ mod tests {
     #[test]
     fn admission_tickets_wrap_so_a_lone_partition_runs() {
         let admission = ScanAdmission::new(4, 2);
-        assert_eq!(admission.register(), 0);
+        assert_eq!(admission.register().ticket, 0);
         assert!(admission.is_admitted(0));
         let admission = ScanAdmission::new(4, 2);
         for _ in 0..4 {
             admission.register();
         }
-        assert_eq!(admission.register(), 0, "a second round restarts at 0");
+        let wrapped = admission.register();
+        assert_eq!(wrapped.ticket, 0, "a second round restarts at 0");
     }
 
     /// A gated partition's wait resolves as soon as the ramp reaches it, and
@@ -10343,11 +10616,11 @@ mod tests {
     #[tokio::test]
     async fn a_gated_partition_waits_until_the_ramp_reaches_it() {
         let admission = Arc::new(ScanAdmission::new(4, 2));
-        for _ in 0..4 {
-            admission.register();
-        }
+        let tickets: Vec<ScanTicket> = (0..4).map(|_| admission.register()).collect();
         let waiting = admission.clone();
-        let mut wait = async move { waiting.wait(3).await }.boxed();
+        let ticket = tickets[3].clone();
+        let wait_ticket = ticket.clone();
+        let mut wait = async move { waiting.wait(wait_ticket).await }.boxed();
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(
             wait.poll_unpin(&mut cx).is_pending(),
@@ -10357,6 +10630,92 @@ mod tests {
         assert!(wait.poll_unpin(&mut cx).is_pending(), "ramp at 2");
         admission.advance();
         assert!(wait.poll_unpin(&mut cx).is_ready(), "ramp at 4");
+    }
+
+    /// #7487: once the clipped coalescer's fetch is filled it closes admission,
+    /// and from then on the terminal credit of the partition that filled it
+    /// must not widen the ramp — that credit is what used to start a reader the
+    /// query was already cancelling. The queued partition wakes to END.
+    ///
+    /// Hand-polled, so the interleaving is fixed rather than raced: close, then
+    /// the credit `finish` pays on drop, then the queued partition's poll.
+    #[tokio::test]
+    async fn a_closed_ramp_pays_no_terminal_credit_and_starts_no_reader() {
+        let admission = Arc::new(ScanAdmission::new(4, 2));
+        let tickets: Vec<ScanTicket> = (0..4).map(|_| admission.register()).collect();
+        let queued = tickets[1].clone();
+        let waiting = admission.clone();
+        let wait_ticket = queued.clone();
+        let mut wait = async move { waiting.wait(wait_ticket).await }.boxed();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            wait.poll_unpin(&mut cx).is_pending(),
+            "ticket 1 waits behind a ramp at 1"
+        );
+
+        admission.close();
+        admission.advance_from(&tickets[0]);
+        assert!(
+            !admission.is_admitted(1),
+            "a terminal credit after the close must not widen the ramp"
+        );
+        for _ in 0..SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT {
+            admission.advance_after_batch(&tickets[0]);
+        }
+        assert!(
+            !admission.is_admitted(1),
+            "nor may the paced batch credit of a partition still draining"
+        );
+
+        assert!(
+            wait.poll_unpin(&mut cx).is_ready(),
+            "the close must wake the queued partition rather than leave it hanging"
+        );
+        assert!(
+            admission.is_closed_for(&queued),
+            "and it wakes CLOSED, so the stream ends without polling its reader"
+        );
+    }
+
+    /// #7487: concurrent executions of one physical plan have distinct ramp
+    /// and close state. Closing one cannot end a reader or suppress a liveness
+    /// credit in the other, even when their registrations interleave.
+    #[tokio::test]
+    async fn closing_one_execution_does_not_affect_another_execution() {
+        let admission = Arc::new(ScanAdmission::new(4, 2));
+        let first_execution = Arc::new(ScanAdmissionExecution::new());
+        let second_execution = Arc::new(ScanAdmissionExecution::new());
+        let first: Vec<ScanTicket> = (0..4)
+            .map(|_| admission.register_for(first_execution.clone()))
+            .collect();
+        let second: Vec<ScanTicket> = (0..4)
+            .map(|_| admission.register_for(second_execution.clone()))
+            .collect();
+        admission.close_execution(&first_execution);
+        assert!(first.iter().all(|ticket| admission.is_closed_for(ticket)));
+        assert!(
+            second.iter().all(|ticket| !admission.is_closed_for(ticket)),
+            "the other execution has its own close state"
+        );
+        let queued = second[1].clone();
+        let waiting = admission.clone();
+        let wait_ticket = queued.clone();
+        let mut wait = async move { waiting.wait(wait_ticket).await }.boxed();
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            wait.poll_unpin(&mut cx).is_pending(),
+            "its ramp is still at 1"
+        );
+        admission.advance_from(&second[0]);
+        assert!(
+            admission.is_ticket_admitted(&queued),
+            "the other execution's own credits still widen its ramp"
+        );
+        assert!(wait.poll_unpin(&mut cx).is_ready());
+        assert!(
+            !admission.is_closed_for(&queued),
+            "it runs, rather than ending as a closed partition does"
+        );
     }
 
     #[tokio::test]

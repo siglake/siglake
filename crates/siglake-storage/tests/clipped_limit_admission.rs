@@ -715,6 +715,12 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
 /// and fails the assertion, so the shape does grade the mechanism when the
 /// margin survives.
 ///
+/// #7487 closes admission when the fetch is filled, so the bounded arm now
+/// reads one file because nothing can admit a second reader, not because
+/// teardown won a race. The control arm still fans out by scheduling, so this
+/// stays a by-hand measurement; `a_filled_clipped_limit_starts_no_further_reader`
+/// is the gate on the bounded side.
+///
 /// `bounded_coalesce_fills_a_dense_residual_limit_exactly` keeps the part of
 /// this shape that does not depend on the scheduler in the gate.
 ///
@@ -852,6 +858,58 @@ async fn bounded_coalesce_fills_a_dense_residual_limit_exactly() {
         run.rows.iter().collect::<HashSet<_>>().len(),
         LIMIT,
         "the clipped limit must be filled from distinct source rows"
+    );
+}
+
+/// #7487: a filled clipped `LIMIT` opens no further file.
+///
+/// The dense fixture fills `LIMIT 100` from the first source batch, so the
+/// production coalescer closes admission as soon as that batch is in its
+/// channel — before it repolls its input, and therefore before the terminal
+/// credit that the repoll or the teardown pays. No queued partition can be
+/// admitted after that, so the scan reads the one file the ramp opened
+/// whatever the scheduler does.
+///
+/// What this gates is the outcome, not the mechanism: on an IDLE lane the old
+/// behavior also read one file, because teardown beat the woken reader to its
+/// footer (the same lane at load 42 read two files and seven ranges — the
+/// measurement in `bounded_coalesce_and_eager_limit_bound_dense_residual_runahead`
+/// and in the design doc). The interleaving itself is pinned by
+/// `a_closed_ramp_pays_no_terminal_credit_and_starts_no_reader` in
+/// `query_provider.rs`, which is hand-polled and does not depend on load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_filled_clipped_limit_starts_no_further_reader() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 100;
+    const DENSE_ROWS_PER_FILE: usize = 20_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    dense_table_with_rows(&ice, DENSE_ROWS_PER_FILE).await;
+
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+
+    let run = run_arm(&ctx, &sql, "raw").await;
+    eprintln!("CLIPPED-CLOSE {:?} drain={:?}", run.work, run.drain);
+
+    assert_eq!(run.rows.len(), LIMIT, "the clipped limit must be filled");
+    assert_all_qualify(&run.rows, &sql);
+    assert_eq!(
+        run.rows.iter().collect::<HashSet<_>>().len(),
+        LIMIT,
+        "the clipped limit must be filled from distinct source rows"
+    );
+    assert_eq!(
+        run.work.partitions, PARTITIONS,
+        "the fixture must plan one partition per file for the close to hold any back"
+    );
+    assert_eq!(
+        run.work.files_read, 1,
+        "a filled fetch must leave every queued partition closed, not admitted: {:?}",
+        run.work
     );
 }
 

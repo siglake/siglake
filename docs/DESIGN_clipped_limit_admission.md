@@ -94,8 +94,9 @@ Liveness for the unordered case: if tickets are waiting then `admitted <
 partitions`, the tickets below `admitted` are all registered, and each pays at
 least the credit it owes by ending. Tickets are handed out modulo the partition
 count, so a caller that executes a single partition takes ticket 0 and runs at
-once, and a plan executed a second time finds the ramp already open — it
-degrades to the ungated behavior rather than blocking.
+once. Each clipped coalescer execution owns a fresh ramp. Direct scan callers
+that bypass the coalescer share a fallback ramp whose wrapped tickets keep
+repeated calls live.
 
 ## Which group starts first (#6979)
 
@@ -335,6 +336,63 @@ filter emitting 8,292 rows or ignoring its fetch. Scan output is upstream
 run-ahead, filter selectivity's denominator is rows evaluated, and root output
 is rows returned; the aggregate must not substitute for any of those counts.
 No repair or threshold change follows from this metric pattern.
+
+## Closing admission when the fetch is filled (#7487)
+
+Until #7487 every terminal event paid an admission credit, the drop of the
+partition that filled an early `LIMIT` included. With the default wave of 2
+that widened `admitted` from 1 to 2 and woke ticket 1, which opened its file.
+Teardown usually reached the woken reader first; on a loaded machine it did
+not, and the footer fetch landed and was paid for.
+
+`ClippedLimitCoalesceExec` now counts the rows its producers have delivered
+into the shared channel and calls `ScanAdmission::close` on the scans below it
+as soon as that count reaches its fetch. The count is taken after `send`
+returns and before the producer repolls its input, so the close precedes the
+terminal credit that the repoll or the teardown pays. A flag set when the root
+stream closes would arrive after the credit it has to suppress.
+
+Liveness is not weakened, because it is no longer owed. The credit exists so a
+queued partition cannot wait on a scan with nothing running; once `fetch` rows
+are in the channel the `LimitStream` answers from what it already holds, no
+queued partition can contribute a row, and the execution tears down. Under a
+close the credits are suppressed and the queued partitions wake to end without
+polling their readers — each folds its (empty) counters and releases its
+tracker slot the way any ending partition does, so `settle_scan_partitions`
+reads a complete fold. The shapes `advance` exists for are untouched: a
+bloom-pruned first partition, a term with too few matches and a sparse term
+never fill the fetch, so nothing closes and the ramp opens on credits as
+before.
+
+The clipped coalescer creates a fresh ramp state for each `execute` call and
+passes it to its scan children through their task context. Ticket allocation,
+credits, close state and wakeups all belong to that execution. A concurrent or
+later execution of the same physical plan therefore keeps its own full ramp,
+and a producer task that registers after its own execution closes ends without
+opening its reader.
+
+`a_closed_ramp_pays_no_terminal_credit_and_starts_no_reader` and
+`closing_one_execution_does_not_affect_another_execution` in
+`query_provider.rs` hand-poll the close/credit interleaving and isolate two
+executions of one plan, so neither depends on load.
+`a_filled_clipped_limit_starts_no_further_reader` gates the outcome on the
+dense 16-file fixture: 100 distinct qualifying rows out of one file read.
+
+The 2026-10-26 local A/B ran that gate five times per arm on a 32-core lane
+with 40 spinners against it (load average 44–54). The arms are the same binary
+except for the `close` call:
+
+| arm | `files_read` per run | `object_store_reads` | `bytes_scanned` |
+| --- | --- | --- | --- |
+| close | 1, 1, 1, 1, 1 | 4 every run | 1,687,907 every run |
+| pre-#7487 control | 1, 2, 4, 4, 1 | 4–16 | 1,687,907–6,751,615 |
+
+Every run of both arms returned 100 distinct qualifying rows. This is a local
+physical-read result on a dense fixture under induced load; it is not a
+latency claim, local or AWS, and it leaves #7106's matched qualification as it
+stands. `bounded_coalesce_and_eager_limit_bound_dense_residual_runahead` stays
+`#[ignore]`d: its production arm is now bounded by the close rather than by a
+margin, but its control arm's fan-out is still a property of the machine.
 
 ## Local measurement
 
