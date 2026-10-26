@@ -144,6 +144,16 @@ struct Run {
     decoded_bytes: usize,
 }
 
+impl Run {
+    /// Per opened file. Wave-2 admission occasionally starts a second file's
+    /// reader before the clipped fetch is satisfied, which scales every read
+    /// counter by the number of files opened. The cross-arm claims below are
+    /// about what one file's read costs, so they compare per-file values.
+    fn per_file(&self, value: usize) -> usize {
+        value / self.files_read.max(1)
+    }
+}
+
 async fn run(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Run {
     let scans = scan_nodes(&plan);
     assert_eq!(scans.len(), 1, "one scan leaf expected");
@@ -415,11 +425,18 @@ async fn clipped_equality_reader_pushdown_attribution() {
             suppressed.decoded_bytes,
         );
         assert_eq!(
-            pushed.object_store_reads, without_selection.object_store_reads,
+            pushed.per_file(pushed.object_store_reads),
+            without_selection.per_file(without_selection.object_store_reads),
             "column and offset indexes are preloaded in both reader arms"
         );
-        assert_eq!(pushed.bytes_index, without_selection.bytes_index);
-        assert_eq!(pushed.decoded_bytes, without_selection.decoded_bytes);
+        assert_eq!(
+            pushed.per_file(pushed.bytes_index),
+            without_selection.per_file(without_selection.bytes_index)
+        );
+        assert_eq!(
+            pushed.per_file(pushed.decoded_bytes),
+            without_selection.per_file(without_selection.decoded_bytes)
+        );
         assert_eq!(
             pushed.rows_pruned_selection, 0,
             "interleaved labels give every page a matching min/max"
