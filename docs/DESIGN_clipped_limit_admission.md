@@ -360,6 +360,13 @@ is one batch, and the latency the AWS capture attributes to the fan-out cannot
 be reproduced at this size. The ramp factor default of 2 is chosen from the
 local decode comparison above, not from a round.
 
+The 2026-10-26 matched field round measured that acceptance and `keyword` stayed
+at 19.64 ms. `docs/CLIPPED_LIMIT_RESIDUAL_ATTRIBUTION_2026-10-26.md` reads its
+retained profiles against this tree (#7446): the ramp reaches full width at
+6.8 ms and all 15 partitions then run to ~13 ms; `collect` is unchanged across
+the round's three phases, so the phase differences it reports come from
+`cost::estimate` rather than from this mechanism.
+
 ## Knob
 
 `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` — ramp factor, default 2. `0` turns the
