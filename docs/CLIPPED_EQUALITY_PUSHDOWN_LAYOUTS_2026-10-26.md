@@ -57,20 +57,21 @@ Each arm returns 100 distinct rows satisfying the equality on every layout.
 
 Seven triples per layout, rotating order, one process, diagnostic build. Times
 are medians of root-stream collection and the differences are paired per triple.
-Counters are medians; byte and read counters are per opened file, because
-wave-2 admission sometimes opens one more file before the clipped fetch closes.
+Counters are medians and byte counters are request totals. Files opened and row
+groups read are separate because wave-2 admission can open a footer-only file
+before the clipped fetch closes.
 
-The lane is shared, so the test was run four times. Run A below is the headline;
-all four are in [Reproduction](#reproduction). Run B hit contention during
+The report retains five runs from the shared lane. Run A below is the headline;
+all five are in [Reproduction](#reproduction). Run B hit contention during
 `rare_clustered` — every arm of that layout came out about three times slower —
 and its figure for that layout is not used.
 
-| layout | pushed | no selection | suppressed | pushed − suppressed (A/B/C/D) |
+| layout | pushed | no selection | suppressed | pushed − suppressed (A/B/C/D/E) |
 | --- | ---: | ---: | ---: | --- |
-| `interleaved` | 27.866 ms | 25.771 ms | 7.255 ms | **+20.8 / +21.5 / +21.0 / +21.8 ms** |
-| `rare_scattered` | 40.882 ms | 40.321 ms | 52.432 ms | **−11.7 / −10.3 / −9.9 / −8.9 ms** |
-| `rare_clustered` | 35.196 ms | 43.964 ms | 36.746 ms | **−2.4 / (+8.0) / −1.7 / −3.7 ms** |
-| `rare_clustered_single_file` | 11.882 ms | 14.576 ms | 53.185 ms | **−41.1 / −43.1 / −41.3 / −41.4 ms** |
+| `interleaved` | 27.866 ms | 25.771 ms | 7.255 ms | **+20.8 / +21.5 / +21.0 / +21.8 / +19.6 ms** |
+| `rare_scattered` | 40.882 ms | 40.321 ms | 52.432 ms | **−11.7 / −10.3 / −9.9 / −8.9 / −8.7 ms** |
+| `rare_clustered` | 35.196 ms | 43.964 ms | 36.746 ms | **−2.4 / (+8.0) / −1.7 / −3.7 / −2.1 ms** |
+| `rare_clustered_single_file` | 11.882 ms | 14.576 ms | 53.185 ms | **−41.1 / −43.1 / −41.3 / −41.4 / −41.2 ms** |
 
 `interleaved` reproduces #7457 on this machine and build: 27.866 / 25.771 /
 7.255 ms against its reported 30.878 / 26.982 / 7.077 ms, and +20.766 ms against
@@ -84,20 +85,20 @@ pair of runs A and C (run B was recorded as summaries only).
 
 What each arm read:
 
-| layout | arm | planned partitions | files opened | rows pruned by selection | data bytes requested / file | decoded Arrow bytes / file |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `interleaved` | pushed | 16 | 1 | 0 | 29,413 | 1,229,144 |
-| | no selection | 16 | 1 | 0 | 29,413 | 1,229,144 |
-| | suppressed | 16 | 1 | 0 | 29,413 | 2,326,872 |
-| `rare_scattered` | pushed | 16 | 3 | 0 | 65,968 | 77,125 |
-| | no selection | 16 | 3 | 0 | 65,968 | 77,125 |
-| | suppressed | 16 | 4 | 0 | 98,952 | 8,373,944 |
-| `rare_clustered` | pushed | 4 | 4 | 63,680 | 38,125 | 166,548 |
-| | no selection | 4 | 4 | 0 | 38,125 | 166,548 |
-| | suppressed | 16 | 2 | 0 | 100,750 | 4,887,732 |
-| `rare_clustered_single_file` | pushed | 1 | 1 | 19,520 | 36,310 | 370,248 |
-| | no selection | 1 | 1 | 0 | 36,310 | 370,248 |
-| | suppressed | 16 | 4 | 0 | 100,082 | 6,090,166 |
+| layout | arm | planned partitions | files opened | row groups read | rows pruned by selection | data bytes requested | decoded Arrow bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `interleaved` | pushed | 16 | 1 | 1 | 0 | 29,413 | 1,229,144 |
+| | no selection | 16 | 1 | 1 | 0 | 29,413 | 1,229,144 |
+| | suppressed | 16 | 1 | 1 | 0 | 29,413 | 2,326,872 |
+| `rare_scattered` | pushed | 16 | 3 | 2 | 0 | 197,906 | 231,376 |
+| | no selection | 16 | 3 | 2 | 0 | 197,906 | 231,376 |
+| | suppressed | 16 | 4 | 4 | 0 | 395,810 | 33,495,776 |
+| `rare_clustered` | pushed | 4 | 4 | 4 | 63,680 | 152,500 | 666,192 |
+| | no selection | 4 | 4 | 4 | 0 | 152,500 | 666,192 |
+| | suppressed | 16 | 2 | 2 | 0 | 201,501 | 9,775,464 |
+| `rare_clustered_single_file` | pushed | 1 | 1 | 1 | 19,520 | 36,310 | 370,248 |
+| | no selection | 1 | 1 | 1 | 0 | 36,310 | 370,248 |
+| | suppressed | 16 | 4 | 4 | 0 | 400,328 | 24,360,664 |
 
 `row_groups_pruned_stats` is 0 everywhere. File bounds drop the target-free
 files during planning, before a reader opens anything, so the pruning shows up
@@ -111,10 +112,10 @@ partition count is 16 in all three. The only difference from `interleaved` is
 that the predicate rejects 99.8% of the rows it sees instead of 75%.
 
 That is enough to reverse the sign. The reader predicate saves 11.734 ms paired
-median, with 109 times less decoded Arrow per opened file (77,125 against
-8,373,944) and a third fewer requested data bytes per file. #7457's finding that
-the predicate "saves neither a page nor a requested data byte" was a property of
-its fixture's selectivity, not of the clipped path.
+median. The suppressed arm decodes 145 times as many Arrow bytes in total
+(33,495,776 against 231,376) and requests twice as many data bytes. #7457's
+finding that the predicate "saves neither a page nor a requested data byte" was
+a property of its fixture's selectivity, not of the clipped path.
 
 The mechanism is the one #7457 described, running the other way. The residual
 filter above the scan can only reject rows the reader already materialised, so
@@ -128,17 +129,18 @@ smaller than the decode it avoids once the predicate is selective.
 
 `RowSelection` is the difference between `pushed` and `no_selection`:
 
-| layout | pushed − no_selection (A/B/C/D) | rows pruned by selection |
+| layout | pushed − no_selection (A/B/C/D/E) | rows pruned by selection |
 | --- | --- | ---: |
-| `interleaved` | +1.97 / +1.68 / +1.95 / +0.90 ms | 0 |
-| `rare_scattered` | +0.78 / +2.04 / +0.51 / +0.71 ms | 0 |
-| `rare_clustered` | **−9.21 / −13.40 / −8.75 / −9.33 ms** | 63,680 |
-| `rare_clustered_single_file` | **−2.69 / −2.54 / −3.23 / −2.71 ms** | 19,520 |
+| `interleaved` | +1.97 / +1.68 / +1.95 / +0.90 / +0.85 ms | 0 |
+| `rare_scattered` | +0.78 / +2.04 / +0.51 / +0.71 / −0.34 ms | 0 |
+| `rare_clustered` | **−9.21 / −13.40 / −8.75 / −9.33 / −8.99 ms** | 63,680 |
+| `rare_clustered_single_file` | **−2.69 / −2.54 / −3.23 / −2.71 / −3.12 ms** | 19,520 |
 
-This is the most reproducible result in the set — it holds on all four runs,
+This is the most reproducible result in the set — it holds on all five runs,
 including the contended one. Where selection rejects nothing it costs 0.5–2.0 ms
-on all four runs, below #7457's 4.587 ms on the same layout; that gap is the
-one figure of #7457's that did not reproduce here, and it is small either way.
+in the first four runs and is neutral in run E, below #7457's 4.587 ms on the
+same layout; that gap is the one figure of #7457's that did not reproduce here,
+and it is small either way.
 Where it rejects pages it pays for itself
 several times over: on `rare_clustered` the pushed arm is faster than the
 no-selection arm in every pair of runs A and C with no overlap (run A
@@ -175,8 +177,8 @@ all three arms plan 16 partitions and run the same wrappers, is the clean one.
 A second consequence matters for any production gate: pruning reduces the
 partitions available to clipped admission. On `rare_clustered` the suppressed
 arm spread 16 partitions over the snapshot, found a matching file in 2 opened
-files, and came out within about 2 ms of the pushed arm despite decoding 29
-times more Arrow per file and requesting 2.6 times more data bytes per file.
+files, and came out within about 2 ms of the pushed arm despite decoding 15
+times as many Arrow bytes in total and requesting 1.3 times as many data bytes.
 Pruning to 4 partitions gave back most of what it saved. That is why
 `rare_clustered` is the one layout here where the reader predicate is neutral on
 wall time while being plainly cheaper on every I/O counter.
@@ -227,10 +229,12 @@ and reader-predicate presence per arm, each layout's pruning floor, and the
 plan-shape difference on the two clustered layouts. Wall time is printed and is
 not a CI threshold.
 
-Four runs, 2026-10-26, 32-core shared lane. Every counter in the tables above
-was identical in all four; only wall time moved. Runs A–C predate a
-clippy-driven rewrite of one fixture predicate into the identical
-`is_multiple_of` form; run D is the committed source and reproduces them.
+Four retained runs and one reconciliation run, 2026-10-26, 32-core shared lane.
+The data/decode totals and pruning counts reproduced. In the reconciliation
+run, `rare_scattered` opened three or four files while reading two row groups;
+the extra footer-only start changed metadata reads without changing data work.
+Runs A–C predate a clippy-driven rewrite of one fixture predicate into the
+identical `is_multiple_of` form; runs D and E use the committed source.
 
 | layout | run | pushed | no selection | suppressed | p − ns | p − s |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -250,6 +254,10 @@ clippy-driven rewrite of one fixture predicate into the identical
 Run D recorded paired differences only. Its `pushed − suppressed` figures are
 +21.771, −8.861, −3.652 and −41.403 ms in the table's layout order, and its
 `pushed − no_selection` figures are +0.896, +0.714, −9.332 and −2.705 ms.
+
+Run E, after reconciling current `main`, recorded `pushed − suppressed` figures
+of +19.580, −8.698, −2.068 and −41.180 ms. Its `pushed − no_selection` figures
+are +0.848, −0.337, −8.990 and −3.118 ms.
 
 Run B's `rare_clustered` block ran at a 1-minute load average of 18 on 32 cores
 and every arm of that layout is about three times its A, C and D value. Its

@@ -241,16 +241,6 @@ struct Run {
     decoded_bytes: usize,
 }
 
-impl Run {
-    /// Per opened file. Wave-2 admission occasionally starts a second reader
-    /// before the clipped fetch is satisfied, which scales every read counter
-    /// by the number of files opened; the per-file value is what the arms can
-    /// be compared on.
-    fn per_file(&self, value: usize) -> usize {
-        value / self.files_read.max(1)
-    }
-}
-
 async fn run(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Run {
     let scans = scan_nodes(&plan);
     assert_eq!(scans.len(), 1, "one scan leaf expected");
@@ -626,8 +616,8 @@ fn report(layout: Layout, result: &LayoutResult) {
             "{arm}_median_ms={:.3} {arm}_planned={} {arm}_files={} \
              {arm}_rg_considered={} \
              {arm}_rg_pruned_stats={} {arm}_rg_read={} {arm}_sel_pruned={} \
-             {arm}_reads_per_file={} {arm}_index_per_file={} \
-             {arm}_requested_per_file={} {arm}_decoded_per_file={}",
+             {arm}_reads={} {arm}_index={} \
+             {arm}_requested={} {arm}_decoded={}",
             median_ms(runs),
             median_count(runs, |run| run.planned_partitions),
             median_count(runs, |run| run.files_read),
@@ -635,10 +625,10 @@ fn report(layout: Layout, result: &LayoutResult) {
             median_count(runs, |run| run.row_groups_pruned_stats),
             median_count(runs, |run| run.row_groups_read),
             median_count(runs, |run| run.rows_pruned_selection),
-            median_count(runs, |run| run.per_file(run.object_store_reads)),
-            median_count(runs, |run| run.per_file(run.bytes_index)),
-            median_count(runs, |run| run.per_file(run.bytes_data_requested)),
-            median_count(runs, |run| run.per_file(run.decoded_bytes)),
+            median_count(runs, |run| run.object_store_reads),
+            median_count(runs, |run| run.bytes_index),
+            median_count(runs, |run| run.bytes_data_requested),
+            median_count(runs, |run| run.decoded_bytes),
         )
     };
     eprintln!(

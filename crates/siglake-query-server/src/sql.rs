@@ -2054,6 +2054,10 @@ type AttrRewriteBindings = HashMap<String, siglake_storage::iceberg::QualifiedAt
 #[derive(Clone)]
 struct RewrittenQuery {
     sql: String,
+    /// Tables collected from the AST that produced `sql`. `None` preserves the
+    /// registration fallback for statements the serving rewrite could not
+    /// classify, including parse failures and table-free shapes.
+    table_references: Option<Vec<String>>,
     /// Exact table generations whose files qualified every promoted-value
     /// substitution in `sql`. Registration and WAL wrapping must use these
     /// captures instead of consulting the mutable table cache again.
@@ -2093,6 +2097,7 @@ fn apply_default_order_if_needed(
         _ => {
             return RewrittenQuery {
                 sql: query.to_string(),
+                table_references: None,
                 attr_rewrite_bindings: HashMap::new(),
                 preferred_scan_order: None,
                 ordered_limit: None,
@@ -2101,6 +2106,10 @@ fn apply_default_order_if_needed(
             };
         }
     };
+    // This is the final parse: search and attribute rewrites have already
+    // happened. The only possible mutation below adds ORDER BY/LIMIT and
+    // cannot change relation discovery.
+    let table_references = referenced_tables_in(&stmts);
     // #91: EXPLAIN derives the scan-order hint from its INNER statement (but
     // never rewrites — the plan shown should be the query's own). Without
     // this, EXPLAIN of an ordered browse planned WITHOUT PreferredScanOrder
@@ -2110,6 +2119,7 @@ fn apply_default_order_if_needed(
         if let Statement::Query(inner) = statement.as_ref() {
             return RewrittenQuery {
                 sql: query.to_string(),
+                table_references,
                 attr_rewrite_bindings: HashMap::new(),
                 preferred_scan_order: preferred_scan_order_from_query(
                     inner,
@@ -2127,6 +2137,7 @@ fn apply_default_order_if_needed(
         }
         return RewrittenQuery {
             sql: query.to_string(),
+            table_references,
             attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
@@ -2137,6 +2148,7 @@ fn apply_default_order_if_needed(
     let Statement::Query(sql_query) = &mut stmts[0] else {
         return RewrittenQuery {
             sql: query.to_string(),
+            table_references,
             attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
@@ -2175,6 +2187,7 @@ fn apply_default_order_if_needed(
             .and_then(|order| ordered_source_filter(sql_query, &order.field));
         return RewrittenQuery {
             sql,
+            table_references,
             attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order,
             ordered_limit,
@@ -2195,6 +2208,7 @@ fn apply_default_order_if_needed(
             .as_ref()
             .and_then(|_| explicit_limit_value(sql_query)),
         sql: query.to_string(),
+        table_references,
         attr_rewrite_bindings: HashMap::new(),
         preferred_scan_order,
         ordered_source_filter,
@@ -5021,13 +5035,7 @@ async fn handle_local_inner(
     // well past the request budget. It ends on the deadline like everything
     // else; the half-registered session context dies with the request.
     let registered_tables = under_request_deadline!(async {
-        let registered = register_tables_for_query_with_bindings(
-            &ice,
-            &ctx,
-            &effective_query.sql,
-            &effective_query.attr_rewrite_bindings,
-        )
-        .await?;
+        let registered = register_tables_for_rewritten_query(&ice, &ctx, &effective_query).await?;
         // WS-6: if real-time buffering is on and this query touches `events`,
         // replace the plain Iceberg provider with a union over the un-committed
         // WAL segments so just-ingested rows are visible before the compaction
@@ -6840,7 +6848,7 @@ async fn run_batch_query_in(
 
     if let Err(e) = under_run_deadline!(
         None,
-        register_tables_for_query_batch(&ice, &ctx, &query.sql, &query.attr_rewrite_bindings,)
+        register_tables_for_rewritten_query_batch(&ice, &ctx, &query)
     ) {
         return BatchOutcome::Failed(format!("register tables: {e:#}"), None);
     }
@@ -10050,6 +10058,20 @@ async fn register_tables_for_query_with_bindings(
         .map_err(registration_error_to_api)
 }
 
+async fn register_tables_for_rewritten_query(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    ctx: &SessionContext,
+    query: &RewrittenQuery,
+) -> Result<usize, ApiError> {
+    if let Some(tables) = query.table_references.as_deref() {
+        return register_selected_tables(ice, ctx, tables, &query.attr_rewrite_bindings)
+            .await
+            .map_err(registration_error_to_api);
+    }
+    register_tables_for_query_with_bindings(ice, ctx, &query.sql, &query.attr_rewrite_bindings)
+        .await
+}
+
 async fn register_tables_for_query_batch(
     ice: &siglake_storage::iceberg::IcebergContext,
     ctx: &SessionContext,
@@ -10062,6 +10084,17 @@ async fn register_tables_for_query_batch(
             .map_err(|e| anyhow::anyhow!(e.msg));
     };
     register_selected_tables(ice, ctx, &tables, bindings).await
+}
+
+async fn register_tables_for_rewritten_query_batch(
+    ice: &siglake_storage::iceberg::IcebergContext,
+    ctx: &SessionContext,
+    query: &RewrittenQuery,
+) -> anyhow::Result<usize> {
+    if let Some(tables) = query.table_references.as_deref() {
+        return register_selected_tables(ice, ctx, tables, &query.attr_rewrite_bindings).await;
+    }
+    register_tables_for_query_batch(ice, ctx, &query.sql, &query.attr_rewrite_bindings).await
 }
 
 async fn register_selected_tables(
@@ -14320,14 +14353,9 @@ mod tests {
         );
 
         let ctx = SessionContext::new();
-        register_tables_for_query_with_bindings(
-            &ice,
-            &ctx,
-            &qualified.sql,
-            &qualified.attr_rewrite_bindings,
-        )
-        .await
-        .unwrap();
+        register_tables_for_rewritten_query(&ice, &ctx, &qualified)
+            .await
+            .unwrap();
         let all = ctx
             .sql("SELECT count(*) AS n FROM events")
             .await
@@ -14353,14 +14381,9 @@ mod tests {
             .unwrap();
         assert!(fallback.sql.contains("attr_get"), "{}", fallback.sql);
         let ctx = SessionContext::new();
-        register_tables_for_query_with_bindings(
-            &ice,
-            &ctx,
-            &fallback.sql,
-            &fallback.attr_rewrite_bindings,
-        )
-        .await
-        .unwrap();
+        register_tables_for_rewritten_query(&ice, &ctx, &fallback)
+            .await
+            .unwrap();
         crate::udfs::register_udfs(&ctx);
         let rows = ctx
             .sql(&fallback.sql)
@@ -14377,6 +14400,58 @@ mod tests {
                 .unwrap()
                 .value(0),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn rewritten_registration_uses_carried_references_and_keeps_unknown_table_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap();
+        ice.create_index(&logs_config(vec![])).await.unwrap();
+
+        let mut rewritten = apply_default_order_if_needed(
+            "WITH rows AS (SELECT * FROM events) \
+             SELECT * FROM rows JOIN logs ON true JOIN query_audit ON true",
+            false,
+            Priority::Interactive,
+            100,
+            None,
+        );
+        assert_eq!(
+            rewritten.table_references,
+            Some(vec!["events".into(), "logs".into(), "query_audit".into()])
+        );
+        // If registration reparses SQL this sentinel fails. The serving path
+        // must consume only the references carried from the final rewrite AST.
+        rewritten.sql = "this is deliberately not SQL".into();
+        let ctx = SessionContext::new();
+        assert_eq!(
+            register_tables_for_rewritten_query(&ice, &ctx, &rewritten)
+                .await
+                .unwrap(),
+            3
+        );
+        assert!(ctx.table_exist("events").unwrap());
+        assert!(ctx.table_exist("logs").unwrap());
+        assert!(ctx.table_exist("query_audit").unwrap());
+
+        let unknown = apply_default_order_if_needed(
+            "SELECT * FROM missing_index",
+            false,
+            Priority::Interactive,
+            100,
+            None,
+        );
+        let err = register_tables_for_rewritten_query(&ice, &SessionContext::new(), &unknown)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.msg.contains("unknown query table `missing_index`"),
+            "{}",
+            err.msg
         );
     }
 
@@ -17476,6 +17551,48 @@ mod tests {
     }
 
     #[test]
+    fn serving_rewrite_carries_final_statement_table_references() {
+        for (sql, expected) in [
+            (
+                "WITH errs AS (SELECT * FROM events) SELECT * FROM errs",
+                vec!["events"],
+            ),
+            (
+                "SELECT * FROM events WHERE EXISTS (SELECT 1 FROM nested_index)",
+                vec!["events", "nested_index"],
+            ),
+            (
+                "EXPLAIN SELECT * FROM events JOIN query_audit ON true",
+                vec!["events", "query_audit"],
+            ),
+            ("SELECT * FROM \"logs-bench\"", vec!["logs-bench"]),
+        ] {
+            let rewritten =
+                apply_default_order_if_needed(sql, false, Priority::Interactive, 100, None);
+            assert_eq!(
+                rewritten.table_references,
+                Some(expected.into_iter().map(str::to_string).collect()),
+                "{sql}"
+            );
+            assert_eq!(
+                rewritten.table_references,
+                referenced_tables(&rewritten.sql),
+                "carried references diverged from the final SQL: {}",
+                rewritten.sql
+            );
+        }
+    }
+
+    #[test]
+    fn serving_rewrite_preserves_registration_fallback_without_table_references() {
+        for sql in ["SELECT 1", "not sql at all", "SELECT 1; SELECT 2"] {
+            let rewritten =
+                apply_default_order_if_needed(sql, false, Priority::Interactive, 100, None);
+            assert_eq!(rewritten.table_references, None, "{sql}");
+        }
+    }
+
+    #[test]
     fn referenced_tables_excludes_cte_aliases() {
         let tables = referenced_tables(
             "WITH errs AS (SELECT * FROM events WHERE raw LIKE '%ERROR%') \
@@ -18033,6 +18150,142 @@ mod tests {
             .downcast_ref::<arrow_array::Int64Array>()
             .unwrap()
             .value(0)
+    }
+
+    /// Matched legacy-reparse/carried-reference measurement for registration
+    /// and the buffered local request. Both arms execute in the same release
+    /// binary, alternate order and assert identical rows. Run:
+    /// `cargo test -p siglake-query-server --lib --release \
+    ///    measure_rewritten_table_reference_reuse -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn measure_rewritten_table_reference_reuse() {
+        use std::time::Instant;
+
+        fn median(mut samples: Vec<u128>) -> u128 {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        ice.append_events(&[Event::now("measurement row")])
+            .await
+            .unwrap();
+        let state = AppState::new(Arc::clone(&ice), crate::AuthConfig::open());
+        let carried = apply_query_rewrites(
+            &ice,
+            "SELECT raw FROM events LIMIT 1",
+            false,
+            Priority::Interactive,
+            100,
+        )
+        .await
+        .unwrap();
+        assert_eq!(carried.table_references, Some(vec!["events".into()]));
+        let mut legacy = carried.clone();
+        legacy.table_references = None;
+
+        // Isolate the phase changed by this patch. Both arms register the
+        // same cached provider; only the legacy arm reparses SQL first.
+        let mut legacy_register = Vec::new();
+        let mut carried_register = Vec::new();
+        for i in 0..1001 {
+            let legacy_first = i % 2 == 0;
+            for use_carried in [!legacy_first, legacy_first] {
+                let ctx = SessionContext::new();
+                let started = Instant::now();
+                if use_carried {
+                    register_tables_for_rewritten_query(&ice, &ctx, &carried)
+                        .await
+                        .unwrap();
+                    carried_register.push(started.elapsed().as_nanos());
+                } else {
+                    register_tables_for_rewritten_query(&ice, &ctx, &legacy)
+                        .await
+                        .unwrap();
+                    legacy_register.push(started.elapsed().as_nanos());
+                }
+            }
+        }
+
+        let request = || SqlRequest {
+            query: "SELECT raw FROM events LIMIT 1".into(),
+            format: Some(QueryFormat::Records),
+            priority: Priority::Interactive,
+            default_order: false,
+            dry_run: false,
+            limits: RequestLimits::default(),
+            shard: None,
+            exact: true,
+        };
+        let run = |effective: RewrittenQuery| {
+            let state = state.clone();
+            let ice = Arc::clone(&ice);
+            let request = request();
+            async move {
+                let started = Instant::now();
+                let response = handle_local_inner(
+                    state,
+                    CallerIdentity::default(),
+                    request,
+                    Some(ice),
+                    Some(effective),
+                    None,
+                )
+                .await
+                .unwrap();
+                let elapsed = started.elapsed().as_nanos();
+                assert_eq!(response.headers()[RESULT_CACHE_HEADER], "off");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                (elapsed, body["rows"].clone())
+            }
+        };
+        let mut legacy_request = Vec::new();
+        let mut carried_request = Vec::new();
+        for i in 0..101 {
+            let legacy_first = i % 2 == 0;
+            let first = if legacy_first {
+                legacy.clone()
+            } else {
+                carried.clone()
+            };
+            let second = if legacy_first {
+                carried.clone()
+            } else {
+                legacy.clone()
+            };
+            let (first_ns, first_rows) = run(first).await;
+            let (second_ns, second_rows) = run(second).await;
+            assert_eq!(first_rows, second_rows);
+            if legacy_first {
+                legacy_request.push(first_ns);
+                carried_request.push(second_ns);
+            } else {
+                carried_request.push(first_ns);
+                legacy_request.push(second_ns);
+            }
+        }
+
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        eprintln!(
+            "REWRITTEN REFERENCES {profile} medians: register legacy={}ns carried={}ns; whole request legacy={}ns carried={}ns",
+            median(legacy_register),
+            median(carried_register),
+            median(legacy_request),
+            median(carried_request),
+        );
     }
 
     /// Phase 5 — measure the per-query overhead FLOOR that sits under every
@@ -18945,13 +19198,7 @@ async fn distributed_inner(
             .set_extension(std::sync::Arc::new(planning_execution_id));
         datafusion::prelude::SessionContext::new_with_state(st)
     };
-    register_tables_for_query_with_bindings(
-        &ice,
-        &planning,
-        &effective_query.sql,
-        &effective_query.attr_rewrite_bindings,
-    )
-    .await?;
+    register_tables_for_rewritten_query(&ice, &planning, &effective_query).await?;
     crate::udfs::register_udfs(&planning);
     // WS-6: a last_values()/distinct_values() query classifies as Local and runs
     // on this coordinator ctx, so its UDTFs must be registered here too.
@@ -20494,6 +20741,7 @@ mod batch_run_deadline_tests {
     fn count_query() -> RewrittenQuery {
         RewrittenQuery {
             sql: "SELECT count(*) AS n FROM events".to_string(),
+            table_references: Some(vec!["events".to_string()]),
             attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
@@ -20904,6 +21152,7 @@ mod batch_lifecycle_tests {
     fn lifecycle_query() -> RewrittenQuery {
         RewrittenQuery {
             sql: LIFECYCLE_SQL.to_string(),
+            table_references: Some(vec!["events".to_string()]),
             attr_rewrite_bindings: HashMap::new(),
             preferred_scan_order: None,
             ordered_limit: None,
