@@ -7,6 +7,7 @@ mod debug_memory_pool;
 mod depth_spike;
 mod distributed_e2e;
 mod e2e;
+mod empty_result_columns;
 mod fts_pruning;
 mod indexes;
 mod limits;

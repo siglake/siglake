@@ -1251,6 +1251,12 @@ pub struct CoordStats {
     /// Summed worker-side scan attribution (None when no shard reported it —
     /// in-process runners, Tier-1, or pre-upgrade workers).
     pub scan: Option<crate::format::ScanDetail>,
+    /// #7420: the schema of the COORDINATED query — the one the client sent,
+    /// not a shard's rewritten worker SQL — so a fan-out that merges to no
+    /// rows can still declare the columns it projected. The merged batches
+    /// carry it whenever there is at least one row; this is the only place it
+    /// survives an empty merge.
+    pub output_schema: Option<arrow::datatypes::SchemaRef>,
 }
 
 /// [`coordinate_with_extra`] plus per-query coordinator stats.
@@ -1317,6 +1323,7 @@ pub async fn coordinate_with_failover(
                 merge_micros: 0,
                 scan: run.scan,
                 totals: run.totals,
+                output_schema: Some(Arc::new(plan.schema().as_arrow().clone())),
             };
             return Ok((run.batches, stats));
         }
@@ -1442,6 +1449,7 @@ pub async fn coordinate_with_failover(
         shard_wall_micros,
         merge_micros: merge_started.elapsed().as_micros() as u64,
         scan,
+        output_schema: Some(Arc::new(plan.schema().as_arrow().clone())),
     };
     Ok((merged, stats))
 }

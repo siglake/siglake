@@ -48,7 +48,7 @@ use crate::cost::{estimate, extract_exact_time_bounds_from_expr, CostReport};
 use crate::error::ApiError;
 #[allow(unused_imports)] // referenced by the `#[utoipa::path]` response bodies
 use crate::format::RecordsResponse;
-use crate::format::{batches_to_records, NdjsonStream, QueryFormat};
+use crate::format::{NdjsonStream, QueryFormat};
 use crate::jobs::{CompletionOutcome, JobStatus};
 use crate::limits::{Priority, RequestLimits, ResolvedLimits};
 #[allow(unused_imports)]
@@ -6856,6 +6856,10 @@ async fn run_batch_query_in(
         }
     }
 
+    // #7420: captured before `collect_with_row_caps` consumes the DataFrame,
+    // so a job whose query matched nothing still reports the columns it
+    // projected when `/jobs/<id>/result` serves the body.
+    let output_schema = Arc::new(df.schema().as_arrow().clone());
     let collect_fut = async {
         // BOUNDED, both ways. This was `df.collect()`, which accumulates the
         // entire result into an unaccounted `Vec<RecordBatch>` — outside the
@@ -6897,8 +6901,12 @@ async fn run_batch_query_in(
                 anyhow::bail!("batch collect reported a refusing accumulation bound")
             }
         };
-        let mut body = crate::format::batches_to_records(&batches, Some(max_rows))
-            .context("render records")?;
+        let mut body = crate::format::batches_to_records_with_schema(
+            &batches,
+            Some(max_rows),
+            Some(output_schema.as_ref()),
+        )
+        .context("render records")?;
         body.cost = Some(cost.clone());
         Ok::<_, anyhow::Error>(body)
     };
@@ -11640,8 +11648,15 @@ async fn render_records(
     record_runtime_metrics("sql", "records", &runtime);
 
     let render_started = Instant::now();
-    let mut body = batches_to_records(&batches, Some(resolved.max_rows_returned))
-        .map_err(ApiError::internal)?;
+    // #7420: the executed plan's schema is what the caller asked for (aliases,
+    // projection order). It only takes effect when the collect returned no
+    // batches at all; otherwise the batch schema answers, as before.
+    let mut body = crate::format::batches_to_records_with_schema(
+        &batches,
+        Some(resolved.max_rows_returned),
+        Some(plan.schema().as_ref()),
+    )
+    .map_err(ApiError::internal)?;
     let render_elapsed = render_started.elapsed();
     record_phase_metric("sql", "render_records", render_elapsed);
     body.cost = cost;
@@ -19182,8 +19197,15 @@ async fn distributed_inner(
             }
             QueryFormat::Records => {
                 let render_started = Instant::now();
-                let mut body = batches_to_records(&batches, Some(resolved.max_rows_returned))
-                    .map_err(ApiError::internal)?;
+                // #7420: the coordinator's own plan schema, which is the
+                // client's query — never a shard partial's, whose columns a
+                // rewritten worker SQL may rename or add to.
+                let mut body = crate::format::batches_to_records_with_schema(
+                    &batches,
+                    Some(resolved.max_rows_returned),
+                    coord_stats.output_schema.as_deref(),
+                )
+                .map_err(ApiError::internal)?;
                 body.cost = Some(cost.clone());
                 // #85: coordinator-side attribution — plan/classify, the
                 // buffer partial, each shard's wall (fan-out is concurrent,
@@ -19427,7 +19449,9 @@ mod distributed_buffer_generation_tests {
                 .unwrap();
         }
         let expected = reference.sql(&sql).await.unwrap().collect().await.unwrap();
-        let expected = batches_to_records(&expected, None).unwrap().rows;
+        let expected = crate::format::batches_to_records(&expected, None)
+            .unwrap()
+            .rows;
         let normalize = |rows: &serde_json::Value| {
             let mut rows: Vec<_> = rows
                 .as_array()
