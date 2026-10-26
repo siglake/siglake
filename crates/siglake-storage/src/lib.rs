@@ -86,6 +86,15 @@ pub struct QueryScanTuning {
     /// measurement fixture. Shipped policy stays drained-scan-only — see
     /// `docs/DESIGN_row_group_decoded_cache_qualification.md`.
     pub file_cache_row_group_prototype: bool,
+    /// #7457 LOCAL ATTRIBUTION CONTROL: hold DataFusion's residual filter and
+    /// scan projection fixed while varying whether the Iceberg reader also
+    /// receives the converted predicate.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. Production uses [`PredicatePushdownControl::Production`];
+    /// the other modes exist only for the immutable-layout measurement in
+    /// `clipped_equality_pushdown_attribution.rs`.
+    pub predicate_pushdown_control: PredicatePushdownControl,
     /// #4905 LOCAL QUALIFICATION PROTOTYPE: admit a fully drained read under a
     /// converted predicate, keyed by that predicate in addition to the shipped
     /// file/projection/delete/range/direction identity.
@@ -119,6 +128,24 @@ pub struct QueryScanTuning {
     /// remain aggregate-only while the representation is qualified in
     /// `docs/DESIGN_row_group_decoded_cache_qualification.md`.
     pub file_attribution_prototype: bool,
+}
+
+/// Test-only control for attributing reader predicate costs without changing
+/// the SQL predicate, residual filter or scan projection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PredicatePushdownControl {
+    /// Shipped filter-pushdown policy.
+    #[default]
+    Production,
+    /// Pass the converted predicate to the reader but report it as inexact so
+    /// DataFusion also evaluates the residual filter.
+    RetainResidual,
+    /// Keep the converted reader predicate and residual filter while disabling
+    /// only page-index `RowSelection` in the reader.
+    RetainResidualWithoutRowSelection,
+    /// Report the predicate as inexact but omit it from the Iceberg file task;
+    /// the unchanged residual filter remains authoritative for exact answers.
+    SuppressReaderPredicate,
 }
 
 /// Effective process-wide read-cache configuration.
