@@ -637,6 +637,24 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
 /// shared channel with eager limit termination, so this attributes only their
 /// combined effect. The result is unordered by contract, so exactness is
 /// cardinality, predicate membership and distinct source rows.
+///
+/// Graded at the MEDIAN of seven pairs, for the reason the admission A/B above
+/// gives: all three counters this compares — `files_read`, `object_store_reads`
+/// and `bytes_scanned` — move when a partition wins a scheduling race with the
+/// root stream closing, because a file counts as read the moment its footer
+/// lands. A single pair grades that race. The original single-pair form, which
+/// asserted the bounded arm read exactly one file, passed on an idle lane and
+/// went red on the gate with both arms at two files (#7458 run 3230); running
+/// the whole target reproduces it locally, and one such draw put the bounded
+/// arm at four files against the control's three. The medians do not move: on
+/// an idle lane and with 24 spinners against 32 cores, every pair measured
+/// bounded 1 file / 4 reads / 1,687,906 bytes against control 2 / 7 /
+/// 3,349,138. With the production coalescer taken out of BOTH arms the medians
+/// are equal and the assertion fails, so the shape still grades the mechanism.
+///
+/// `decoded_bytes` is equal in both arms by assertion: this fixture answers
+/// the limit from one source batch, so the repair moves footer fetches and
+/// reader starts, not decoded work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;

@@ -278,6 +278,18 @@ for the standard arm and 5.45 ms for the replacement on the first execution;
 the final focused passing execution measured 7.86 ms and 4.11 ms with the same
 work counters. The physical-read counters, rather than these local timing pairs,
 are the regression oracle.
+
+Those counters are a scheduling race, so the gate grades them at the median of
+seven interleaved pairs with the arm order alternating, the same shape as the
+admission A/B above. The single-pair form this paragraph reports passed on an
+idle lane and went red on the gate with both arms at two files read (#7458, run
+3230), and one local draw under the whole target put the bounded arm at four
+files against the control's three. Seven-pair medians held at bounded 1 file,
+4 object-store reads and 1,687,906 bytes against control 2, 7 and 3,349,138,
+both on an idle lane and with 24 spinners against 32 cores. Taking the
+production coalescer out of both arms leaves the medians equal and fails the
+assertion.
+
 This evidence supports the combined buffering and eager-termination repair; it
 does not support the earlier decoded-work attribution, a capacity-only cause,
 or a local or AWS latency guarantee. The unchanged matched field qualification
