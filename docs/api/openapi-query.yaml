@@ -1269,6 +1269,19 @@ paths:
       responses:
         "200":
           description: Result rows.
+          headers:
+            x-siglake-handler-micros:
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
+              description: Handler wall time for this result fetch.
+            x-siglake-result-cache:
+              schema:
+                type: string
+              description: >-
+                Always off for a persisted job result; the body's phases belong to its original
+                execution.
           content:
             application/json:
               schema:
@@ -1347,6 +1360,17 @@ paths:
       responses:
         "200":
           description: "Success. Normally result rows (`RecordsResponse`); a `dry_run` request returns only the `CostReport` instead. When the request asks for `format: \"ndjson\"` the body is `application/x-ndjson` — one JSON object per line, streamed, with a trailing `{\"_meta\": ...}` line if the result was cut short or execution failed after the 200 response started. An error trailer carries `code` and `error`; a pool-refusal trailer also carries `retry_after_secs`."
+          headers:
+            x-siglake-handler-micros:
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
+              description: Handler wall time for this buffered response; omitted for streamed NDJSON.
+            x-siglake-result-cache:
+              schema:
+                type: string
+              description: "Serving request cache outcome: hit, miss, insert, or off; omitted for streamed NDJSON."
           content:
             application/json:
               schema:
@@ -1453,6 +1477,17 @@ paths:
       responses:
         "200":
           description: "Merged result rows, or NDJSON when the request asked for `format: \"ndjson\"`."
+          headers:
+            x-siglake-handler-micros:
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
+              description: Handler wall time for this buffered response; omitted for streamed NDJSON.
+            x-siglake-result-cache:
+              schema:
+                type: string
+              description: "Serving request cache outcome: hit, miss, insert, or off; omitted for streamed NDJSON."
           content:
             application/json:
               schema:
@@ -1607,6 +1642,17 @@ paths:
       responses:
         "200":
           description: "Success. Result rows, the `CostReport` for a `dry_run`, or an `application/x-ndjson` stream for `format: \"ndjson\"`. If execution fails after that stream's 200 response starts, its final line is an `_meta: \"error\"` trailer with `code` and `error`; a pool refusal also carries `retry_after_secs`."
+          headers:
+            x-siglake-handler-micros:
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
+              description: Handler wall time for this buffered response; omitted for streamed NDJSON.
+            x-siglake-result-cache:
+              schema:
+                type: string
+              description: "Serving request cache outcome: hit, miss, insert, or off; omitted for streamed NDJSON."
           content:
             application/json:
               schema:
@@ -2697,6 +2743,24 @@ components:
           oneOf:
           - type: "null"
           - $ref: "#/components/schemas/DistPhaseStats"
+        execution_micros:
+          type:
+          - integer
+          - "null"
+          format: int64
+          description: |-
+            Executing request's handler clock when this response body was sealed.
+            Replayed bodies retain the filling execution's value.
+          minimum: 0
+        other_micros:
+          type:
+          - integer
+          - "null"
+          format: int64
+          description: |-
+            Portion of `execution_micros` not covered by the named phases in this
+            block. Computed by the server with saturating subtraction.
+          minimum: 0
         plan_micros:
           type: integer
           format: int64

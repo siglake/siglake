@@ -120,6 +120,25 @@ async fn distributed_query_over_http_matches_single_pod() {
                 "{body}"
             );
             assert_eq!(body["stats"]["spill_bytes"], 0, "{body}");
+            let phases = &body["stats"]["phases"];
+            assert_eq!(phases["collect_micros"], 0, "{body}");
+            let dist = &phases["distributed"];
+            let shard_max = dist["shard_wall_micros"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|wall| wall.as_u64().unwrap())
+                .max()
+                .unwrap();
+            let named = phases["plan_micros"].as_u64().unwrap()
+                + phases["buffer_delta_micros"].as_u64().unwrap()
+                + phases["render_micros"].as_u64().unwrap()
+                + shard_max
+                + dist["merge_micros"].as_u64().unwrap();
+            let execution = phases["execution_micros"].as_u64().unwrap();
+            let other = phases["other_micros"].as_u64().unwrap();
+            assert!(named <= execution, "named phases exceed execution: {body}");
+            assert_eq!(other + named, execution, "{body}");
             assert_eq!(
                 body["stats"]["phases"]["distributed"]["shard_wall_micros"]
                     .as_array()
