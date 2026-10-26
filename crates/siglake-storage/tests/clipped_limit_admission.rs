@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -133,6 +134,56 @@ fn scan_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
         {
             out.push(node.clone());
         }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NodeOutputRows {
+    name: String,
+    partitions: Vec<(usize, usize)>,
+    evaluated_rows: Vec<(usize, usize)>,
+}
+
+impl NodeOutputRows {
+    fn total(&self) -> usize {
+        self.partitions.iter().map(|(_, rows)| rows).sum()
+    }
+}
+
+/// Read `output_rows` without aggregating operators together. DataFusion keeps
+/// one counter per output partition, so this also distinguishes a node's fetch
+/// from work that ran ahead in another partition.
+fn node_output_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<NodeOutputRows> {
+    let mut out = Vec::new();
+    plan.apply(|node| {
+        let mut partitions = Vec::new();
+        let mut evaluated_rows = Vec::new();
+        if let Some(metrics) = node.metrics() {
+            for metric in metrics.iter() {
+                match metric.value() {
+                    MetricValue::OutputRows(_) => partitions.push((
+                        metric.partition().expect("output metric partition"),
+                        metric.value().as_usize(),
+                    )),
+                    MetricValue::Ratio {
+                        name,
+                        ratio_metrics,
+                    } if name == "selectivity" => evaluated_rows.push((
+                        metric.partition().expect("selectivity metric partition"),
+                        ratio_metrics.total(),
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        out.push(NodeOutputRows {
+            name: node.name().to_string(),
+            partitions,
+            evaluated_rows,
+        });
         Ok(TreeNodeRecursion::Continue)
     })
     .unwrap();
@@ -287,6 +338,66 @@ fn replace_clipped_coalescer_with_standard(
     assert_eq!(children.len(), 1, "clipped coalescer must have one child");
     let standard = CoalescePartitionsExec::new(children[0].clone()).with_fetch(plan.fetch());
     (Arc::new(standard), replacements + 1)
+}
+
+/// One bounded/control pair of the #7341 A/B: plan both arms from their own
+/// session, replace the control's clipped coalescer, then drain them in the
+/// order the caller picked. `check_shape` runs the one-time plan assertions,
+/// which are the same for every pair.
+async fn run_backpressure_pair(
+    bounded_ctx: &SessionContext,
+    control_ctx: &SessionContext,
+    sql: &str,
+    limit: usize,
+    bounded_first: bool,
+    check_shape: bool,
+) -> (Run, Run) {
+    let bounded_planning_started = std::time::Instant::now();
+    let bounded_plan = bounded_ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let bounded_planning = bounded_planning_started.elapsed();
+    let control_planning_started = std::time::Instant::now();
+    let production_control_plan = control_ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let control_planning = control_planning_started.elapsed();
+    let (control_plan, replacements) =
+        replace_clipped_coalescer_with_standard(production_control_plan);
+    if check_shape {
+        assert_eq!(replacements, 1, "control must replace exactly one node");
+        assert_eq!(bounded_plan.name(), "ClippedLimitCoalesceExec");
+        assert_eq!(control_plan.name(), "CoalescePartitionsExec");
+        assert_eq!(bounded_plan.fetch(), control_plan.fetch());
+        assert_eq!(bounded_plan.fetch(), Some(limit));
+        assert_eq!(
+            datafusion::physical_plan::displayable(bounded_plan.children()[0].as_ref())
+                .indent(false)
+                .to_string(),
+            datafusion::physical_plan::displayable(control_plan.children()[0].as_ref())
+                .indent(false)
+                .to_string(),
+            "the arms must have identical physical plans below the coalescer"
+        );
+    }
+
+    if bounded_first {
+        let bounded = run_planned_arm(bounded_ctx, bounded_plan, bounded_planning, "raw").await;
+        let control = run_planned_arm(control_ctx, control_plan, control_planning, "raw").await;
+        (bounded, control)
+    } else {
+        let control = run_planned_arm(control_ctx, control_plan, control_planning, "raw").await;
+        let bounded = run_planned_arm(bounded_ctx, bounded_plan, bounded_planning, "raw").await;
+        (bounded, control)
+    }
 }
 
 /// Scheduler-free #7000 arm: visit ticket-ordered groups one at a time until
@@ -577,12 +688,32 @@ async fn the_admission_ramp_stops_every_partition_decoding_for_a_clipped_limit()
 /// shared channel with eager limit termination, so this attributes only their
 /// combined effect. The result is unordered by contract, so exactness is
 /// cardinality, predicate membership and distinct source rows.
+///
+/// Graded at the MEDIAN of seven pairs, for the reason the admission A/B above
+/// gives: all three counters this compares — `files_read`, `object_store_reads`
+/// and `bytes_scanned` — move when a partition wins a scheduling race with the
+/// root stream closing, because a file counts as read the moment its footer
+/// lands. A single pair grades that race. The original single-pair form, which
+/// asserted the bounded arm read exactly one file, passed on an idle lane and
+/// went red on the gate with both arms at two files (#7458 run 3230); running
+/// the whole target reproduces it locally, and one such draw put the bounded
+/// arm at four files against the control's three. The medians do not move: on
+/// an idle lane and with 24 spinners against 32 cores, every pair measured
+/// bounded 1 file / 4 reads / 1,687,906 bytes against control 2 / 7 /
+/// 3,349,138. With the production coalescer taken out of BOTH arms the medians
+/// are equal and the assertion fails, so the shape still grades the mechanism.
+///
+/// `decoded_bytes` is equal in both arms by assertion: this fixture answers
+/// the limit from one source batch, so the repair moves footer fetches and
+/// reader starts, not decoded work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
 
     const LIMIT: usize = 100;
     const DENSE_ROWS_PER_FILE: usize = 20_000;
+    // Odd, so the median is a pair that was actually measured.
+    const PAIRS: usize = 7;
 
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
@@ -594,78 +725,187 @@ async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
     let control_ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
     ice.register_with_datafusion(&control_ctx).await.unwrap();
 
-    let bounded_planning_started = std::time::Instant::now();
-    let bounded_plan = bounded_ctx
-        .sql(&sql)
-        .await
-        .unwrap()
-        .create_physical_plan()
-        .await
-        .unwrap();
-    let bounded_planning = bounded_planning_started.elapsed();
-    let control_planning_started = std::time::Instant::now();
-    let production_control_plan = control_ctx
-        .sql(&sql)
-        .await
-        .unwrap()
-        .create_physical_plan()
-        .await
-        .unwrap();
-    let control_planning = control_planning_started.elapsed();
-    let (control_plan, replacements) =
-        replace_clipped_coalescer_with_standard(production_control_plan);
-    assert_eq!(replacements, 1, "control must replace exactly one node");
-    assert_eq!(bounded_plan.name(), "ClippedLimitCoalesceExec");
-    assert_eq!(control_plan.name(), "CoalescePartitionsExec");
-    assert_eq!(bounded_plan.fetch(), control_plan.fetch());
-    assert_eq!(bounded_plan.fetch(), Some(LIMIT));
-    assert_eq!(
-        datafusion::physical_plan::displayable(bounded_plan.children()[0].as_ref())
-            .indent(false)
-            .to_string(),
-        datafusion::physical_plan::displayable(control_plan.children()[0].as_ref())
-            .indent(false)
-            .to_string(),
-        "the arms must have identical physical plans below the coalescer"
-    );
-
-    let control = run_planned_arm(&control_ctx, control_plan, control_planning, "raw").await;
-    let bounded = run_planned_arm(&bounded_ctx, bounded_plan, bounded_planning, "raw").await;
-    eprintln!(
-        "CLIPPED-BACKPRESSURE-SAME-WAVE2 control={:?} drain={:?} bounded={:?} drain={:?}",
-        control.work, control.drain, bounded.work, bounded.drain
-    );
-
-    for (name, run) in [("bounded", &bounded), ("control", &control)] {
-        assert_eq!(run.rows.len(), LIMIT, "{name} must fill the limit");
-        assert_all_qualify(&run.rows, &sql);
-        assert_eq!(
-            run.rows.iter().collect::<HashSet<_>>().len(),
+    let mut pairs: Vec<(Work, Work)> = Vec::new();
+    for pair in 0..PAIRS {
+        let bounded_first = pair % 2 == 0;
+        let (bounded, control) = run_backpressure_pair(
+            &bounded_ctx,
+            &control_ctx,
+            &sql,
             LIMIT,
-            "{name} must return distinct source rows"
+            bounded_first,
+            pair == 0,
+        )
+        .await;
+        eprintln!(
+            "CLIPPED-BACKPRESSURE-SAME-WAVE2 pair={pair} bounded_first={bounded_first} \
+             bounded={:?} drain={:?} control={:?} drain={:?}",
+            bounded.work, bounded.drain, control.work, control.drain
+        );
+
+        for (name, run) in [("bounded", &bounded), ("control", &control)] {
+            assert_eq!(run.rows.len(), LIMIT, "{name} must fill the limit");
+            assert_all_qualify(&run.rows, &sql);
+            assert_eq!(
+                run.rows.iter().collect::<HashSet<_>>().len(),
+                LIMIT,
+                "{name} must return distinct source rows"
+            );
+        }
+        assert_eq!(bounded.work.partitions, control.work.partitions);
+        assert_eq!(
+            bounded.work.decoded_bytes, control.work.decoded_bytes,
+            "the isolated fixture does not support a decoded-work reduction claim"
+        );
+        pairs.push((bounded.work, control.work));
+    }
+
+    let median = |mut xs: Vec<usize>| {
+        xs.sort_unstable();
+        xs[xs.len() / 2]
+    };
+    let medians = |f: fn(&Work) -> usize| {
+        (
+            median(pairs.iter().map(|(b, _)| f(b)).collect()),
+            median(pairs.iter().map(|(_, c)| f(c)).collect()),
+        )
+    };
+    let (bounded_files, control_files) = medians(|w| w.files_read);
+    let (bounded_reads, control_reads) = medians(|w| w.object_store_reads);
+    let (bounded_bytes, control_bytes) = medians(|w| w.bytes_scanned);
+    eprintln!(
+        "CLIPPED-BACKPRESSURE-SAME-WAVE2 pairs={PAIRS} median files_read bounded={bounded_files} \
+         control={control_files} median object_store_reads bounded={bounded_reads} \
+         control={control_reads} median bytes_scanned bounded={bounded_bytes} \
+         control={control_bytes} per pair {pairs:?}"
+    );
+    assert!(
+        control_files > 1,
+        "the control no longer reproduces the avoidable reader start this test exists for: \
+         per pair {pairs:?}"
+    );
+    assert!(
+        bounded_files < control_files
+            && bounded_reads < control_reads
+            && bounded_bytes * 3 <= control_bytes * 2,
+        "bounded buffering plus eager limit termination must reduce early physical reads at the \
+         median of {PAIRS} pairs: bounded files {bounded_files} reads {bounded_reads} bytes \
+         {bounded_bytes}, control files {control_files} reads {control_reads} bytes \
+         {control_bytes}"
+    );
+}
+
+/// #7458: `sql execution profile` adds every plan node's `output_rows` before
+/// comparing that sum with the scan leaf. Read the same clipped physical shape
+/// one node and partition at a time so an 8,192-row repartition batch cannot be
+/// mistaken for rows emitted by the filter above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clipped_limit_output_metrics_separate_runahead_from_emitted_rows() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 100;
+    const DENSE_ROWS_PER_FILE: usize = 20_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    // Fifteen input file groups against sixteen target partitions reproduces
+    // the candidate plan's RoundRobinBatch(16) node between scan and filter.
+    for file in 0..15 {
+        let events: Vec<Event> = (0..DENSE_ROWS_PER_FILE)
+            .map(|row| Event::now(payload(file, row, true)))
+            .collect();
+        ice.append_events(&events).await.unwrap();
+    }
+
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let expected_shape = [
+        "ClippedLimitCoalesceExec",
+        "FilterExec",
+        "RepartitionExec",
+        "SiglakeIcebergTableScan",
+    ];
+    let actual_shape: Vec<_> = node_output_rows(&plan)
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+    assert_eq!(actual_shape, expected_shape);
+
+    let run = run_planned_arm(&ctx, plan.clone(), Duration::ZERO, "raw").await;
+    assert_eq!(run.rows.len(), LIMIT);
+    assert_all_qualify(&run.rows, &sql);
+
+    let rows = node_output_rows(&plan);
+    eprintln!("CLIPPED-LIMIT-OUTPUT-ROWS {rows:?} work={:?}", run.work);
+    assert_eq!(
+        rows[0].total(),
+        LIMIT,
+        "the final limit must emit its fetch"
+    );
+    assert!(
+        rows[1]
+            .partitions
+            .iter()
+            .all(|(_, output_rows)| *output_rows <= LIMIT),
+        "FilterExec's per-partition fetch must be respected: {:?}",
+        rows[1]
+    );
+    let contributing_filters: BTreeSet<_> = rows[1]
+        .partitions
+        .iter()
+        .filter_map(|(partition, output_rows)| (*output_rows > 0).then_some(*partition))
+        .collect();
+    let contributing_repartitions: BTreeSet<_> = rows[2]
+        .partitions
+        .iter()
+        .filter_map(|(partition, output_rows)| (*output_rows > 0).then_some(*partition))
+        .collect();
+    assert!(!contributing_filters.is_empty());
+    assert_eq!(contributing_filters, contributing_repartitions);
+    for partition in &contributing_filters {
+        assert_eq!(
+            rows[1]
+                .partitions
+                .iter()
+                .find(|(candidate, _)| candidate == partition)
+                .map(|(_, output_rows)| *output_rows),
+            Some(LIMIT),
+            "each contributing filter emits its fetch"
+        );
+        assert_eq!(
+            rows[1]
+                .evaluated_rows
+                .iter()
+                .find(|(candidate, _)| candidate == partition)
+                .map(|(_, input_rows)| *input_rows),
+            Some(8_192),
+            "the filter evaluates one coalesced repartition batch"
+        );
+        assert_eq!(
+            rows[2]
+                .partitions
+                .iter()
+                .find(|(candidate, _)| candidate == partition)
+                .map(|(_, output_rows)| *output_rows),
+            Some(8_192),
+            "the repartition emits one coalesced batch"
         );
     }
-    assert_eq!(bounded.work.partitions, control.work.partitions);
-    assert_eq!(
-        bounded.work.files_read, 1,
-        "the replacement must finish from the first admitted reader: {:?}",
-        bounded.work
-    );
+
+    let contributors = contributing_filters.len();
+    let non_leaf_rows = rows[0].total() + rows[1].total() + rows[2].total();
+    assert_eq!(non_leaf_rows, LIMIT + contributors * (8_192 + LIMIT));
     assert!(
-        control.work.files_read > bounded.work.files_read,
-        "the same-wave standard coalescer must reproduce avoidable reader start: {:?}",
-        control.work
-    );
-    assert_eq!(
-        bounded.work.decoded_bytes, control.work.decoded_bytes,
-        "the isolated fixture does not support a decoded-work reduction claim"
-    );
-    assert!(
-        bounded.work.object_store_reads < control.work.object_store_reads
-            && bounded.work.bytes_scanned * 3 <= control.work.bytes_scanned * 2,
-        "bounded buffering plus eager limit termination must reduce early physical reads: bounded {:?}, control {:?}",
-        bounded.work,
-        control.work
+        rows[3].total() >= rows[2].total(),
+        "the settled scan cannot emit fewer rows than repartition reports downstream"
     );
 }
 

@@ -220,6 +220,7 @@ version = "1.7"
 
 [dependencies.zstd]
 version = "0.13.3"
+default-features = false
 
 [dev-dependencies.expect-test]
 version = "1"

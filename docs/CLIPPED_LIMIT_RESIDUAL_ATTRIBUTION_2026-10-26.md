@@ -198,6 +198,53 @@ into the scan, where the first does not. `keyword_and_label` carries the same
 pushdown and sits at 85.63 ms against a 100 ms ceiling, so this cost is inside
 the round's passing rows rather than its failing ones. It is unexplained here.
 
+## The 8,292-row term is summed operator throughput
+
+The raw candidate records correct the earlier arithmetic premise. They include
+the final limit's 100 rows once, then 8,292 for each contributing partition:
+
+| execution | `df_output_rows` | `leaf_rows_scanned` | difference |
+| ---: | ---: | ---: | ---: |
+| 336 | 403,205 | 361,645 | 41,560 = 100 + 5 × 8,292 |
+| 338 | 426,457 | 409,773 | 16,684 = 100 + 2 × 8,292 |
+| 346 | 373,109 | 364,717 | 8,392 = 100 + 1 × 8,292 |
+
+These are `sql execution profile` records in the retained candidate
+`query-server.log`. The prior claim that the raw difference was an exact
+multiple of 8,292 omitted the root's 100 rows.
+
+`clipped_limit_output_metrics_separate_runahead_from_emitted_rows` reproduces
+the retained four-node shape over fifteen local files and reads each node's
+per-partition `output_rows` directly. A focused execution had two contributing
+partitions:
+
+| node | per-partition rows | aggregate rows |
+| --- | --- | ---: |
+| `ClippedLimitCoalesceExec` | partition 0: 100 | 100 |
+| `FilterExec: fetch=100` | two partitions: 100 each | 200 |
+| `RepartitionExec: RoundRobinBatch(16)` | the same two: 8,192 each | 16,384 |
+| `SiglakeIcebergTableScan` | 15 partitions: 16,384–20,000 | 276,736 |
+
+The two non-leaf partitions therefore add
+`2 × (8,192 + 100)`, and the final limit adds 100 once. DataFusion's
+repartition receiver coalesces its downstream output to the configured 8,192
+row batch size. Each filter partition evaluates that 8,192-row batch, applies
+its own pushed fetch, and emits 100. The root accepts one of those filtered
+batches, slices it to its global remaining fetch, drops the coalesced input and
+emits 100. The other filtered batch can win the sender race before that drop;
+it is operator throughput rather than another result batch.
+
+The settled scan's 276,736 rows show upstream work that had already run before
+the cancellation reached its producers. Those leaf rows were emitted by the
+scan; they are separate from the 16,384 rows the repartition emitted to polled
+filter partitions, the 16,384 rows those filters evaluated, and the 200 rows
+the filters emitted. `df_output_rows` adds all four stages, so subtracting its
+leaf term does not measure unique rows, predicate evaluations or result rows.
+
+The fixture finds no per-partition fetch violation. No LIMIT-termination repair
+follows from the 8,292 pattern; the existing admission, coalescer and release
+thresholds stay unchanged.
+
 ## Not established
 
 - That the ceilings are reachable on this layout. The 10 ms figures come from
@@ -212,16 +259,6 @@ the round's passing rows rather than its failing ones. It is unexplained here.
   remaining 0.86 / 0.90 ms is the header's own wider span, which includes
   request-body receipt off the socket. See
   `docs/SQL_PHASE_ACCOUNTING_2026-10-26.md`.
-- Why the coalescer does not complete once one partition has supplied the
-  fetch. Over every clipped execution in the candidate capture,
-  `df_output_rows − leaf_rows_scanned` is an exact integer multiple of
-  8,292 = 8,192 + 100, and the multiple never exceeds 16, the repartition's
-  output-partition count (1–16 on the `match_terms` shapes, 1–15 on
-  `substring`, 1 on `region = 'us-east-2' AND …`). A clipped partition that
-  contributes therefore appears to emit one full `batch_size` of filtered rows
-  plus the fetch, not the fetch. The retained artifacts do not settle that
-  against the `FilterExec: …, fetch=100` the plan shows, and no EXPLAIN ANALYZE
-  was retained.
 - Any AWS latency a source change would produce. Source fixtures do not
   establish it and no run was made.
 

@@ -278,10 +278,51 @@ for the standard arm and 5.45 ms for the replacement on the first execution;
 the final focused passing execution measured 7.86 ms and 4.11 ms with the same
 work counters. The physical-read counters, rather than these local timing pairs,
 are the regression oracle.
+
+Those counters are a scheduling race, so the gate grades them at the median of
+seven interleaved pairs with the arm order alternating, the same shape as the
+admission A/B above. The single-pair form this paragraph reports passed on an
+idle lane and went red on the gate with both arms at two files read (#7458, run
+3230), and one local draw under the whole target put the bounded arm at four
+files against the control's three. Seven-pair medians held at bounded 1 file,
+4 object-store reads and 1,687,906 bytes against control 2, 7 and 3,349,138,
+both on an idle lane and with 24 spinners against 32 cores. Taking the
+production coalescer out of both arms leaves the medians equal and fails the
+assertion.
+
 This evidence supports the combined buffering and eager-termination repair; it
 does not support the earlier decoded-work attribution, a capacity-only cause,
 or a local or AWS latency guarantee. The unchanged matched field qualification
 remains required.
+
+## Per-node LIMIT metrics (#7458)
+
+The 2026-10-26 candidate profile's `df_output_rows` is the sum of
+`output_rows` from every physical operator. Its four-node clipped plan is
+`ClippedLimitCoalesceExec → FilterExec → RepartitionExec → scan`; subtracting
+the scan leaf still leaves three different stages in the value.
+
+The retained log's raw difference is `100 + n × 8,292`, despite the original
+report calling it an exact multiple of 8,292. Execution 338, for example,
+reports 426,457 total rows and 409,773 leaf rows: 16,684, or
+`100 + 2 × (8,192 + 100)`.
+
+`clipped_limit_output_metrics_separate_runahead_from_emitted_rows` builds the
+same node shape with fifteen files and sixteen target partitions. It reads
+each node's metrics by partition after the scan workers settle. Every
+contributing repartition partition emits one 8,192-row coalesced batch; the
+corresponding filter evaluates those 8,192 rows and emits at most its 100-row
+fetch; the clipped coalescer emits the global 100 rows once and drops its
+input. A focused run had two contributing partitions, so its non-leaf total
+was 16,684 rows. The scan had already emitted 276,736 rows across its fifteen
+partitions before cancellation settled.
+
+The 8,292 term is therefore two metrics added together: 8,192 rows emitted by
+the repartition and 100 emitted by that partition's filter. It does not show a
+filter emitting 8,292 rows or ignoring its fetch. Scan output is upstream
+run-ahead, filter selectivity's denominator is rows evaluated, and root output
+is rows returned; the aggregate must not substitute for any of those counts.
+No repair or threshold change follows from this metric pattern.
 
 ## Local measurement
 
