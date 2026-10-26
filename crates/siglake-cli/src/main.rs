@@ -835,7 +835,10 @@ enum Command {
         /// Iceberg catalog URI. See `ingest-server --catalog-uri`.
         #[arg(long, env = "SIGLAKE_CATALOG_URI")]
         catalog_uri: Option<String>,
-        /// Process the currently-sealed segments and exit.
+        /// Run one compactor pass and exit. The default commit-batch gate can
+        /// leave a sealed queue below 32 MiB uncommitted until its oldest
+        /// segment is 10 seconds old, so a successful pass can report zero.
+        /// Set `SIGLAKE_COMMIT_BATCH_TARGET_MB=0` to drain without that gate.
         #[arg(long, default_value_t = false)]
         once: bool,
         /// Polling interval (seconds) when running as a daemon.
@@ -5900,6 +5903,23 @@ mod default_policy_tests {
             commit_batch_cfg_from(Some("0"), None).is_none(),
             "TARGET_MB=0 must opt out to commit-per-segment"
         );
+    }
+
+    #[test]
+    fn compactor_once_help_names_the_batch_hold_and_opt_out() {
+        use clap::CommandFactory as _;
+
+        let mut command = Cli::command();
+        let compactor = command
+            .find_subcommand_mut("compactor")
+            .expect("compactor subcommand");
+        let help = compactor.render_long_help().to_string();
+        assert!(
+            help.contains("sealed queue below 32 MiB uncommitted"),
+            "{help}"
+        );
+        assert!(help.contains("segment is 10 seconds old"), "{help}");
+        assert!(help.contains("SIGLAKE_COMMIT_BATCH_TARGET_MB=0"), "{help}");
     }
 
     #[test]
