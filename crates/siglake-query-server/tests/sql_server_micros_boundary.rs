@@ -9,8 +9,9 @@
 //! writes charges the gap between them to the header and to nothing else.
 //!
 //! This drives the server over a real loopback socket and splits the body
-//! write from the head write by a known delay. If the gap were handler work
-//! the delay could not move it.
+//! write from the head write by a known delay. An HTTP `100 Continue`
+//! acknowledgement synchronizes the delay after the middleware has started.
+//! If the gap were handler work the delay could not move it.
 //!
 //! One test function in its own binary: the tracing subscriber is
 //! process-global and the test reads the whole captured log.
@@ -89,12 +90,14 @@ fn loopback_available() -> bool {
     ok
 }
 
-/// POST the query, writing the body `delay` after the head. Returns the
-/// `x-siglake-server-micros` the response carries, in milliseconds.
+/// POST the query, writing the body `delay` after the server acknowledges that
+/// it is ready for it. Returns the `x-siglake-server-micros` the response
+/// carries, in milliseconds.
 fn post_split(addr: std::net::SocketAddr, query: &str, delay: Duration) -> f64 {
     let body = serde_json::json!({ "query": query }).to_string();
     let head = format!(
         "POST /api/v1/sql HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Expect: 100-continue\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
@@ -102,12 +105,30 @@ fn post_split(addr: std::net::SocketAddr, query: &str, delay: Duration) -> f64 {
     stream.set_nodelay(true).expect("nodelay");
     stream.write_all(head.as_bytes()).expect("write head");
     stream.flush().expect("flush head");
-    std::thread::sleep(delay);
-    stream.write_all(body.as_bytes()).expect("write body");
-    stream.flush().expect("flush body");
 
+    // Hyper sends this when the Json extractor polls the body. By then the
+    // outer server-micros middleware has entered and started its clock. A
+    // flush alone does not provide that ordering: the client can begin its
+    // sleep a few microseconds before the server parses the request head.
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
+    reader.read_line(&mut status).expect("continue status line");
+    assert!(
+        status.starts_with("HTTP/1.1 100 Continue"),
+        "continue status: {status}"
+    );
+    let mut end = String::new();
+    reader.read_line(&mut end).expect("continue header end");
+    assert_eq!(end, "\r\n", "continue response header end");
+
+    std::thread::sleep(delay);
+    reader
+        .get_mut()
+        .write_all(body.as_bytes())
+        .expect("write body");
+    reader.get_mut().flush().expect("flush body");
+
+    status.clear();
     reader.read_line(&mut status).expect("status line");
     assert!(status.starts_with("HTTP/1.1 200"), "status: {status}");
     let mut server_micros = None;
