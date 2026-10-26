@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -133,6 +134,56 @@ fn scan_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
         {
             out.push(node.clone());
         }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    out
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NodeOutputRows {
+    name: String,
+    partitions: Vec<(usize, usize)>,
+    evaluated_rows: Vec<(usize, usize)>,
+}
+
+impl NodeOutputRows {
+    fn total(&self) -> usize {
+        self.partitions.iter().map(|(_, rows)| rows).sum()
+    }
+}
+
+/// Read `output_rows` without aggregating operators together. DataFusion keeps
+/// one counter per output partition, so this also distinguishes a node's fetch
+/// from work that ran ahead in another partition.
+fn node_output_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<NodeOutputRows> {
+    let mut out = Vec::new();
+    plan.apply(|node| {
+        let mut partitions = Vec::new();
+        let mut evaluated_rows = Vec::new();
+        if let Some(metrics) = node.metrics() {
+            for metric in metrics.iter() {
+                match metric.value() {
+                    MetricValue::OutputRows(_) => partitions.push((
+                        metric.partition().expect("output metric partition"),
+                        metric.value().as_usize(),
+                    )),
+                    MetricValue::Ratio {
+                        name,
+                        ratio_metrics,
+                    } if name == "selectivity" => evaluated_rows.push((
+                        metric.partition().expect("selectivity metric partition"),
+                        ratio_metrics.total(),
+                    )),
+                    _ => {}
+                }
+            }
+        }
+        out.push(NodeOutputRows {
+            name: node.name().to_string(),
+            partitions,
+            evaluated_rows,
+        });
         Ok(TreeNodeRecursion::Continue)
     })
     .unwrap();
@@ -666,6 +717,120 @@ async fn bounded_coalesce_and_eager_limit_bound_dense_residual_runahead() {
         "bounded buffering plus eager limit termination must reduce early physical reads: bounded {:?}, control {:?}",
         bounded.work,
         control.work
+    );
+}
+
+/// #7458: `sql execution profile` adds every plan node's `output_rows` before
+/// comparing that sum with the scan leaf. Read the same clipped physical shape
+/// one node and partition at a time so an 8,192-row repartition batch cannot be
+/// mistaken for rows emitted by the filter above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clipped_limit_output_metrics_separate_runahead_from_emitted_rows() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 100;
+    const DENSE_ROWS_PER_FILE: usize = 20_000;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    // Fifteen input file groups against sixteen target partitions reproduces
+    // the candidate plan's RoundRobinBatch(16) node between scan and filter.
+    for file in 0..15 {
+        let events: Vec<Event> = (0..DENSE_ROWS_PER_FILE)
+            .map(|row| Event::now(payload(file, row, true)))
+            .collect();
+        ice.append_events(&events).await.unwrap();
+    }
+
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let expected_shape = [
+        "ClippedLimitCoalesceExec",
+        "FilterExec",
+        "RepartitionExec",
+        "SiglakeIcebergTableScan",
+    ];
+    let actual_shape: Vec<_> = node_output_rows(&plan)
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+    assert_eq!(actual_shape, expected_shape);
+
+    let run = run_planned_arm(&ctx, plan.clone(), Duration::ZERO, "raw").await;
+    assert_eq!(run.rows.len(), LIMIT);
+    assert_all_qualify(&run.rows, &sql);
+
+    let rows = node_output_rows(&plan);
+    eprintln!("CLIPPED-LIMIT-OUTPUT-ROWS {rows:?} work={:?}", run.work);
+    assert_eq!(
+        rows[0].total(),
+        LIMIT,
+        "the final limit must emit its fetch"
+    );
+    assert!(
+        rows[1]
+            .partitions
+            .iter()
+            .all(|(_, output_rows)| *output_rows <= LIMIT),
+        "FilterExec's per-partition fetch must be respected: {:?}",
+        rows[1]
+    );
+    let contributing_filters: BTreeSet<_> = rows[1]
+        .partitions
+        .iter()
+        .filter_map(|(partition, output_rows)| (*output_rows > 0).then_some(*partition))
+        .collect();
+    let contributing_repartitions: BTreeSet<_> = rows[2]
+        .partitions
+        .iter()
+        .filter_map(|(partition, output_rows)| (*output_rows > 0).then_some(*partition))
+        .collect();
+    assert!(!contributing_filters.is_empty());
+    assert_eq!(contributing_filters, contributing_repartitions);
+    for partition in &contributing_filters {
+        assert_eq!(
+            rows[1]
+                .partitions
+                .iter()
+                .find(|(candidate, _)| candidate == partition)
+                .map(|(_, output_rows)| *output_rows),
+            Some(LIMIT),
+            "each contributing filter emits its fetch"
+        );
+        assert_eq!(
+            rows[1]
+                .evaluated_rows
+                .iter()
+                .find(|(candidate, _)| candidate == partition)
+                .map(|(_, input_rows)| *input_rows),
+            Some(8_192),
+            "the filter evaluates one coalesced repartition batch"
+        );
+        assert_eq!(
+            rows[2]
+                .partitions
+                .iter()
+                .find(|(candidate, _)| candidate == partition)
+                .map(|(_, output_rows)| *output_rows),
+            Some(8_192),
+            "the repartition emits one coalesced batch"
+        );
+    }
+
+    let contributors = contributing_filters.len();
+    let non_leaf_rows = rows[0].total() + rows[1].total() + rows[2].total();
+    assert_eq!(non_leaf_rows, LIMIT + contributors * (8_192 + LIMIT));
+    assert!(
+        rows[3].total() >= rows[2].total(),
+        "the settled scan cannot emit fewer rows than repartition reports downstream"
     );
 }
 
