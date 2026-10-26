@@ -15,7 +15,7 @@
 //! file drops the clipped-limit shape — the test pins that difference rather
 //! than hiding it.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -145,7 +145,7 @@ async fn build_fixture(ice: &IcebergContext, layout: Layout) {
     }
 }
 
-fn context() -> SessionContext {
+fn context(wave: usize) -> SessionContext {
     let base = siglake_storage::session_context_with_target_partitions(Some(16));
     let mut state = base.state();
     state
@@ -154,7 +154,7 @@ fn context() -> SessionContext {
     state
         .config_mut()
         .set_extension(Arc::new(siglake_storage::ClippedAdmissionWave {
-            factor: 2,
+            factor: wave,
         }));
     state
         .config_mut()
@@ -239,6 +239,14 @@ struct Run {
     bytes_index: usize,
     bytes_data_requested: usize,
     decoded_bytes: usize,
+    per_file_work: Vec<PerFileWork>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PerFileWork {
+    requested: usize,
+    decoded: usize,
+    opened: usize,
 }
 
 async fn run(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Run {
@@ -267,13 +275,36 @@ async fn run(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Run {
     let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(60)).await;
     assert!(settle.complete, "scan did not settle: {settle:?}");
 
-    let metrics = scans[0].metrics().unwrap().aggregate_by_name();
+    let scan_metrics = scans[0].metrics().unwrap();
+    let metrics = scan_metrics.aggregate_by_name();
     let sum = |name: &str| {
         metrics
             .sum_by_name(name)
             .map(|metric| metric.as_usize())
             .unwrap_or_default()
     };
+    // The fixture has one file task per scan partition. Admission tickets name
+    // those groups deterministically; a settled partition with `files_read=1`
+    // is therefore one actually admitted/opened file. Keep its requested and
+    // decoded bytes together instead of inferring a per-file mean from totals.
+    let mut per_partition = BTreeMap::<usize, PerFileWork>::new();
+    for metric in scan_metrics.iter() {
+        let Some(partition) = metric.partition() else {
+            continue;
+        };
+        let work = per_partition.entry(partition).or_default();
+        match metric.value().name() {
+            "files_read" => work.opened += metric.value().as_usize(),
+            "bytes_data_requested" => work.requested += metric.value().as_usize(),
+            "decoded_bytes" => work.decoded += metric.value().as_usize(),
+            _ => {}
+        }
+    }
+    let per_file_work = per_partition
+        .into_values()
+        .filter(|work| work.opened > 0)
+        .collect::<Vec<_>>();
+
     Run {
         collect,
         rows,
@@ -288,6 +319,7 @@ async fn run(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Run {
         bytes_index: sum("bytes_index"),
         bytes_data_requested: sum("bytes_data_requested"),
         decoded_bytes: sum("decoded_bytes"),
+        per_file_work,
     }
 }
 
@@ -363,9 +395,9 @@ async fn measure(layout: Layout) -> LayoutResult {
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
     build_fixture(&ice, layout).await;
 
-    let pushed_ctx = context();
-    let without_selection_ctx = context();
-    let suppressed_ctx = context();
+    let pushed_ctx = context(2);
+    let without_selection_ctx = context(2);
+    let suppressed_ctx = context(2);
     ice.register_with_datafusion(&pushed_ctx).await.unwrap();
     ice.register_with_datafusion(&without_selection_ctx)
         .await
@@ -646,6 +678,185 @@ fn report(layout: Layout, result: &LayoutResult) {
     );
 }
 
+struct WaveLayoutResult {
+    wave2: Vec<Run>,
+    wave4: Vec<Run>,
+}
+
+fn assert_wave_run(run: &Run, wave: usize, layout: Layout) {
+    assert_exact(run, &format!("wave{wave}"), layout);
+    assert_eq!(
+        run.per_file_work
+            .iter()
+            .map(|work| work.opened)
+            .sum::<usize>(),
+        run.files_read,
+        "{} wave{wave}: admitted/opened file detail must match the settled total",
+        layout.name()
+    );
+    assert_eq!(
+        run.per_file_work
+            .iter()
+            .map(|work| work.requested)
+            .sum::<usize>(),
+        run.bytes_data_requested,
+        "{} wave{wave}: per-file requested bytes must match the settled total",
+        layout.name()
+    );
+    assert_eq!(
+        run.per_file_work
+            .iter()
+            .map(|work| work.decoded)
+            .sum::<usize>(),
+        run.decoded_bytes,
+        "{} wave{wave}: per-file decoded bytes must match the settled total",
+        layout.name()
+    );
+}
+
+fn wave_line(wave: usize, run: &Run) -> String {
+    let mut requested = run
+        .per_file_work
+        .iter()
+        .map(|work| work.requested)
+        .collect::<Vec<_>>();
+    requested.sort_unstable();
+    let mut decoded = run
+        .per_file_work
+        .iter()
+        .map(|work| work.decoded)
+        .collect::<Vec<_>>();
+    decoded.sort_unstable();
+    format!(
+        "wave{wave}_collect={:?} wave{wave}_planned={} \
+         wave{wave}_admitted_opened={} wave{wave}_requested={} \
+         wave{wave}_decoded={} wave{wave}_requested_per_file={requested:?} \
+         wave{wave}_decoded_per_file={decoded:?}",
+        run.collect,
+        run.planned_partitions,
+        run.files_read,
+        run.bytes_data_requested,
+        run.decoded_bytes,
+    )
+}
+
+/// Hold #7500's pushed-predicate query, reader settings, plan and deterministic
+/// file-group order fixed while changing only the admission growth multiplier.
+/// Factor 4 is the proposed way to open a larger fraction of a four-partition
+/// pruned scan; factor 2 is the shipped control.
+async fn measure_waves(layout: Layout) -> WaveLayoutResult {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    build_fixture(&ice, layout).await;
+
+    let wave2_ctx = context(2);
+    let wave4_ctx = context(4);
+    ice.register_with_datafusion(&wave2_ctx).await.unwrap();
+    ice.register_with_datafusion(&wave4_ctx).await.unwrap();
+    let sql = format!("SELECT timestamp, raw FROM events WHERE source = '{TARGET}' LIMIT {LIMIT}");
+
+    // Warm planning metadata without reading data. Reader caches stay bypassed
+    // in both arms, as in #7500.
+    let _ = plan(&wave2_ctx, &sql, PredicatePushdownControl::RetainResidual).await;
+    let _ = plan(&wave4_ctx, &sql, PredicatePushdownControl::RetainResidual).await;
+
+    let mut result = WaveLayoutResult {
+        wave2: Vec::new(),
+        wave4: Vec::new(),
+    };
+    for pair in 0..PAIRS {
+        let wave2_plan = plan(&wave2_ctx, &sql, PredicatePushdownControl::RetainResidual).await;
+        let wave4_plan = plan(&wave4_ctx, &sql, PredicatePushdownControl::RetainResidual).await;
+        siglake_storage::configure_query_scan_tuning(QueryScanTuning::default());
+
+        let wave2_scan = scan_nodes(&wave2_plan).pop().unwrap();
+        let wave4_scan = scan_nodes(&wave4_plan).pop().unwrap();
+        assert_eq!(
+            wrapper_names(&wave2_plan),
+            wrapper_names(&wave4_plan),
+            "{}: wave factor must not change the physical wrappers",
+            layout.name()
+        );
+        assert_eq!(
+            planned_partitions(&wave2_scan),
+            planned_partitions(&wave4_scan),
+            "{}: wave factor must not change planned partitions",
+            layout.name()
+        );
+        assert_eq!(
+            wave2_scan
+                .as_any()
+                .downcast_ref::<SiglakeIcebergTableScan>()
+                .unwrap()
+                .file_attribution()
+                .files,
+            wave4_scan
+                .as_any()
+                .downcast_ref::<SiglakeIcebergTableScan>()
+                .unwrap()
+                .file_attribution()
+                .files,
+            "{}: both waves must retain the same planned file tasks",
+            layout.name()
+        );
+
+        let (wave2, wave4) = if pair.is_multiple_of(2) {
+            (
+                run(&wave2_ctx, wave2_plan).await,
+                run(&wave4_ctx, wave4_plan).await,
+            )
+        } else {
+            let wave4 = run(&wave4_ctx, wave4_plan).await;
+            let wave2 = run(&wave2_ctx, wave2_plan).await;
+            (wave2, wave4)
+        };
+        assert_wave_run(&wave2, 2, layout);
+        assert_wave_run(&wave4, 4, layout);
+        if layout == Layout::RareClusteredSingleFile {
+            assert!(!wave2
+                .wrappers
+                .iter()
+                .any(|name| name == "ClippedLimitCoalesceExec"));
+            assert_eq!(wave2.files_read, wave4.files_read);
+            assert_eq!(wave2.bytes_data_requested, wave4.bytes_data_requested);
+            assert_eq!(wave2.decoded_bytes, wave4.decoded_bytes);
+        }
+
+        eprintln!(
+            "CLIPPED-WAVE layout={} pair={pair} order={} {} {}",
+            layout.name(),
+            pair % 2,
+            wave_line(2, &wave2),
+            wave_line(4, &wave4),
+        );
+        result.wave2.push(wave2);
+        result.wave4.push(wave4);
+    }
+    result
+}
+
+fn report_waves(layout: Layout, result: &WaveLayoutResult) {
+    eprintln!(
+        "CLIPPED-WAVE-SUMMARY layout={} pairs={PAIRS} \
+         wave2_median_ms={:.3} wave2_planned={} wave2_admitted_opened={} \
+         wave2_requested={} wave2_decoded={} \
+         wave4_median_ms={:.3} wave4_planned={} wave4_admitted_opened={} \
+         wave4_requested={} wave4_decoded={} paired_wave4_minus_wave2_ms={:.3}",
+        layout.name(),
+        median_ms(&result.wave2),
+        median_count(&result.wave2, |run| run.planned_partitions),
+        median_count(&result.wave2, |run| run.files_read),
+        median_count(&result.wave2, |run| run.bytes_data_requested),
+        median_count(&result.wave2, |run| run.decoded_bytes),
+        median_ms(&result.wave4),
+        median_count(&result.wave4, |run| run.planned_partitions),
+        median_count(&result.wave4, |run| run.files_read),
+        median_count(&result.wave4, |run| run.bytes_data_requested),
+        median_count(&result.wave4, |run| run.decoded_bytes),
+        median_paired_ms(&result.wave4, &result.wave2),
+    );
+}
+
 /// By-hand measurement: run alone on an idle lane. The deterministic checks pin
 /// the matched control, its exact answers and each layout's pruning floor; wall
 /// time is retained for attribution and is not a CI performance threshold.
@@ -660,5 +871,23 @@ async fn clipped_equality_pushdown_layout_attribution() {
     ] {
         let result = measure(layout).await;
         report(layout, &result);
+    }
+}
+
+/// #7515 by-hand measurement. Factor 2 and factor 4 share each fixture and
+/// differ only through `ClippedAdmissionWave`; collect time is evidence, not a
+/// CI threshold. The single-file layout proves the factor is inert when
+/// pruning removes the clipped-limit shape.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "matched local wave-factor attribution; run alone with --ignored --nocapture"]
+async fn clipped_admission_wave_layout_attribution() {
+    for layout in [
+        Layout::Interleaved,
+        Layout::RareScattered,
+        Layout::RareClustered,
+        Layout::RareClusteredSingleFile,
+    ] {
+        let result = measure_waves(layout).await;
+        report_waves(layout, &result);
     }
 }

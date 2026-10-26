@@ -486,3 +486,14 @@ Anything else is clamped to at least 2, since a factor of 1 would never widen
 the ramp. Per-session override `ClippedAdmissionWave` exists so a measurement
 can run both arms in one process without `set_var`. Packaged defaults, the chart
 and the operator are unchanged: the knob has no chart value and no CRD field.
+
+## Admission after predicate pruning
+
+The matched #7515 local measurement varies the per-session wave between 2 and
+4 on #7500's four layouts. Factor 4 cuts the four-partition clustered layout's
+collect time by 12.037 ms paired median with identical requested and decoded
+bytes, but doubles both byte totals on the sixteen-partition rare-scattered
+layout without a repeatable timing benefit. The recommendation is to keep
+factor 2 above four planned partitions and let a future production change fill
+the first wave when pruning leaves two to four. The default is unchanged. See
+[`CLIPPED_ADMISSION_WAVE_LAYOUTS_2026-10-26.md`](CLIPPED_ADMISSION_WAVE_LAYOUTS_2026-10-26.md).
