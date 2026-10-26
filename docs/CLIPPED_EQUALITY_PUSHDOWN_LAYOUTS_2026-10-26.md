@@ -19,17 +19,19 @@ public knob.
 
 ## Matched fixtures
 
-Each layout is one Iceberg snapshot: 15 Parquet files, 40,000 rows per file,
+Each layout is one Iceberg snapshot built from 15 40,000-row appends, with
 production writer properties (20,000-row page limit, 1,048,576-row row-group
-ceiling), one row group per file. Only the placement of `source = 'us-east-2'`
-changes.
+ceiling). The `events` table's day partition splits seven appends at midnight,
+so the snapshot contains 22 physical Parquet files rather than 15. Each
+physical file has one row group. Only the placement of
+`source = 'us-east-2'` changes.
 
 | layout | target rows | placement | what bounds can drop |
 | --- | ---: | --- | --- |
 | `interleaved` | 150,000 (25%) | four labels cycling row by row | nothing |
 | `rare_scattered` | 1,200 (0.2%) | one row in every 500, in every page | nothing |
-| `rare_clustered` | 1,200 (0.2%) | 300 contiguous rows in the first page of each of four files | 11 files, and the second page of each opened file |
-| `rare_clustered_single_file` | 1,200 (0.2%) | all 1,200 contiguous in one page of one file | 14 files, and that file's second page |
+| `rare_clustered` | 1,200 (0.2%) | 300 contiguous rows in the first page of each of four files | 18 target-free physical files, and the second page of each opened file |
+| `rare_clustered_single_file` | 1,200 (0.2%) | all 1,200 contiguous in one page of one file | 21 target-free physical files, and that file's second page |
 
 The three non-target labels (`ap-south-1`, `eu-west-1`, `us-east-1`) all sort
 below `us-east-2`, so a page or row group holding only those has an upper bound
@@ -150,8 +152,35 @@ Selection cost and selection benefit are therefore separable at run time by the
 same counter: `rows_pruned_selection`. On `rare_clustered_single_file` a full
 second-page prune is 19,520 of a file's 40,000 rows — the first page closes at
 20,480 rows because the 20,000-row limit is checked at 1,024-row write-batch
-boundaries. The four-file total of 63,680 is below four times that and is stable
-to the row across all seven pairs; the shortfall is not attributed here.
+boundaries.
+
+The four-file `rare_clustered` total is exactly 63,680. Three target-bearing
+files have 40,000 rows and contribute 19,520 each. Logical append 6 crosses the
+`day_ts` boundary after row 25,600: its target run at rows 10,000–10,299 is in
+the first physical file, whose second page has only 5,120 rows. The append's
+remaining 14,400 target-free rows are a separate next-day file removed by file
+bounds during planning, so they never enter a reader selection. The aggregate
+is therefore `3 * 19,520 + 5,120 = 63,680`; the counter is not under-reporting.
+The reader still applies its setup-time formula:
+`rows_in_read_groups - selection.row_count()`. No delete or inverted-index
+selection intersects these fixture selections.
+
+A focused pass retained the reader-setup decomposition below. The temporary
+directory prefix is omitted from each task identity; UUIDs identify this pass.
+Every task covered the shown range, had one selected row group, and constructed
+its selection before streaming.
+
+| logical append | file task identity | task range | row-group rows | `source` page starts | selected rows | counter contribution |
+| ---: | --- | ---: | ---: | --- | ---: | ---: |
+| 3 | `day_ts=2023-11-16/siglake-x2-01a17a6f-dba5-7940-b752-f83eeb5d9a6b-00000.parquet` | `[0, 341529)` | 40,000 | `[0, 20,480]` | 20,480 | 19,520 |
+| 6 | `day_ts=2023-11-17/siglake-x2-01a17a70-0215-7693-9eee-2724683833d4-00000.parquet` | `[0, 1624328)` | 25,600 | `[0, 20,480]` | 20,480 | 5,120 |
+| 9 | `day_ts=2023-11-19/siglake-x2-01a17a70-2e14-7142-aa60-842ddfe4b4e2-00000.parquet` | `[0, 341522)` | 40,000 | `[0, 20,480]` | 20,480 | 19,520 |
+| 12 | `day_ts=2023-11-20/siglake-x2-01a17a70-5790-70f2-b914-fdfd95bbd668-00000.parquet` | `[0, 341507)` | 40,000 | `[0, 20,480]` | 20,480 | 19,520 |
+
+The test now pins both settled aggregates: 63,680 for `rare_clustered` and
+19,520 for `rare_clustered_single_file`. A change to the writer or fixture that
+changes this geometry must update the decomposition rather than weakening the
+counter assertion.
 
 ## Pruning is a plan-time effect, so prunable arms are not plan-matched
 
@@ -210,8 +239,6 @@ This investigation makes no production policy change and adds no knob.
   The fixtures here are not the field layout.
 - One equality predicate on one dictionary-encoded low-cardinality column. No
   range predicate, no multi-column predicate, no `raw` text predicate.
-- The four-file `rows_pruned_selection` total of 63,680 is not decomposed to a
-  per-file figure.
 - No gate is implemented, so nothing here is qualified as a shipped policy.
 
 ## Reproduction
