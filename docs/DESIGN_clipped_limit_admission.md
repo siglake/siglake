@@ -480,20 +480,70 @@ the round's three phases, so the phase differences it reports come from
 
 ## Knob
 
-`SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` — ramp factor, default 2. `0` turns the
-ramp off, which is the pre-#4865 scan and the negative-control arm of the A/B.
-Anything else is clamped to at least 2, since a factor of 1 would never widen
-the ramp. Per-session override `ClippedAdmissionWave` exists so a measurement
-can run both arms in one process without `set_var`. Packaged defaults, the chart
+`SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` — ramp factor. Unset, the scan resolves
+the partition-sensitive default below: the planned partition count at two to
+four planned partitions, 2 above that. `0` turns the ramp off, which is the
+pre-#4865 scan and the negative-control arm of the A/B. Anything else is
+clamped to at least 2, since a factor of 1 would never widen the ramp, and an
+explicit factor applies at every planned width — a matched A/B varies one
+thing. Per-session override `ClippedAdmissionWave` exists so a measurement can
+run both arms in one process without `set_var`. Packaged defaults, the chart
 and the operator are unchanged: the knob has no chart value and no CRD field.
 
-## Admission after predicate pruning
+## Admission after predicate pruning (#7515, #7520)
 
 The matched #7515 local measurement varies the per-session wave between 2 and
 4 on #7500's four layouts. Factor 4 cuts the four-partition clustered layout's
 collect time by 12.037 ms paired median with identical requested and decoded
 bytes, but doubles both byte totals on the sixteen-partition rare-scattered
-layout without a repeatable timing benefit. The recommendation is to keep
-factor 2 above four planned partitions and let a future production change fill
-the first wave when pruning leaves two to four. The default is unchanged. See
+layout without a repeatable timing benefit. See
 [`CLIPPED_ADMISSION_WAVE_LAYOUTS_2026-10-26.md`](CLIPPED_ADMISSION_WAVE_LAYOUTS_2026-10-26.md).
+
+#7520 ships that recommendation as the default policy, and nothing else:
+
+* the factor reads `partition_count` — the scan node's own planned partitions,
+  after pruning and before the repartition above it — so two to four planned
+  partitions take a factor equal to the count and the FIRST earned credit
+  admits all of them;
+* one reader still starts alone, and the fill happens at that first credit,
+  not at scan start. Batch pacing (eight raw batches per credit), terminal
+  credits, #7487's close and the one-partition bypass are untouched;
+* above four planned partitions the factor is still 2;
+* an explicit session or environment factor, `0` included, overrides the
+  policy at every width. No new knob, chart value or CRD field.
+
+Why filling is free at this width and not at sixteen: a scan that planned
+fewer partitions than `target_partitions` is driven through a
+`RepartitionExec: RoundRobinBatch(16), input_partitions=4`, whose tasks poll
+every input partition. The ends therefore come quickly, both factors open all
+four files, and the ramp decides when they start rather than how many run —
+which is exactly what #7515 measured, identical bytes 12.037 ms apart. At
+sixteen partitions there is no repartition and a wider first wave is more
+readers.
+
+Deterministic coverage. In `query_provider.rs`:
+`the_default_admission_wave_fills_two_to_four_planned_partitions` and
+`the_default_policy_fills_a_small_scan_at_its_first_credit` hold the policy and
+the ramp arithmetic at one, two, three, four and wider scans;
+`the_default_policy_keeps_the_batch_credit_pacing` holds the eight-batch
+quantum at the filled width; `clipped_admission_wave_is_overridable_and_never_stalls`
+holds the pure override resolver. In `clipped_limit_admission.rs`, over a
+session carrying no `ClippedAdmissionWave` at all — the server's own path —
+`the_default_policy_fills_a_small_scan_at_its_first_credit` hand-drives exactly
+one terminal credit and requires the last partition to be pending before it and
+reading after it; `the_default_policy_still_doubles_above_four_partitions` runs
+the same drive at five and sixteen partitions and requires partition 1 to start
+and the last to stay pending; `an_explicit_wave_overrides_the_partition_sensitive_default`
+checks factor 2 and `0` through real plans;
+`the_default_policy_answers_every_planned_width_exactly` answers a dense and a
+last-file-only layout at one to five partitions;
+`cancelling_a_filled_small_scan_ends_every_stream` drops the root stream at the
+filled width and requires every stream to end; and
+`a_small_clipped_scan_repartitions_above_the_ramp` pins the repartition shape
+above.
+
+What this does not establish: no AWS, object-store or distributed-query
+measurement, and no three-partition benefit — three follows the ramp's
+arithmetic and the measured factor-4 cap, not a measurement. The timing
+evidence remains #7515's by-hand `#[ignore]`d comparison; nothing in CI grades
+collect time.
