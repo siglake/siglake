@@ -1470,6 +1470,16 @@ IO), per-tier ceilings clamp per-request limits, a mid-flight rows-scanned
 breaker aborts runaway scans at batch boundaries, and a wall-clock timeout
 backs everything.
 
+Clipped UTF-8 equality scans expose internal counts for data files rejected by
+manifest metrics, row groups rejected by Parquet statistics, page-selected
+rows, and rows accepted by the Parquet predicate. A bounded, snapshot-keyed
+learned-cache prototype consumes those counts only when an in-process test
+enables it. It retains DataFusion's exact residual, publishes after every scan
+partition settles, and discards cancelled or failed observations. The query
+server does not enable the prototype; production predicate pushdown is
+unchanged. The key and local qualification are recorded in
+[`CLIPPED_EQUALITY_PUSHDOWN_GATE_2026-10-27.md`](CLIPPED_EQUALITY_PUSHDOWN_GATE_2026-10-27.md).
+
 An unknown key inside the request's `limits` object is **refused**, `422`, by
 the JSON extractor — before planning, execution or batch enqueue. Every field
 there is a safety constraint the caller asked for, so quietly dropping a

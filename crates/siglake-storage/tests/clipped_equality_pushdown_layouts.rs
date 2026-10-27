@@ -26,7 +26,7 @@ use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use siglake_core::Event;
-use siglake_storage::iceberg::IcebergContext;
+use siglake_storage::iceberg::{IcebergContext, IcebergTuning};
 use siglake_storage::{PredicatePushdownControl, QueryScanTuning, SiglakeIcebergTableScan};
 
 /// Logical 40,000-row append batches. The `events` table is day-partitioned,
@@ -253,6 +253,7 @@ struct Run {
     rows: Vec<String>,
     wrappers: Vec<String>,
     planned_partitions: usize,
+    manifest_files_pruned_metrics: usize,
     files_read: usize,
     row_groups_considered: usize,
     row_groups_pruned_stats: usize,
@@ -333,6 +334,11 @@ async fn run(ctx: &SessionContext, plan: Arc<dyn ExecutionPlan>) -> Run {
         rows,
         wrappers: wrapper_names(&plan),
         planned_partitions: planned_partitions(&scans[0]),
+        manifest_files_pruned_metrics: scans[0]
+            .as_any()
+            .downcast_ref::<SiglakeIcebergTableScan>()
+            .unwrap()
+            .manifest_files_pruned_metrics() as usize,
         files_read: sum("files_read"),
         row_groups_considered: sum("row_groups_considered"),
         row_groups_pruned_stats: sum("row_groups_pruned_stats"),
@@ -373,6 +379,50 @@ fn observed_tuning() -> QueryScanTuning {
         predicate_evaluation_observer: Some(observe_predicate_evaluation),
         ..tuning(PredicatePushdownControl::RetainResidual)
     }
+}
+
+fn learned_cache_tuning() -> QueryScanTuning {
+    QueryScanTuning {
+        clipped_equality_learned_gate_prototype: true,
+        ..tuning(PredicatePushdownControl::Production)
+    }
+}
+
+fn learned_event(ordinal: usize, source: &str, attributes: Option<&str>) -> Event {
+    Event {
+        timestamp: Utc
+            .timestamp_opt(1_710_000_000, (ordinal % 1_000_000_000) as u32)
+            .single()
+            .unwrap(),
+        host: "fixture".to_string(),
+        source: source.to_string(),
+        sourcetype: "json".to_string(),
+        index: "bench".to_string(),
+        raw: format!("row={ordinal} source={source} attributes={attributes:?}"),
+        attributes: attributes.map(str::to_string),
+    }
+}
+
+fn scan_display(plan: &Arc<dyn ExecutionPlan>) -> String {
+    datafusion::physical_plan::displayable(scan_nodes(plan)[0].as_ref())
+        .one_line()
+        .to_string()
+}
+
+fn assert_reader_predicate(plan: &Arc<dyn ExecutionPlan>, expected: bool) {
+    let display = scan_display(plan);
+    assert_eq!(
+        !display.contains("predicate:[]"),
+        expected,
+        "unexpected reader predicate state: {display}"
+    );
+    assert!(
+        datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(false)
+            .to_string()
+            .contains("FilterExec"),
+        "the exact residual must remain above the learned scan"
+    );
 }
 
 /// A learned signal is deliberately conservative: page selection must have
@@ -1200,6 +1250,173 @@ fn learned_gate_requires_complete_high_survival_signal_without_selection() {
         PredicatePushdownControl::RetainResidual,
         "any verified page pruning keeps the reader predicate"
     );
+}
+
+/// #7525 correctness qualification for the real bounded observation cache.
+/// Each case uses a distinct table UUID, so process-wide entries cannot bleed
+/// between fixtures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn learned_cache_requires_all_earlier_pruning_signals_and_snapshot_identity() {
+    // No early pruning: the cold observation publishes a suppressing entry.
+    let common_tmp = tempfile::tempdir().unwrap();
+    let common_ice = IcebergContext::open(common_tmp.path()).await.unwrap();
+    let common = (0..8_000)
+        .map(|row| {
+            let source = if row % 4 == 0 {
+                TARGET
+            } else {
+                OTHERS[row % 3]
+            };
+            learned_event(row, source, None)
+        })
+        .collect::<Vec<_>>();
+    common_ice.append_events(&common).await.unwrap();
+    let common_ctx = context(2);
+    common_ice
+        .register_with_datafusion(&common_ctx)
+        .await
+        .unwrap();
+    let source_sql =
+        format!("SELECT timestamp, raw FROM events WHERE source = '{TARGET}' LIMIT {LIMIT}");
+    let cold = plan_with_tuning(&common_ctx, &source_sql, learned_cache_tuning()).await;
+    assert_reader_predicate(&cold, true);
+    let cold_run = run(&common_ctx, cold).await;
+    assert_eq!(cold_run.manifest_files_pruned_metrics, 0);
+    assert_eq!(cold_run.row_groups_pruned_stats, 0);
+    assert_eq!(cold_run.rows_pruned_selection, 0);
+    let warm = plan_with_tuning(&common_ctx, &source_sql, learned_cache_tuning()).await;
+    assert_reader_predicate(&warm, false);
+    let warm_run = run(&common_ctx, warm).await;
+    assert_eq!(warm_run.rows.len(), LIMIT);
+    assert!(warm_run
+        .rows
+        .iter()
+        .all(|raw| raw.contains("source=us-east-2")));
+
+    // A new snapshot is cold even when every other observation-key field is
+    // unchanged.
+    common_ice
+        .append_events(
+            &(8_000..8_100)
+                .map(|row| learned_event(row, TARGET, None))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let next_snapshot_ctx = context(2);
+    common_ice
+        .register_with_datafusion(&next_snapshot_ctx)
+        .await
+        .unwrap();
+    let next_snapshot =
+        plan_with_tuning(&next_snapshot_ctx, &source_sql, learned_cache_tuning()).await;
+    assert_reader_predicate(&next_snapshot, true);
+
+    // Manifest-only pruning: the surviving file is all matches, but the file
+    // rejected before reader construction keeps the predicate on a repeat.
+    let manifest_tmp = tempfile::tempdir().unwrap();
+    let manifest_ice = IcebergContext::open(manifest_tmp.path()).await.unwrap();
+    manifest_ice
+        .append_events(
+            &(0..4_000)
+                .map(|row| learned_event(row, "us-east-1", None))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    manifest_ice
+        .append_events(
+            &(4_000..8_000)
+                .map(|row| learned_event(row, TARGET, None))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let manifest_ctx = context(2);
+    manifest_ice
+        .register_with_datafusion(&manifest_ctx)
+        .await
+        .unwrap();
+    let manifest_cold = plan_with_tuning(&manifest_ctx, &source_sql, learned_cache_tuning()).await;
+    let manifest_run = run(&manifest_ctx, manifest_cold).await;
+    assert!(manifest_run.manifest_files_pruned_metrics > 0);
+    assert_eq!(manifest_run.row_groups_pruned_stats, 0);
+    assert_eq!(manifest_run.rows_pruned_selection, 0);
+    let manifest_warm = plan_with_tuning(&manifest_ctx, &source_sql, learned_cache_tuning()).await;
+    assert_reader_predicate(&manifest_warm, true);
+
+    // Row-group-only pruning: force the writer's lower row-group bound, put
+    // matches in the complete first group and misses in the second. The file
+    // bounds span both values, and no page in the surviving group can prune.
+    let row_group_tmp = tempfile::tempdir().unwrap();
+    let row_group_ice = IcebergContext::open(row_group_tmp.path())
+        .await
+        .unwrap()
+        .with_tuning(IcebergTuning {
+            target_row_group_bytes: Some(1),
+            ..Default::default()
+        });
+    let row_group_rows = 128 * 1024 + 4_096;
+    row_group_ice
+        .append_events(
+            &(0..row_group_rows)
+                .map(|row| {
+                    let source = if row < 128 * 1024 {
+                        TARGET
+                    } else {
+                        "us-east-1"
+                    };
+                    learned_event(row, source, None)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let row_group_ctx = context(2);
+    row_group_ice
+        .register_with_datafusion(&row_group_ctx)
+        .await
+        .unwrap();
+    let row_group_cold =
+        plan_with_tuning(&row_group_ctx, &source_sql, learned_cache_tuning()).await;
+    let row_group_run = run(&row_group_ctx, row_group_cold).await;
+    assert_eq!(row_group_run.manifest_files_pruned_metrics, 0);
+    assert!(row_group_run.row_groups_pruned_stats > 0);
+    assert_eq!(row_group_run.rows_pruned_selection, 0);
+    let row_group_warm =
+        plan_with_tuning(&row_group_ctx, &source_sql, learned_cache_tuning()).await;
+    assert_reader_predicate(&row_group_warm, true);
+
+    // Nulls count as predicate input and never as accepted rows. A learned
+    // suppressing hit still returns only exact non-null matches because the
+    // DataFusion residual remains authoritative.
+    let null_tmp = tempfile::tempdir().unwrap();
+    let null_ice = IcebergContext::open(null_tmp.path()).await.unwrap();
+    null_ice
+        .append_events(
+            &(0..8_000)
+                .map(|row| learned_event(row, "fixture", row.is_multiple_of(4).then_some("kept")))
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .unwrap();
+    let null_ctx = context(2);
+    null_ice.register_with_datafusion(&null_ctx).await.unwrap();
+    let null_sql =
+        format!("SELECT timestamp, raw FROM events WHERE attributes = 'kept' LIMIT {LIMIT}");
+    let null_cold = plan_with_tuning(&null_ctx, &null_sql, learned_cache_tuning()).await;
+    let null_cold_run = run(&null_ctx, null_cold).await;
+    assert_eq!(null_cold_run.rows_pruned_selection, 0);
+    let null_warm = plan_with_tuning(&null_ctx, &null_sql, learned_cache_tuning()).await;
+    assert_reader_predicate(&null_warm, false);
+    let null_warm_run = run(&null_ctx, null_warm).await;
+    assert_eq!(null_warm_run.rows.len(), LIMIT);
+    assert!(null_warm_run
+        .rows
+        .iter()
+        .all(|raw| raw.contains("attributes=Some(\"kept\")")));
+
+    siglake_storage::configure_query_scan_tuning(QueryScanTuning::default());
 }
 
 /// #7515 by-hand measurement. Factor 2 and factor 4 share each fixture and

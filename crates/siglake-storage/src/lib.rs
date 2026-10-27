@@ -103,6 +103,15 @@ pub struct QueryScanTuning {
     /// fixture uses it to verify the proposed run-time signal and its counting
     /// cost without publishing a metric.
     pub predicate_evaluation_observer: Option<fn(usize, usize)>,
+    /// #7525 LOCAL QUALIFICATION PROTOTYPE: learn whether a repeated clipped
+    /// UTF-8 equality should omit the Parquet row predicate. Observations are
+    /// bounded and snapshot-keyed; the exact DataFusion residual stays in the
+    /// plan. Production leaves this false.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. The one-eighth threshold is experimental and this path
+    /// exists only for the local qualification fixture.
+    pub clipped_equality_learned_gate_prototype: bool,
     /// #4905 LOCAL QUALIFICATION PROTOTYPE: admit a fully drained read under a
     /// converted predicate, keyed by that predicate in addition to the shipped
     /// file/projection/delete/range/direction identity.
@@ -189,6 +198,9 @@ impl QueryScanTuning {
             // #7513's row-filter input/output observation exists only for the
             // local gate measurement; production never installs an observer.
             predicate_evaluation_observer: None,
+            // #7525's learned clipped-equality gate is a local qualification
+            // prototype; production keeps the existing pushdown policy.
+            clipped_equality_learned_gate_prototype: false,
             // #4905's predicate-keyed population is a local prototype with no
             // operator surface; production never turns it on.
             file_cache_predicate_key_prototype: false,
@@ -1514,6 +1526,7 @@ mod tests {
             PredicatePushdownControl::Production
         );
         assert!(tuning.predicate_evaluation_observer.is_none());
+        assert!(!tuning.clipped_equality_learned_gate_prototype);
         assert!(!tuning.file_cache_predicate_key_prototype);
         assert!(!tuning.file_cache_population_bound_prototype);
         assert!(!tuning.file_cache_unbounded_population_prototype);
