@@ -16,11 +16,17 @@ use siglake_query_server::{
     ServerLimits, TlsConfig,
 };
 use siglake_storage::{
-    configure_query_scan_tuning, iceberg::IcebergContext, PredicatePushdownControl, QueryScanTuning,
+    configure_query_scan_tuning, iceberg::IcebergContext, QueryScanProductionConfig,
+    QueryScanTuning,
 };
 
+/// Map the server's operator-backed scan settings onto the shipped tuning.
+///
+/// Every qualification-only control is stated by
+/// [`QueryScanTuning::production`] in `siglake-storage`, so a new field on
+/// `QueryScanTuning` fails to compile there rather than here.
 fn configure_server_query_scan_tuning(query_scan: QueryScanConfig) {
-    configure_query_scan_tuning(QueryScanTuning {
+    configure_query_scan_tuning(QueryScanTuning::production(QueryScanProductionConfig {
         reader_budget: query_scan.reader_budget,
         file_concurrency_limit: query_scan.file_concurrency_limit,
         batch_size: query_scan.batch_size,
@@ -33,27 +39,7 @@ fn configure_server_query_scan_tuning(query_scan: QueryScanConfig) {
         file_cache_max_bytes: query_scan.file_cache_max_bytes,
         file_cache_max_entries: query_scan.file_cache_max_entries,
         ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
-        // #4847's row-group population is a local prototype with no operator
-        // surface; the server never turns it on.
-        file_cache_row_group_prototype: false,
-        // #4905's predicate-keyed population is a local prototype with no
-        // operator surface; the server never turns it on.
-        file_cache_predicate_key_prototype: false,
-        // #5074's shared population bound is a local qualification prototype
-        // with no operator surface; the server never turns it on.
-        file_cache_population_bound_prototype: false,
-        // #5786's pre-adoption unbounded-population control is local-only.
-        file_cache_unbounded_population_prototype: false,
-        // #4959's per-file attribution is a local qualification gate with no
-        // response or operator surface; the server never turns it on.
-        file_attribution_prototype: false,
-        // #7457's pushdown attribution arms exist only for the local
-        // measurement fixture; the server always runs shipped policy.
-        predicate_pushdown_control: PredicatePushdownControl::Production,
-        // #7513's observer is a local qualification hook with no operator
-        // surface; the server never installs it.
-        predicate_evaluation_observer: None,
-    });
+    }));
 }
 
 #[derive(Parser, Debug)]

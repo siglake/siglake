@@ -138,6 +138,72 @@ pub struct QueryScanTuning {
     pub file_attribution_prototype: bool,
 }
 
+/// Query-server inputs that are part of the shipped scan configuration.
+///
+/// Keep this separate from qualification-only fields on [`QueryScanTuning`]:
+/// the server maps every operator-backed value here, then
+/// [`QueryScanTuning::production`] states the production value of every local
+/// control.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryScanProductionConfig {
+    pub reader_budget: Option<usize>,
+    pub file_concurrency_limit: Option<usize>,
+    pub batch_size: Option<usize>,
+    pub range_coalesce_bytes: Option<u64>,
+    pub range_fetch_concurrency: Option<usize>,
+    pub range_adaptive_min_bytes: Option<u64>,
+    pub range_adaptive_min_files: Option<usize>,
+    pub adaptive_partition_min_bytes: Option<u64>,
+    pub adaptive_partition_min_files: Option<usize>,
+    pub file_cache_max_bytes: Option<u64>,
+    pub file_cache_max_entries: Option<usize>,
+    pub ordered_drain_buffer_bytes: Option<u64>,
+}
+
+impl QueryScanTuning {
+    /// Build the tuning used by the query-server process.
+    ///
+    /// The `Self` literal is deliberately exhaustive. Adding a field to
+    /// `QueryScanTuning` must make the storage crate fail to compile until this
+    /// actual production constructor states the new field's shipped value.
+    pub fn production(config: QueryScanProductionConfig) -> Self {
+        Self {
+            reader_budget: config.reader_budget,
+            file_concurrency_limit: config.file_concurrency_limit,
+            batch_size: config.batch_size,
+            range_coalesce_bytes: config.range_coalesce_bytes,
+            range_fetch_concurrency: config.range_fetch_concurrency,
+            range_adaptive_min_bytes: config.range_adaptive_min_bytes,
+            range_adaptive_min_files: config.range_adaptive_min_files,
+            adaptive_partition_min_bytes: config.adaptive_partition_min_bytes,
+            adaptive_partition_min_files: config.adaptive_partition_min_files,
+            file_cache_max_bytes: config.file_cache_max_bytes,
+            file_cache_max_entries: config.file_cache_max_entries,
+            ordered_drain_buffer_bytes: config.ordered_drain_buffer_bytes,
+            // #4847's row-group population is a local prototype with no
+            // operator surface; production never turns it on.
+            file_cache_row_group_prototype: false,
+            // #7457's pushdown attribution arms exist only for the local
+            // measurement fixture; production always runs shipped policy.
+            predicate_pushdown_control: PredicatePushdownControl::Production,
+            // #7513's row-filter input/output observation exists only for the
+            // local gate measurement; production never installs an observer.
+            predicate_evaluation_observer: None,
+            // #4905's predicate-keyed population is a local prototype with no
+            // operator surface; production never turns it on.
+            file_cache_predicate_key_prototype: false,
+            // #5074's shared population bound is a local qualification
+            // prototype with no operator surface; production never turns it on.
+            file_cache_population_bound_prototype: false,
+            // #5786's pre-adoption unbounded-population control is local-only.
+            file_cache_unbounded_population_prototype: false,
+            // #4959's per-file attribution is a local qualification gate with
+            // no response or operator surface; production never turns it on.
+            file_attribution_prototype: false,
+        }
+    }
+}
+
 /// Test-only control for attributing reader predicate costs without changing
 /// the SQL predicate, residual filter or scan projection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1412,6 +1478,47 @@ mod tests {
     use super::*;
     use arrow_schema::Schema;
     use datafusion::datasource::empty::EmptyTable;
+
+    #[test]
+    fn production_query_scan_tuning_maps_shipped_inputs_and_disables_local_controls() {
+        let tuning = QueryScanTuning::production(QueryScanProductionConfig {
+            reader_budget: Some(1),
+            file_concurrency_limit: Some(2),
+            batch_size: Some(3),
+            range_coalesce_bytes: Some(4),
+            range_fetch_concurrency: Some(5),
+            range_adaptive_min_bytes: Some(6),
+            range_adaptive_min_files: Some(7),
+            adaptive_partition_min_bytes: Some(8),
+            adaptive_partition_min_files: Some(9),
+            file_cache_max_bytes: Some(10),
+            file_cache_max_entries: Some(11),
+            ordered_drain_buffer_bytes: Some(12),
+        });
+
+        assert_eq!(tuning.reader_budget, Some(1));
+        assert_eq!(tuning.file_concurrency_limit, Some(2));
+        assert_eq!(tuning.batch_size, Some(3));
+        assert_eq!(tuning.range_coalesce_bytes, Some(4));
+        assert_eq!(tuning.range_fetch_concurrency, Some(5));
+        assert_eq!(tuning.range_adaptive_min_bytes, Some(6));
+        assert_eq!(tuning.range_adaptive_min_files, Some(7));
+        assert_eq!(tuning.adaptive_partition_min_bytes, Some(8));
+        assert_eq!(tuning.adaptive_partition_min_files, Some(9));
+        assert_eq!(tuning.file_cache_max_bytes, Some(10));
+        assert_eq!(tuning.file_cache_max_entries, Some(11));
+        assert_eq!(tuning.ordered_drain_buffer_bytes, Some(12));
+        assert!(!tuning.file_cache_row_group_prototype);
+        assert_eq!(
+            tuning.predicate_pushdown_control,
+            PredicatePushdownControl::Production
+        );
+        assert!(tuning.predicate_evaluation_observer.is_none());
+        assert!(!tuning.file_cache_predicate_key_prototype);
+        assert!(!tuning.file_cache_population_bound_prototype);
+        assert!(!tuning.file_cache_unbounded_population_prototype);
+        assert!(!tuning.file_attribution_prototype);
+    }
 
     #[test]
     fn core_tokenizer_names_parse_in_bloom_registry() {
