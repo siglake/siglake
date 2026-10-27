@@ -20,6 +20,28 @@ use siglake_storage::{
     QueryScanTuning,
 };
 
+/// Map the server's operator-backed scan settings onto the shipped tuning.
+///
+/// Every qualification-only control is stated by
+/// [`QueryScanTuning::production`] in `siglake-storage`, so a new field on
+/// `QueryScanTuning` fails to compile there rather than here.
+fn configure_server_query_scan_tuning(query_scan: QueryScanConfig) {
+    configure_query_scan_tuning(QueryScanTuning::production(QueryScanProductionConfig {
+        reader_budget: query_scan.reader_budget,
+        file_concurrency_limit: query_scan.file_concurrency_limit,
+        batch_size: query_scan.batch_size,
+        range_coalesce_bytes: query_scan.range_coalesce_bytes,
+        range_fetch_concurrency: query_scan.range_fetch_concurrency,
+        range_adaptive_min_bytes: query_scan.range_adaptive_min_bytes,
+        range_adaptive_min_files: query_scan.range_adaptive_min_files,
+        adaptive_partition_min_bytes: query_scan.adaptive_partition_min_bytes,
+        adaptive_partition_min_files: query_scan.adaptive_partition_min_files,
+        file_cache_max_bytes: query_scan.file_cache_max_bytes,
+        file_cache_max_entries: query_scan.file_cache_max_entries,
+        ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
+    }));
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "siglake-query-server",
@@ -504,20 +526,7 @@ async fn run() -> Result<()> {
         bypass_reader_caches: false,
         ordered_drain_buffer_bytes: None,
     };
-    configure_query_scan_tuning(QueryScanTuning::production(QueryScanProductionConfig {
-        reader_budget: query_scan.reader_budget,
-        file_concurrency_limit: query_scan.file_concurrency_limit,
-        batch_size: query_scan.batch_size,
-        range_coalesce_bytes: query_scan.range_coalesce_bytes,
-        range_fetch_concurrency: query_scan.range_fetch_concurrency,
-        range_adaptive_min_bytes: query_scan.range_adaptive_min_bytes,
-        range_adaptive_min_files: query_scan.range_adaptive_min_files,
-        adaptive_partition_min_bytes: query_scan.adaptive_partition_min_bytes,
-        adaptive_partition_min_files: query_scan.adaptive_partition_min_files,
-        file_cache_max_bytes: query_scan.file_cache_max_bytes,
-        file_cache_max_entries: query_scan.file_cache_max_entries,
-        ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
-    }));
+    configure_server_query_scan_tuning(query_scan);
     tracing::info!(
         target_partitions = query_scan.target_partitions,
         reader_budget = query_scan.reader_budget,
@@ -826,11 +835,21 @@ fn query_tenant_config_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_tenants_from, jobs_store_uri_from, oidc_tenant_claim_from,
-        query_tenant_config_error, Cli, OidcVerifier,
+        allowed_tenants_from, configure_server_query_scan_tuning, jobs_store_uri_from,
+        oidc_tenant_claim_from, query_tenant_config_error, Cli, OidcVerifier,
     };
     use clap::{CommandFactory, Parser};
+    use siglake_query_server::QueryScanConfig;
     use siglake_storage::resolve_query_read_cache_config;
+
+    #[test]
+    fn server_never_installs_the_predicate_evaluation_observer() {
+        configure_server_query_scan_tuning(QueryScanConfig::default());
+
+        assert!(siglake_storage::current_query_scan_tuning()
+            .predicate_evaluation_observer
+            .is_none());
+    }
 
     #[test]
     fn cli_version_contains_the_embedded_provenance() {
