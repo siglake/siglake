@@ -198,6 +198,9 @@ impl QueryScanTuning {
             // #7513's row-filter input/output observation exists only for the
             // local gate measurement; production never installs an observer.
             predicate_evaluation_observer: None,
+            // #7525's learned clipped-equality gate is a local qualification
+            // prototype; production keeps the existing pushdown policy.
+            clipped_equality_learned_gate_prototype: false,
             // #4905's predicate-keyed population is a local prototype with no
             // operator surface; production never turns it on.
             file_cache_predicate_key_prototype: false,
@@ -1523,6 +1526,7 @@ mod tests {
             PredicatePushdownControl::Production
         );
         assert!(tuning.predicate_evaluation_observer.is_none());
+        assert!(!tuning.clipped_equality_learned_gate_prototype);
         assert!(!tuning.file_cache_predicate_key_prototype);
         assert!(!tuning.file_cache_population_bound_prototype);
         assert!(!tuning.file_cache_unbounded_population_prototype);
