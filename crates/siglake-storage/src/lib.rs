@@ -103,6 +103,15 @@ pub struct QueryScanTuning {
     /// fixture uses it to verify the proposed run-time signal and its counting
     /// cost without publishing a metric.
     pub predicate_evaluation_observer: Option<fn(usize, usize)>,
+    /// #7525 LOCAL QUALIFICATION PROTOTYPE: learn whether a repeated clipped
+    /// UTF-8 equality should omit the Parquet row predicate. Observations are
+    /// bounded and snapshot-keyed; the exact DataFusion residual stays in the
+    /// plan. Production leaves this false.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. The one-eighth threshold is experimental and this path
+    /// exists only for the local qualification fixture.
+    pub clipped_equality_learned_gate_prototype: bool,
     /// #4905 LOCAL QUALIFICATION PROTOTYPE: admit a fully drained read under a
     /// converted predicate, keyed by that predicate in addition to the shipped
     /// file/projection/delete/range/direction identity.

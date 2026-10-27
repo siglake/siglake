@@ -40,7 +40,10 @@ use iceberg::arrow::{
     schema_to_arrow_schema, ArrowReaderBuilder, PromotedPruneSpec, RawPruneSpec, ScanCounters,
     DEFAULT_RANGE_COALESCE_BYTES, DEFAULT_RANGE_FETCH_CONCURRENCY,
 };
-use iceberg::expr::{BinaryExpression, Predicate, PredicateOperator, Reference, UnaryExpression};
+use iceberg::expr::{
+    BinaryExpression, Bind, BoundPredicate, Predicate, PredicateOperator, Reference,
+    UnaryExpression,
+};
 use iceberg::scan::{FileScanTask, FileScanTaskStream};
 use iceberg::spec::{Datum, PrimitiveLiteral};
 use iceberg::table::Table;
@@ -205,6 +208,7 @@ struct EffectiveReaderTuning {
     ordered_drain_buffer_bytes: Option<u64>,
     row_selection_enabled: bool,
     predicate_evaluation_observer: Option<fn(usize, usize)>,
+    predicate_evaluation_counting: bool,
 }
 
 impl PartialEq for EffectiveReaderTuning {
@@ -221,6 +225,7 @@ impl PartialEq for EffectiveReaderTuning {
             && self.row_selection_enabled == other.row_selection_enabled
             && self.predicate_evaluation_observer.is_some()
                 == other.predicate_evaluation_observer.is_some()
+            && self.predicate_evaluation_counting == other.predicate_evaluation_counting
     }
 }
 
@@ -2553,6 +2558,9 @@ pub struct SiglakeIcebergTableScan {
     /// carry it (see the reader; conservative for pre-promotion files).
     promoted_prune: Vec<PromotedPruneSpec>,
     task_partitions: Arc<Vec<Vec<FileScanTask>>>,
+    /// Data files rejected by Iceberg manifest metrics while this scan was
+    /// planned. Internal qualification signal; not exported as a SQL metric.
+    manifest_files_pruned_metrics: u64,
     /// Per-request cancellation, captured from the session at planning time.
     /// `None` for callers that never inject one (tests, internal scans), which
     /// behaves exactly as before.
@@ -2600,6 +2608,9 @@ pub struct SiglakeIcebergTableScan {
     /// Partition streams handed out by `execute` and not yet finished; see
     /// [`ScanPartitionTracker`] and [`settle_scan_partitions`].
     partition_tracker: Arc<ScanPartitionTracker>,
+    /// #7525 settled internal signal for the in-process learned-gate
+    /// qualification. Absent in production and on cache hits.
+    clipped_equality_observation: Option<Arc<ClippedEqualityObservation>>,
     /// #4865: the staged start for an unordered, row-clipped `LIMIT`. `None`
     /// for every other shape — an ordered scan, an aggregate, a single
     /// partition, or a session carrying no [`ClippedScanLimit`] — which is
@@ -2646,6 +2657,186 @@ struct GlobalTimestampBoundsCacheKey {
     table_uuid: uuid::Uuid,
     snapshot_id: i64,
     field_id: i32,
+}
+
+/// Full identity of one #7525 learned observation. Every field can change the
+/// work seen by the Parquet predicate, so none may be omitted from reuse.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ClippedEqualityObservationKey {
+    table_uuid: uuid::Uuid,
+    snapshot_id: i64,
+    normalized_bound_predicate: String,
+    projected_field_ids: Vec<i32>,
+    clipped_limit: usize,
+    reader_batch_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ClippedEqualityObservationSignal {
+    predicate_input_rows: u64,
+    predicate_output_rows: u64,
+    manifest_files_pruned_metrics: u64,
+    row_groups_pruned_stats: u64,
+    rows_pruned_selection: u64,
+}
+
+impl ClippedEqualityObservationSignal {
+    fn suppress_reader_predicate(self) -> bool {
+        self.predicate_input_rows > 0
+            && self.manifest_files_pruned_metrics == 0
+            && self.row_groups_pruned_stats == 0
+            && self.rows_pruned_selection == 0
+            && self.predicate_output_rows.saturating_mul(8) >= self.predicate_input_rows
+    }
+}
+
+const CLIPPED_EQUALITY_OBSERVATION_CACHE_CAP: usize = 256;
+type ClippedEqualityObservationCacheInner = (
+    HashMap<ClippedEqualityObservationKey, ClippedEqualityObservationSignal>,
+    VecDeque<ClippedEqualityObservationKey>,
+);
+
+static CLIPPED_EQUALITY_OBSERVATION_CACHE: OnceLock<
+    std::sync::Mutex<ClippedEqualityObservationCacheInner>,
+> = OnceLock::new();
+
+fn clipped_equality_observation_cache(
+) -> &'static std::sync::Mutex<ClippedEqualityObservationCacheInner> {
+    CLIPPED_EQUALITY_OBSERVATION_CACHE
+        .get_or_init(|| std::sync::Mutex::new((HashMap::new(), VecDeque::new())))
+}
+
+fn clipped_equality_observation_cache_get(
+    key: &ClippedEqualityObservationKey,
+) -> Option<ClippedEqualityObservationSignal> {
+    clipped_equality_observation_cache()
+        .lock()
+        .ok()?
+        .0
+        .get(key)
+        .copied()
+}
+
+fn clipped_equality_observation_cache_put(
+    key: ClippedEqualityObservationKey,
+    signal: ClippedEqualityObservationSignal,
+) {
+    if let Ok(mut guard) = clipped_equality_observation_cache().lock() {
+        let (map, order) = &mut *guard;
+        if map.insert(key.clone(), signal).is_none() {
+            order.push_back(key);
+            while map.len() > CLIPPED_EQUALITY_OBSERVATION_CACHE_CAP {
+                if let Some(old) = order.pop_front() {
+                    map.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn clipped_equality_observation_key(
+    table: &Table,
+    snapshot_id: Option<i64>,
+    output_schema: &ArrowSchemaRef,
+    predicate: &Predicate,
+    clipped_limit: Option<usize>,
+    reader_batch_size: Option<usize>,
+) -> Option<ClippedEqualityObservationKey> {
+    let clipped_limit = clipped_limit.filter(|limit| *limit > 0)?;
+    let bound = predicate
+        .clone()
+        .bind(table.metadata().current_schema().clone(), true)
+        .ok()?;
+    let BoundPredicate::Binary(expression) = &bound else {
+        return None;
+    };
+    if expression.op() != PredicateOperator::Eq
+        || !matches!(expression.literal().literal(), PrimitiveLiteral::String(_))
+    {
+        return None;
+    }
+    let snapshot_id = snapshot_id.or_else(|| {
+        table
+            .metadata()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id())
+    })?;
+    let projected_field_ids = output_schema
+        .fields()
+        .iter()
+        .map(|field| iceberg_field_id(field))
+        .collect::<Option<Vec<_>>>()?;
+    Some(ClippedEqualityObservationKey {
+        table_uuid: table.metadata().uuid(),
+        snapshot_id,
+        normalized_bound_predicate: serde_json::to_string(&bound).ok()?,
+        projected_field_ids,
+        clipped_limit,
+        reader_batch_size: reader_batch_size
+            .map(|size| size.max(1))
+            .unwrap_or(parquet::arrow::arrow_reader::DEFAULT_BATCH_SIZE),
+    })
+}
+
+#[derive(Debug)]
+struct ClippedEqualityObservation {
+    key: ClippedEqualityObservationKey,
+    remaining_partitions: std::sync::atomic::AtomicUsize,
+    invalid: std::sync::atomic::AtomicBool,
+    predicate_input_rows: std::sync::atomic::AtomicU64,
+    predicate_output_rows: std::sync::atomic::AtomicU64,
+    manifest_files_pruned_metrics: u64,
+    row_groups_pruned_stats: std::sync::atomic::AtomicU64,
+    rows_pruned_selection: std::sync::atomic::AtomicU64,
+}
+
+impl ClippedEqualityObservation {
+    fn new(
+        key: ClippedEqualityObservationKey,
+        partitions: usize,
+        manifest_files_pruned_metrics: u64,
+    ) -> Self {
+        Self {
+            key,
+            remaining_partitions: std::sync::atomic::AtomicUsize::new(partitions),
+            invalid: std::sync::atomic::AtomicBool::new(false),
+            predicate_input_rows: std::sync::atomic::AtomicU64::new(0),
+            predicate_output_rows: std::sync::atomic::AtomicU64::new(0),
+            manifest_files_pruned_metrics,
+            row_groups_pruned_stats: std::sync::atomic::AtomicU64::new(0),
+            rows_pruned_selection: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn finish_partition(&self, counters: &ScanCounters, valid: bool) {
+        use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+        self.predicate_input_rows
+            .fetch_add(counters.predicate_input_rows.load(Relaxed), Relaxed);
+        self.predicate_output_rows
+            .fetch_add(counters.predicate_output_rows.load(Relaxed), Relaxed);
+        self.row_groups_pruned_stats
+            .fetch_add(counters.row_groups_pruned_stats.load(Relaxed), Relaxed);
+        self.rows_pruned_selection
+            .fetch_add(counters.rows_pruned_selection.load(Relaxed), Relaxed);
+        if !valid {
+            self.invalid.store(true, Relaxed);
+        }
+        if self.remaining_partitions.fetch_sub(1, AcqRel) != 1 || self.invalid.load(Relaxed) {
+            return;
+        }
+        let signal = ClippedEqualityObservationSignal {
+            predicate_input_rows: self.predicate_input_rows.load(Relaxed),
+            predicate_output_rows: self.predicate_output_rows.load(Relaxed),
+            manifest_files_pruned_metrics: self.manifest_files_pruned_metrics,
+            row_groups_pruned_stats: self.row_groups_pruned_stats.load(Relaxed),
+            rows_pruned_selection: self.rows_pruned_selection.load(Relaxed),
+        };
+        if signal.predicate_input_rows > 0 {
+            clipped_equality_observation_cache_put(self.key.clone(), signal);
+        }
+    }
 }
 
 const GLOBAL_TIMESTAMP_BOUNDS_CACHE_CAP: usize = 256;
@@ -2834,21 +3025,42 @@ impl SiglakeIcebergTableScan {
             .map(|order| order.field.clone())
             .unwrap_or_else(|| Arc::from(CANONICAL_EVENT_TIME_FIELD));
         let tuning = crate::current_query_scan_tuning();
-        let predicates = (tuning.predicate_pushdown_control
-            != crate::PredicatePushdownControl::SuppressReaderPredicate)
-            .then(|| PredicateConverter::new(&schema).convert_filters(filters))
-            .flatten();
-        let text_tokenizers = loaded_table_index_config(&table)
-            .map_err(|e| DataFusionError::External(e.into()))?
-            .map(|config| text_field_tokenizers(&config))
-            .unwrap_or_default();
-        let mut raw_prune_spec = extract_raw_prune_spec(filters, &text_tokenizers)?;
+        let candidate_predicates = PredicateConverter::new(&schema).convert_filters(filters);
         let clipped_limit = limit.or_else(|| {
             state
                 .config()
                 .get_extension::<ClippedScanLimit>()
                 .map(|limit| limit.limit)
         });
+        let learned_key = (tuning.clipped_equality_learned_gate_prototype
+            && tuning.predicate_pushdown_control
+                != crate::PredicatePushdownControl::SuppressReaderPredicate)
+            .then(|| {
+                clipped_equality_observation_key(
+                    &table,
+                    snapshot_id,
+                    &output_schema,
+                    candidate_predicates.as_ref()?,
+                    clipped_limit,
+                    tuning.batch_size,
+                )
+            })
+            .flatten();
+        let learned_signal = learned_key
+            .as_ref()
+            .and_then(clipped_equality_observation_cache_get);
+        let suppress_learned =
+            learned_signal.is_some_and(ClippedEqualityObservationSignal::suppress_reader_predicate);
+        let predicates = (tuning.predicate_pushdown_control
+            != crate::PredicatePushdownControl::SuppressReaderPredicate
+            && !suppress_learned)
+            .then_some(candidate_predicates)
+            .flatten();
+        let text_tokenizers = loaded_table_index_config(&table)
+            .map_err(|e| DataFusionError::External(e.into()))?
+            .map(|config| text_field_tokenizers(&config))
+            .unwrap_or_default();
+        let mut raw_prune_spec = extract_raw_prune_spec(filters, &text_tokenizers)?;
         let text_index_decline = text_index_decline_reason(
             raw_prune_spec.is_some(),
             state
@@ -2883,7 +3095,7 @@ impl SiglakeIcebergTableScan {
         // Resolved ONCE per scan so the refusal, the cached-plan decision and
         // the plan-cache key all see the same budget.
         let global_fan_in_budget = ordered_merge_global_fanin_for(state);
-        let mut task_partitions = plan_task_partitions(
+        let (mut task_partitions, manifest_files_pruned_metrics) = plan_task_partitions(
             &table,
             snapshot_id,
             projection.as_ref(),
@@ -3115,6 +3327,16 @@ impl SiglakeIcebergTableScan {
             );
         }
         let partition_count = task_partitions.len().max(1);
+        let clipped_equality_observation = learned_key
+            .filter(|_| learned_signal.is_none())
+            .filter(|_| !task_partitions.is_empty())
+            .map(|key| {
+                Arc::new(ClippedEqualityObservation::new(
+                    key,
+                    task_partitions.len(),
+                    manifest_files_pruned_metrics,
+                ))
+            });
         // #4865: stage the start of an UNORDERED, row-clipped `LIMIT n` scan.
         // Scoped by query shape, not by layout: `ClippedScanLimit` is set only
         // where every operator between the scan and the limit passes rows
@@ -3250,6 +3472,7 @@ impl SiglakeIcebergTableScan {
             raw_prune_spec,
             promoted_prune,
             task_partitions: Arc::new(task_partitions),
+            manifest_files_pruned_metrics,
             // Captured here rather than read in execute(): a plan is executed
             // through whatever `TaskContext` the caller supplies, and only
             // one of them is the session's. The mid-flight collector's now is
@@ -3274,6 +3497,7 @@ impl SiglakeIcebergTableScan {
             ordering_outcome,
             residual_filtered: filtered_scan,
             partition_tracker: Arc::new(ScanPartitionTracker::default()),
+            clipped_equality_observation,
             admission: clipped_admission,
             ordered_limit: state
                 .config()
@@ -3327,6 +3551,11 @@ impl SiglakeIcebergTableScan {
         self.file_attribution.snapshot(self.live_partitions() == 0)
     }
 
+    /// Files rejected by manifest lower/upper-bound or null-count metrics.
+    pub fn manifest_files_pruned_metrics(&self) -> u64 {
+        self.manifest_files_pruned_metrics
+    }
+
     /// WS-3: build a sorted partition stream by k-way merging the per-file
     /// batch streams on `timestamp` in the declared direction — for partitions
     /// whose files OVERLAP in time (a disjoint run streams by plain ordered
@@ -3361,6 +3590,7 @@ impl SiglakeIcebergTableScan {
                 .with_data_file_concurrency_limit(1)
                 .with_row_selection_enabled(reader_tuning.row_selection_enabled)
                 .with_predicate_evaluation_observer(reader_tuning.predicate_evaluation_observer)
+                .with_predicate_evaluation_counting(reader_tuning.predicate_evaluation_counting)
                 .with_scan_counters(Some(scan_counters))
                 .with_file_opened_observer(Some(Arc::new(move |task| {
                     file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
@@ -5442,6 +5672,8 @@ struct SourceMetricsStream {
     /// Decremented once, after the fold, so `settle_scan_partitions` wakes to
     /// complete counters.
     partition_tracker: Arc<ScanPartitionTracker>,
+    clipped_equality_observation: Option<Arc<ClippedEqualityObservation>>,
+    cancel: Option<QueryCancel>,
     /// #4865: this partition's place in the clipped-limit admission ramp.
     /// `AdmissionGate::Open` for every other shape.
     gate: AdmissionGate,
@@ -5645,6 +5877,11 @@ impl SourceMetricsStream {
             self.decoded_bytes,
             &self.file_cache_counters,
         );
+        if let Some(observation) = &self.clipped_equality_observation {
+            let valid =
+                error.is_none() && !self.cancel.as_ref().is_some_and(QueryCancel::is_cancelled);
+            observation.finish_partition(&self.scan_counters, valid);
+        }
         if self.output_batches > 1 {
             metrics::histogram!("siglake_query_scan_partition_inter_batch_gap_seconds_mean")
                 .record(self.inter_batch_gap_sum_secs / (self.output_batches - 1) as f64);
@@ -5855,6 +6092,7 @@ fn open_task_batch_stream_uncached(
         .with_data_file_concurrency_limit(1)
         .with_row_selection_enabled(reader_tuning.row_selection_enabled)
         .with_predicate_evaluation_observer(reader_tuning.predicate_evaluation_observer)
+        .with_predicate_evaluation_counting(reader_tuning.predicate_evaluation_counting)
         .with_scan_counters(Some(scan_counters))
         .with_file_opened_observer(Some(Arc::new(move |_task| {
             if let Some(identity) = &opened_identity {
@@ -6576,6 +6814,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 // within the survivors.
                 .with_row_selection_enabled(reader_tuning.row_selection_enabled)
                 .with_predicate_evaluation_observer(reader_tuning.predicate_evaluation_observer)
+                .with_predicate_evaluation_counting(reader_tuning.predicate_evaluation_counting)
                 .with_scan_counters(Some(scan_counters.clone()))
                 .with_file_opened_observer(Some(Arc::new(move |task| {
                     file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
@@ -6692,6 +6931,8 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
             file_cache_counters,
             detail_metrics: ScanDetailMetrics::new(&metrics, partition),
             partition_tracker: self.partition_tracker.clone(),
+            clipped_equality_observation: self.clipped_equality_observation.clone(),
+            cancel: self.cancel.clone(),
             gate,
             finished: false,
         }))
@@ -7192,11 +7433,12 @@ impl TableProvider for SiglakeStaticTableProvider {
             .iter()
             .map(|expr| {
                 pushdown_kind(expr, &self.schema, &text_tokenizers, &promoted).map(|kind| {
-                    filter_pushdown_for_control(
-                        kind,
-                        file_cache_enabled,
-                        tuning.predicate_pushdown_control,
-                    )
+                    let control = if tuning.clipped_equality_learned_gate_prototype {
+                        crate::PredicatePushdownControl::RetainResidual
+                    } else {
+                        tuning.predicate_pushdown_control
+                    };
+                    filter_pushdown_for_control(kind, file_cache_enabled, control)
                 })
             })
             .collect()
@@ -7351,7 +7593,7 @@ async fn plan_task_partitions(
     target_partitions: usize,
     tuning: crate::QueryScanTuning,
     shard: Option<ScanShard>,
-) -> DFResult<Vec<Vec<FileScanTask>>> {
+) -> DFResult<(Vec<Vec<FileScanTask>>, u64)> {
     let scan_builder = match snapshot_id {
         Some(snapshot_id) => table.scan().snapshot_id(snapshot_id),
         None => table.scan(),
@@ -7377,6 +7619,7 @@ async fn plan_task_partitions(
     let table_scan = scan_builder
         .build()
         .map_err(|e| DataFusionError::External(e.into()))?;
+    let manifest_scan_counters = table_scan.manifest_scan_counters().clone();
     let tasks = table_scan
         .plan_files()
         .await
@@ -7390,11 +7633,12 @@ async fn plan_task_partitions(
         Some(s) => shard_file_tasks(tasks, s),
         None => tasks,
     };
-    Ok(partition_file_tasks(
-        tasks,
-        limit,
-        target_partitions,
-        tuning,
+    let manifest_files_pruned_metrics = manifest_scan_counters
+        .data_files_pruned_metrics
+        .load(Relaxed);
+    Ok((
+        partition_file_tasks(tasks, limit, target_partitions, tuning),
+        manifest_files_pruned_metrics,
     ))
 }
 
@@ -7945,6 +8189,7 @@ fn effective_reader_tuning(
             row_selection_enabled: tuning.predicate_pushdown_control
                 != crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
             predicate_evaluation_observer: tuning.predicate_evaluation_observer,
+            predicate_evaluation_counting: tuning.clipped_equality_learned_gate_prototype,
         };
     }
     let enable_range = match (
@@ -7973,6 +8218,7 @@ fn effective_reader_tuning(
         row_selection_enabled: tuning.predicate_pushdown_control
             != crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
         predicate_evaluation_observer: tuning.predicate_evaluation_observer,
+        predicate_evaluation_counting: tuning.clipped_equality_learned_gate_prototype,
     }
 }
 
@@ -8717,6 +8963,59 @@ mod tests {
                 _ => 0,
             })
             .sum()
+    }
+
+    fn learned_key(snapshot_id: i64) -> ClippedEqualityObservationKey {
+        ClippedEqualityObservationKey {
+            table_uuid: uuid::Uuid::new_v4(),
+            snapshot_id,
+            normalized_bound_predicate: "source = us-east-2".to_string(),
+            projected_field_ids: vec![1, 3, 6],
+            clipped_limit: 100,
+            reader_batch_size: 8_192,
+        }
+    }
+
+    #[test]
+    fn learned_gate_requires_complete_pruning_free_signal() {
+        let common = ClippedEqualityObservationSignal {
+            predicate_input_rows: 40_000,
+            predicate_output_rows: 10_000,
+            ..Default::default()
+        };
+        assert!(common.suppress_reader_predicate());
+        assert!(!ClippedEqualityObservationSignal {
+            manifest_files_pruned_metrics: 1,
+            ..common
+        }
+        .suppress_reader_predicate());
+        assert!(!ClippedEqualityObservationSignal {
+            row_groups_pruned_stats: 1,
+            ..common
+        }
+        .suppress_reader_predicate());
+        assert!(!ClippedEqualityObservationSignal {
+            rows_pruned_selection: 1,
+            ..common
+        }
+        .suppress_reader_predicate());
+        assert!(!ClippedEqualityObservationSignal {
+            predicate_input_rows: 0,
+            predicate_output_rows: 0,
+            ..common
+        }
+        .suppress_reader_predicate());
+    }
+
+    #[test]
+    fn cancelled_observation_does_not_publish() {
+        let key = learned_key(41);
+        let observation = ClippedEqualityObservation::new(key.clone(), 1, 0);
+        let counters = ScanCounters::default();
+        counters.predicate_input_rows.store(8_192, Relaxed);
+        counters.predicate_output_rows.store(4_096, Relaxed);
+        observation.finish_partition(&counters, false);
+        assert_eq!(clipped_equality_observation_cache_get(&key), None);
     }
 
     #[test]

@@ -25,12 +25,26 @@ mod task;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow_array::RecordBatch;
 use futures::channel::mpsc::{Sender, channel};
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt, TryStreamExt};
 pub use task::*;
+
+/// Internal file-level pruning counts collected while a table scan walks data
+/// manifest entries. These counts are complete once the stream returned by
+/// [`TableScan::plan_files`] has been fully consumed.
+#[derive(Debug, Default)]
+pub struct ManifestScanCounters {
+    /// Live data-file entries considered by partition and file metrics.
+    pub data_files_considered: AtomicU64,
+    /// Data files rejected by partition values.
+    pub data_files_pruned_partition: AtomicU64,
+    /// Data files rejected by lower/upper-bound and null-count metrics.
+    pub data_files_pruned_metrics: AtomicU64,
+}
 
 use crate::arrow::ArrowReaderBuilder;
 pub use crate::arrow::{ScanMetrics, ScanResult};
@@ -249,6 +263,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        manifest_scan_counters: Arc::new(ManifestScanCounters::default()),
                         runtime: self.table.runtime().clone(),
                     });
                 };
@@ -368,6 +383,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            manifest_scan_counters: Arc::new(ManifestScanCounters::default()),
             runtime: self.table.runtime().clone(),
         })
     }
@@ -398,10 +414,17 @@ pub struct TableScan {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
 
+    manifest_scan_counters: Arc<ManifestScanCounters>,
+
     runtime: Runtime,
 }
 
 impl TableScan {
+    /// File-level pruning counts for this scan's manifest walk.
+    pub fn manifest_scan_counters(&self) -> &Arc<ManifestScanCounters> {
+        &self.manifest_scan_counters
+    }
+
     /// Returns a stream of [`FileScanTask`]s.
     pub async fn plan_files(&self) -> Result<FileScanTaskStream> {
         let Some(plan_context) = self.plan_context.as_ref() else {
@@ -491,6 +514,7 @@ impl TableScan {
         // Process the data file [`ManifestEntry`] stream in parallel
         {
             let rt_inner = rt.clone();
+            let manifest_scan_counters = self.manifest_scan_counters.clone();
             rt.cpu().spawn(async move {
                 let result = manifest_entry_data_ctx_rx
                     .map(|me_ctx| Ok((me_ctx, file_scan_task_tx.clone())))
@@ -498,6 +522,7 @@ impl TableScan {
                         concurrency_limit_manifest_entries,
                         |(manifest_entry_context, tx)| {
                             let rt_inner = rt_inner.clone();
+                            let manifest_scan_counters = manifest_scan_counters.clone();
                             async move {
                                 rt_inner
                                     .cpu()
@@ -505,6 +530,7 @@ impl TableScan {
                                         Self::process_data_manifest_entry(
                                             manifest_entry_context,
                                             tx,
+                                            manifest_scan_counters,
                                         )
                                         .await
                                     })
@@ -554,6 +580,7 @@ impl TableScan {
     async fn process_data_manifest_entry(
         manifest_entry_context: ManifestEntryContext,
         mut file_scan_task_tx: Sender<Result<FileScanTask>>,
+        counters: Arc<ManifestScanCounters>,
     ) -> Result<()> {
         // skip processing this manifest entry if it has been marked as deleted
         if !manifest_entry_context.manifest_entry.is_alive() {
@@ -567,6 +594,8 @@ impl TableScan {
                 "Encountered an entry for a delete file in a data file manifest",
             ));
         }
+
+        counters.data_files_considered.fetch_add(1, Ordering::Relaxed);
 
         if let Some(ref bound_predicates) = manifest_entry_context.bound_predicates {
             let BoundPredicates {
@@ -585,6 +614,9 @@ impl TableScan {
             // skip any data file whose partition data indicates that it can't contain
             // any data that matches this scan's filter
             if !expression_evaluator.eval(manifest_entry_context.manifest_entry.data_file())? {
+                counters
+                    .data_files_pruned_partition
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
 
@@ -594,6 +626,9 @@ impl TableScan {
                 manifest_entry_context.manifest_entry.data_file(),
                 false,
             )? {
+                counters
+                    .data_files_pruned_metrics
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(());
             }
         }

@@ -31,6 +31,12 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   ramp opens first no longer varies run to run — but that fixes the spread,
   not the level: the same retained runs took 379–508 ms whenever the file they
   opened had to be read. No matched round has been run against the ceilings.
+- **The clipped equality learned gate is local-only.** A bounded prototype can
+  suppress the Parquet row predicate on a repeated, pruning-free snapshot key,
+  while keeping the exact residual. Manifest-file, row-group and page pruning
+  now force retention, and cancelled observations are discarded. The
+  one-eighth survival threshold has only local fixture evidence; the query
+  server does not enable the prototype and production pushdown is unchanged.
 - **The numeric TopK route's footer reuse is unmeasured in the field.**
   Snapshot-qualified value-only Int64 `ORDER BY … LIMIT` reads prune row groups
   by exact Parquet bounds (#6978), and the matched #7076 round measured that on

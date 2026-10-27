@@ -29,6 +29,7 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
+use crate::arrow::ScanCounters;
 use crate::error::Result;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -43,6 +44,7 @@ impl ArrowReader {
         iceberg_field_ids: &HashSet<i32>,
         field_id_map: &HashMap<i32, usize>,
         observer: Option<fn(usize, usize)>,
+        counters: Option<Arc<ScanCounters>>,
     ) -> Result<RowFilter> {
         // Collect Parquet column indices from field ids.
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
@@ -66,6 +68,14 @@ impl ArrowReader {
         let observed_predicate = move |batch: arrow_array::RecordBatch| {
             let input_rows = batch.num_rows();
             let matches = predicate_func(batch)?;
+            if let Some(counters) = counters.as_ref() {
+                counters
+                    .predicate_input_rows
+                    .fetch_add(input_rows as u64, std::sync::atomic::Ordering::Relaxed);
+                counters
+                    .predicate_output_rows
+                    .fetch_add(matches.true_count() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             if let Some(observer) = observer {
                 observer(input_rows, matches.true_count());
             }

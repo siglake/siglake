@@ -40,6 +40,10 @@ pub struct ScanCounters {
     pub row_groups_read: AtomicU64,
     /// Rows skipped before decode by a row selection.
     pub rows_pruned_selection: AtomicU64,
+    /// Rows presented to Parquet row predicates.
+    pub predicate_input_rows: AtomicU64,
+    /// Rows accepted by Parquet row predicates.
+    pub predicate_output_rows: AtomicU64,
     /// Physical object-store range reads, including delete files.
     pub object_store_reads: AtomicU64,
     /// Physical Parquet and Puffin footer bytes.

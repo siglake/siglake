@@ -58,13 +58,11 @@ snapshot therefore starts cold. Cancellation before scan settlement must not
 publish a cache entry. The entry has no time-to-live: snapshot identity is its
 validity boundary.
 
-The candidate also needs a verified count of files removed by manifest metrics
-and row groups removed by statistics before it can become a general production
-gate. `rows_pruned_selection = 0` says nothing about those earlier pruning
-stages. The four fixtures happen to put every file-prunable case in the
-nonzero-selection arm, but that correlation is not a storage invariant. Until
-the planner exposes the missing count, a production implementation must keep
-the predicate. This experiment therefore does not ship the learned cache.
+Task #7525 added the missing internal counts and a local-only learned-cache
+prototype. The reader already counted row groups rejected by statistics;
+Iceberg planning now also counts live data files rejected by manifest metrics.
+`rows_pruned_selection = 0` alone still says nothing about either earlier
+stage, so the prototype suppresses only when all three pruning counts are zero.
 
 ## Matched local result
 
@@ -115,7 +113,41 @@ non-prunable fixtures.
   policy.
 - The test threshold only brackets 5.86% and 25% survival. It does not locate a
   production break-even point.
-- No cache implementation, production knob, public metric or shipped policy.
+- The bounded cache is an in-process qualification prototype. There is no
+  production knob, public metric or shipped policy.
+
+## #7525 cache qualification
+
+The prototype holds at most 256 entries in insertion order. Entries have no
+time-to-live. Its complete key is:
+
+```text
+(table UUID, snapshot ID, serialized normalized bound predicate,
+ ordered projected Iceberg field IDs, clipped limit,
+ resolved Parquet reader batch size)
+```
+
+The cold execution keeps the reader predicate and publishes only after every
+scan partition settles. An error or request cancellation marks the observation
+invalid; the last partition then discards it. A zero-input observation and a
+scan whose key cannot be completed are also not published. Missing entries
+keep current policy. The exact DataFusion `FilterExec` remains above the scan
+on cold and warm executions.
+
+The deterministic local test covers these cases:
+
+| layout | manifest metrics pruned | row groups pruned | page rows pruned | repeat decision |
+| --- | ---: | ---: | ---: | --- |
+| common interleaved equality | 0 | 0 | 0 | suppress |
+| one target-free file | >0 | 0 | 0 | retain |
+| one target-free row group | 0 | >0 | 0 | retain |
+| nullable UTF-8 equality | 0 | 0 | 0 | suppress, exact residual excludes nulls |
+
+Appending creates a new snapshot-key miss for the otherwise identical query.
+A separate unit check supplies nonzero predicate counts to an observation,
+marks its partition cancelled, and verifies that no entry appears. The local
+qualification passed in 5.78 seconds. It does not authorize production use;
+the one-eighth threshold and deployment behavior remain unqualified.
 
 ## Reproduction
 
@@ -124,6 +156,10 @@ cargo test -p siglake-storage \
   --test clipped_equality_pushdown_layouts \
   clipped_equality_learned_gate_attribution \
   -- --ignored --nocapture
+
+cargo test -p siglake-storage \
+  --test clipped_equality_pushdown_layouts \
+  learned_cache_requires_all_earlier_pruning_signals_and_snapshot_identity
 ```
 
 The retained run was made on 2026-10-27 on the shared 32-core lane. It finished

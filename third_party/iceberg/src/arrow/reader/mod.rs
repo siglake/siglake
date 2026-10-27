@@ -146,6 +146,7 @@ pub struct ArrowReaderBuilder {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     predicate_evaluation_observer: Option<fn(usize, usize)>,
+    predicate_evaluation_counting: bool,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
     scan_counters: Option<Arc<ScanCounters>>,
@@ -170,6 +171,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             predicate_evaluation_observer: None,
+            predicate_evaluation_counting: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
             scan_counters: None,
@@ -216,6 +218,13 @@ impl ArrowReaderBuilder {
         observer: Option<fn(usize, usize)>,
     ) -> Self {
         self.predicate_evaluation_observer = observer;
+        self
+    }
+
+    /// Count predicate input and accepted rows in this reader's internal scan
+    /// counters. Disabled by default.
+    pub fn with_predicate_evaluation_counting(mut self, enabled: bool) -> Self {
+        self.predicate_evaluation_counting = enabled;
         self
     }
 
@@ -323,6 +332,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             predicate_evaluation_observer: self.predicate_evaluation_observer,
+            predicate_evaluation_counting: self.predicate_evaluation_counting,
             parquet_read_options: self.parquet_read_options,
             scan_counters: self.scan_counters,
             file_opened_observer: self.file_opened_observer,
@@ -349,6 +359,7 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     predicate_evaluation_observer: Option<fn(usize, usize)>,
+    predicate_evaluation_counting: bool,
     parquet_read_options: ParquetReadOptions,
     scan_counters: Option<Arc<ScanCounters>>,
     file_opened_observer: Option<FileOpenedObserver>,
