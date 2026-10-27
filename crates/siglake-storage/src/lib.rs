@@ -535,7 +535,8 @@ pub fn configure_object_cache_max_bytes(max_bytes: u64) {
     ::iceberg::io::set_object_cache_max_bytes(max_bytes);
 }
 
-pub(crate) fn current_query_scan_tuning() -> QueryScanTuning {
+/// Return the process-wide scan tuning currently used for new query contexts.
+pub fn current_query_scan_tuning() -> QueryScanTuning {
     *query_scan_tuning_cell()
         .read()
         .expect("query scan tuning lock poisoned")
