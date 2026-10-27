@@ -1790,6 +1790,116 @@ pub(crate) fn bounded_filter_mask_count(expr: &Expr) -> Option<u64> {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct FilterWorkspace {
+    masks: u64,
+    scalar_bytes_per_batch: u64,
+    attr_get_calls: u64,
+    attr_get_key_bytes: u64,
+}
+
+impl FilterWorkspace {
+    fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            masks: self.masks.checked_add(other.masks)?,
+            scalar_bytes_per_batch: self
+                .scalar_bytes_per_batch
+                .checked_add(other.scalar_bytes_per_batch)?,
+            attr_get_calls: self.attr_get_calls.checked_add(other.attr_get_calls)?,
+            attr_get_key_bytes: self
+                .attr_get_key_bytes
+                .checked_add(other.attr_get_key_bytes)?,
+        })
+    }
+}
+
+fn utf8_literal_bytes(expr: &Expr) -> Option<u64> {
+    let value = match expr {
+        Expr::Literal(datafusion::common::ScalarValue::Utf8(Some(value)), _)
+        | Expr::Literal(datafusion::common::ScalarValue::LargeUtf8(Some(value)), _)
+        | Expr::Literal(datafusion::common::ScalarValue::Utf8View(Some(value)), _) => value,
+        _ => return None,
+    };
+    u64::try_from(value.len()).ok()
+}
+
+/// The exact `attr_get` shape whose allocation can be bounded from one decoded
+/// WAL generation: a literal-key chain rooted at the `attributes` column.
+fn attr_get_chain_workspace(expr: &Expr) -> Option<(u64, u64)> {
+    let Expr::ScalarFunction(function) = expr else {
+        return None;
+    };
+    if !function.func.name().eq_ignore_ascii_case("attr_get") || function.args.len() != 2 {
+        return None;
+    }
+    let key_bytes = utf8_literal_bytes(&function.args[1])?;
+    match &function.args[0] {
+        Expr::Column(column) if column.name == "attributes" => Some((1, key_bytes)),
+        inner => {
+            let (calls, inner_key_bytes) = attr_get_chain_workspace(inner)?;
+            Some((
+                calls.checked_add(1)?,
+                inner_key_bytes.checked_add(key_bytes)?,
+            ))
+        }
+    }
+}
+
+/// Extend the scalar-mask whitelist only for literal-key `attr_get` equality.
+/// Other UDFs retain the committed-only refusal from #6879.
+fn bounded_filter_workspace(expr: &Expr) -> Option<FilterWorkspace> {
+    if let Some(masks) = bounded_filter_mask_count(expr) {
+        return Some(FilterWorkspace {
+            masks,
+            scalar_bytes_per_batch: bounded_filter_scalar_workspace(expr)?,
+            ..Default::default()
+        });
+    }
+    match expr {
+        Expr::Alias(alias) => bounded_filter_workspace(&alias.expr),
+        Expr::BinaryExpr(binary) if matches!(binary.op, Operator::And | Operator::Or) => {
+            let mut workspace = bounded_filter_workspace(&binary.left)?
+                .checked_add(bounded_filter_workspace(&binary.right)?)?;
+            workspace.masks = workspace.masks.checked_add(1)?;
+            Some(workspace)
+        }
+        Expr::BinaryExpr(binary)
+            if matches!(
+                binary.op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::IsDistinctFrom
+                    | Operator::IsNotDistinctFrom
+            ) =>
+        {
+            let (calls, key_bytes) = match (
+                attr_get_chain_workspace(&binary.left),
+                attr_get_chain_workspace(&binary.right),
+            ) {
+                (Some(workspace), None) if utf8_literal_bytes(&binary.right).is_some() => workspace,
+                (None, Some(workspace)) if utf8_literal_bytes(&binary.left).is_some() => workspace,
+                _ => return None,
+            };
+            Some(FilterWorkspace {
+                masks: 1,
+                attr_get_calls: calls,
+                attr_get_key_bytes: key_bytes,
+                ..Default::default()
+            })
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            let (calls, key_bytes) = attr_get_chain_workspace(inner)?;
+            Some(FilterWorkspace {
+                masks: 1,
+                attr_get_calls: calls,
+                attr_get_key_bytes: key_bytes,
+                ..Default::default()
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Run the query-local filter under its own reservation. Filtered value
 /// buffers cannot contain more values or variable-width payload than their
 /// inputs; the extra term covers one value bitmap per predicate plus the
@@ -1805,9 +1915,12 @@ fn filter_batches_charged(
     if filters.is_empty() || batches.is_empty() {
         return Some(Ok(batches.to_vec()));
     }
-    let Some(expression_masks) = filters.iter().try_fold(0u64, |count, filter| {
-        count.checked_add(bounded_filter_mask_count(filter)?)
-    }) else {
+    let Some(workspace) = filters
+        .iter()
+        .try_fold(FilterWorkspace::default(), |workspace, filter| {
+            workspace.checked_add(bounded_filter_workspace(filter)?)
+        })
+    else {
         metrics::counter!("siglake_query_wal_buffer_refused_filter_workspace_total").increment(1);
         return None;
     };
@@ -1816,16 +1929,29 @@ fn filter_batches_charged(
     });
     let mask_bytes = rows
         .div_ceil(8)
-        .saturating_mul(expression_masks.saturating_add(filters.len() as u64));
-    let scalar_bytes = filters
-        .iter()
-        .try_fold(0u64, |sum, expr| {
-            sum.checked_add(bounded_filter_scalar_workspace(expr)?)
-        })?
+        .checked_mul(workspace.masks.checked_add(filters.len() as u64)?)?;
+    let scalar_bytes = workspace
+        .scalar_bytes_per_batch
         .checked_mul(batches.len() as u64)?;
+    // Each attr_get result is no larger than its input JSON, but Arrow builders
+    // can retain a growing old allocation while allocating the next capacity.
+    // Four full source payloads per call plus per-row result/key arrays cover
+    // that overlap, nested-call intermediates, offsets and validity buffers.
+    let attr_get_bytes = batches_payload_bytes(batches)
+        .checked_mul(workspace.attr_get_calls)?
+        .checked_mul(4)?
+        .checked_add(
+            rows.checked_mul(
+                workspace
+                    .attr_get_calls
+                    .checked_mul(64)?
+                    .checked_add(workspace.attr_get_key_bytes.checked_mul(2)?)?,
+            )?,
+        )?;
     let bound = batches_payload_bytes(batches)
         .checked_add(mask_bytes)?
-        .checked_add(scalar_bytes)?;
+        .checked_add(scalar_bytes)?
+        .checked_add(attr_get_bytes)?;
     let reservation = memory.try_reserve(bound)?;
     let filtered = match filter_batches(batches, filters, schema, state) {
         Ok(filtered) => filtered,
@@ -3734,6 +3860,7 @@ mod buffer_prefilter_tests {
     use super::*;
     use arrow_array::{RecordBatch, StringArray, TimestampNanosecondArray};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use datafusion::execution::FunctionRegistry;
     use datafusion::prelude::{col, lit, SessionContext};
 
     fn batch() -> (SchemaRef, RecordBatch) {
@@ -3816,5 +3943,50 @@ mod buffer_prefilter_tests {
             0,
             "contradictory filters must AND to nothing, not OR to everything"
         );
+    }
+
+    #[tokio::test]
+    async fn nested_attr_get_filter_reserves_workspace_before_evaluation() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "attributes",
+            DataType::Utf8,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec![
+                Some(r#"{"resource.labels":{"bench.resource.int":"42"}}"#),
+                Some(r#"{"resource.labels":{"other":"value"}}"#),
+            ]))],
+        )
+        .unwrap();
+        let ctx = SessionContext::new();
+        crate::udfs::register_udfs(&ctx);
+        let attr_get = ctx.state().udf("attr_get").unwrap();
+        let inner = attr_get.call(vec![col("attributes"), lit("resource.labels")]);
+        let filters = [attr_get
+            .call(vec![inner, lit("bench.resource.int")])
+            .eq(lit("42"))];
+        let source_payload = batches_payload_bytes(std::slice::from_ref(&batch));
+
+        let low = BufferMemoryBudget::new(source_payload);
+        assert!(filter_batches_charged(
+            &low,
+            std::slice::from_ref(&batch),
+            &filters,
+            &schema,
+            &ctx.state(),
+        )
+        .is_none());
+        assert_eq!(low.used(), 0);
+
+        let memory = BufferMemoryBudget::new(1024 * 1024);
+        let output = filter_batches_charged(&memory, &[batch], &filters, &schema, &ctx.state())
+            .expect("workspace admitted")
+            .unwrap();
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert!(memory.used() > source_payload);
+        drop(output);
+        assert_eq!(memory.used(), 0);
     }
 }

@@ -584,13 +584,17 @@ embedded decoded buffer lengths. The reader decompresses the outer WAL frame
 into the admitted IPC extent. Before alignment, row counts and supported Arrow
 layouts price every missing-column allocation. Managed-index mapping is
 admitted only when the carrier attributes are empty and its builder layouts
-have a local bound; other mappings use the committed snapshot. The WAL filter pre-pass accepts
-only scalar comparisons and Boolean masks. String functions, casts, regular
-expressions, user-defined functions, and arithmetic use the committed snapshot
-instead of allocating an unpriced intermediate. Distributed WAL partials apply
-the same restriction to every executed aggregate, filter, projection, sort,
-and pushed scan predicate. Filter and ordered-union copies take per-query
-reservations, so simultaneous cache hits are additive.
+have a local bound; other mappings use the committed snapshot. The WAL filter
+pre-pass accepts scalar comparisons, Boolean masks, capped timestamp literals,
+and literal-key `attr_get` chains compared with a string literal or tested for
+NULL. The `attr_get` admission prices builder growth, scalar-key arrays, and
+each nested result from the decoded source payload before evaluation. Other
+string functions, casts, regular expressions, user-defined functions, and
+arithmetic use the committed snapshot instead of allocating an unpriced
+intermediate. Distributed WAL partials apply the narrower scalar restriction
+to every executed aggregate, filter, projection, sort, and pushed scan
+predicate. Filter and ordered-union copies take per-query reservations, so
+simultaneous cache hits are additive.
 Reservations are attached to the Arrow buffers they cover and remain charged
 when a caller retains a batch after the plan, stream, or cache generation is
 gone. This is a payload-ownership bound, not an RSS estimate. It defaults to
