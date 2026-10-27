@@ -95,6 +95,14 @@ pub struct QueryScanTuning {
     /// the other modes exist only for the immutable-layout measurement in
     /// `clipped_equality_pushdown_attribution.rs`.
     pub predicate_pushdown_control: PredicatePushdownControl,
+    /// #7513 LOCAL QUALIFICATION OBSERVER: report the rows presented to and
+    /// accepted by each Parquet row-filter evaluation.
+    ///
+    /// Deliberately has no environment variable, CLI flag, chart value or
+    /// operator field. Production leaves it unset; the clipped equality gate
+    /// fixture uses it to verify the proposed run-time signal and its counting
+    /// cost without publishing a metric.
+    pub predicate_evaluation_observer: Option<fn(usize, usize)>,
     /// #4905 LOCAL QUALIFICATION PROTOTYPE: admit a fully drained read under a
     /// converted predicate, keyed by that predicate in addition to the shipped
     /// file/projection/delete/range/direction identity.
@@ -527,7 +535,8 @@ pub fn configure_object_cache_max_bytes(max_bytes: u64) {
     ::iceberg::io::set_object_cache_max_bytes(max_bytes);
 }
 
-pub(crate) fn current_query_scan_tuning() -> QueryScanTuning {
+/// Return the process-wide scan tuning currently used for new query contexts.
+pub fn current_query_scan_tuning() -> QueryScanTuning {
     *query_scan_tuning_cell()
         .read()
         .expect("query scan tuning lock poisoned")

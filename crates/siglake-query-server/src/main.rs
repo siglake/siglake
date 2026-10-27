@@ -19,6 +19,43 @@ use siglake_storage::{
     configure_query_scan_tuning, iceberg::IcebergContext, PredicatePushdownControl, QueryScanTuning,
 };
 
+fn configure_server_query_scan_tuning(query_scan: QueryScanConfig) {
+    configure_query_scan_tuning(QueryScanTuning {
+        reader_budget: query_scan.reader_budget,
+        file_concurrency_limit: query_scan.file_concurrency_limit,
+        batch_size: query_scan.batch_size,
+        range_coalesce_bytes: query_scan.range_coalesce_bytes,
+        range_fetch_concurrency: query_scan.range_fetch_concurrency,
+        range_adaptive_min_bytes: query_scan.range_adaptive_min_bytes,
+        range_adaptive_min_files: query_scan.range_adaptive_min_files,
+        adaptive_partition_min_bytes: query_scan.adaptive_partition_min_bytes,
+        adaptive_partition_min_files: query_scan.adaptive_partition_min_files,
+        file_cache_max_bytes: query_scan.file_cache_max_bytes,
+        file_cache_max_entries: query_scan.file_cache_max_entries,
+        ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
+        // #4847's row-group population is a local prototype with no operator
+        // surface; the server never turns it on.
+        file_cache_row_group_prototype: false,
+        // #4905's predicate-keyed population is a local prototype with no
+        // operator surface; the server never turns it on.
+        file_cache_predicate_key_prototype: false,
+        // #5074's shared population bound is a local qualification prototype
+        // with no operator surface; the server never turns it on.
+        file_cache_population_bound_prototype: false,
+        // #5786's pre-adoption unbounded-population control is local-only.
+        file_cache_unbounded_population_prototype: false,
+        // #4959's per-file attribution is a local qualification gate with no
+        // response or operator surface; the server never turns it on.
+        file_attribution_prototype: false,
+        // #7457's pushdown attribution arms exist only for the local
+        // measurement fixture; the server always runs shipped policy.
+        predicate_pushdown_control: PredicatePushdownControl::Production,
+        // #7513's observer is a local qualification hook with no operator
+        // surface; the server never installs it.
+        predicate_evaluation_observer: None,
+    });
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "siglake-query-server",
@@ -503,37 +540,7 @@ async fn run() -> Result<()> {
         bypass_reader_caches: false,
         ordered_drain_buffer_bytes: None,
     };
-    configure_query_scan_tuning(QueryScanTuning {
-        reader_budget: query_scan.reader_budget,
-        file_concurrency_limit: query_scan.file_concurrency_limit,
-        batch_size: query_scan.batch_size,
-        range_coalesce_bytes: query_scan.range_coalesce_bytes,
-        range_fetch_concurrency: query_scan.range_fetch_concurrency,
-        range_adaptive_min_bytes: query_scan.range_adaptive_min_bytes,
-        range_adaptive_min_files: query_scan.range_adaptive_min_files,
-        adaptive_partition_min_bytes: query_scan.adaptive_partition_min_bytes,
-        adaptive_partition_min_files: query_scan.adaptive_partition_min_files,
-        file_cache_max_bytes: query_scan.file_cache_max_bytes,
-        file_cache_max_entries: query_scan.file_cache_max_entries,
-        ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
-        // #4847's row-group population is a local prototype with no operator
-        // surface; the server never turns it on.
-        file_cache_row_group_prototype: false,
-        // #4905's predicate-keyed population is a local prototype with no
-        // operator surface; the server never turns it on.
-        file_cache_predicate_key_prototype: false,
-        // #5074's shared population bound is a local qualification prototype
-        // with no operator surface; the server never turns it on.
-        file_cache_population_bound_prototype: false,
-        // #5786's pre-adoption unbounded-population control is local-only.
-        file_cache_unbounded_population_prototype: false,
-        // #4959's per-file attribution is a local qualification gate with no
-        // response or operator surface; the server never turns it on.
-        file_attribution_prototype: false,
-        // #7457's pushdown attribution arms exist only for the local
-        // measurement fixture; the server always runs shipped policy.
-        predicate_pushdown_control: PredicatePushdownControl::Production,
-    });
+    configure_server_query_scan_tuning(query_scan);
     tracing::info!(
         target_partitions = query_scan.target_partitions,
         reader_budget = query_scan.reader_budget,
@@ -842,11 +849,21 @@ fn query_tenant_config_error(
 #[cfg(test)]
 mod tests {
     use super::{
-        allowed_tenants_from, jobs_store_uri_from, oidc_tenant_claim_from,
-        query_tenant_config_error, Cli, OidcVerifier,
+        allowed_tenants_from, configure_server_query_scan_tuning, jobs_store_uri_from,
+        oidc_tenant_claim_from, query_tenant_config_error, Cli, OidcVerifier,
     };
     use clap::{CommandFactory, Parser};
+    use siglake_query_server::QueryScanConfig;
     use siglake_storage::resolve_query_read_cache_config;
+
+    #[test]
+    fn server_never_installs_the_predicate_evaluation_observer() {
+        configure_server_query_scan_tuning(QueryScanConfig::default());
+
+        assert!(siglake_storage::current_query_scan_tuning()
+            .predicate_evaluation_observer
+            .is_none());
+    }
 
     #[test]
     fn cli_version_contains_the_embedded_provenance() {

@@ -195,7 +195,7 @@ fn adaptive_fanin_default(floor: usize, per_cpu: usize, ceiling: usize) -> usize
     cpus.saturating_mul(per_cpu).clamp(floor, ceiling)
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default)]
 struct EffectiveReaderTuning {
     batch_size: Option<usize>,
     range_coalesce_bytes: Option<u64>,
@@ -204,7 +204,27 @@ struct EffectiveReaderTuning {
     bypass_reader_caches: bool,
     ordered_drain_buffer_bytes: Option<u64>,
     row_selection_enabled: bool,
+    predicate_evaluation_observer: Option<fn(usize, usize)>,
 }
+
+impl PartialEq for EffectiveReaderTuning {
+    fn eq(&self, other: &Self) -> bool {
+        // The observer is an in-process test hook with one implementation.
+        // Function addresses are not stable equality keys, so effective
+        // configuration compares whether observation is enabled.
+        self.batch_size == other.batch_size
+            && self.range_coalesce_bytes == other.range_coalesce_bytes
+            && self.range_fetch_concurrency == other.range_fetch_concurrency
+            && self.reversed_chunk_rows == other.reversed_chunk_rows
+            && self.bypass_reader_caches == other.bypass_reader_caches
+            && self.ordered_drain_buffer_bytes == other.ordered_drain_buffer_bytes
+            && self.row_selection_enabled == other.row_selection_enabled
+            && self.predicate_evaluation_observer.is_some()
+                == other.predicate_evaluation_observer.is_some()
+    }
+}
+
+impl Eq for EffectiveReaderTuning {}
 
 /// What the Iceberg reader will actually do with byte ranges on one scan, as
 /// opposed to what siglake configured. #5806: leaving both range knobs unset
@@ -3340,6 +3360,7 @@ impl SiglakeIcebergTableScan {
             let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
                 .with_data_file_concurrency_limit(1)
                 .with_row_selection_enabled(reader_tuning.row_selection_enabled)
+                .with_predicate_evaluation_observer(reader_tuning.predicate_evaluation_observer)
                 .with_scan_counters(Some(scan_counters))
                 .with_file_opened_observer(Some(Arc::new(move |task| {
                     file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
@@ -5833,6 +5854,7 @@ fn open_task_batch_stream_uncached(
     let mut reader = ArrowReaderBuilder::new(file_io, iceberg::Runtime::current())
         .with_data_file_concurrency_limit(1)
         .with_row_selection_enabled(reader_tuning.row_selection_enabled)
+        .with_predicate_evaluation_observer(reader_tuning.predicate_evaluation_observer)
         .with_scan_counters(Some(scan_counters))
         .with_file_opened_observer(Some(Arc::new(move |_task| {
             if let Some(identity) = &opened_identity {
@@ -6553,6 +6575,7 @@ impl ExecutionPlan for SiglakeIcebergTableScan {
                 // those narrow row groups first, then the page index prunes rows
                 // within the survivors.
                 .with_row_selection_enabled(reader_tuning.row_selection_enabled)
+                .with_predicate_evaluation_observer(reader_tuning.predicate_evaluation_observer)
                 .with_scan_counters(Some(scan_counters.clone()))
                 .with_file_opened_observer(Some(Arc::new(move |task| {
                     file_attribution.observe(task, FileAttributionOutcome::ReaderOpened);
@@ -7921,6 +7944,7 @@ fn effective_reader_tuning(
                 .or(ordered_tuning.ordered_drain_buffer_bytes),
             row_selection_enabled: tuning.predicate_pushdown_control
                 != crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
+            predicate_evaluation_observer: tuning.predicate_evaluation_observer,
         };
     }
     let enable_range = match (
@@ -7948,6 +7972,7 @@ fn effective_reader_tuning(
             .or(ordered_tuning.ordered_drain_buffer_bytes),
         row_selection_enabled: tuning.predicate_pushdown_control
             != crate::PredicatePushdownControl::RetainResidualWithoutRowSelection,
+        predicate_evaluation_observer: tuning.predicate_evaluation_observer,
     }
 }
 

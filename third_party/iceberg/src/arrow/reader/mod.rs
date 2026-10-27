@@ -145,6 +145,7 @@ pub struct ArrowReaderBuilder {
     concurrency_limit_data_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    predicate_evaluation_observer: Option<fn(usize, usize)>,
     parquet_read_options: ParquetReadOptions,
     runtime: Runtime,
     scan_counters: Option<Arc<ScanCounters>>,
@@ -168,6 +169,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            predicate_evaluation_observer: None,
             parquet_read_options: ParquetReadOptions::builder().build(),
             runtime,
             scan_counters: None,
@@ -203,6 +205,17 @@ impl ArrowReaderBuilder {
     /// Determines whether to enable row selection.
     pub fn with_row_selection_enabled(mut self, row_selection_enabled: bool) -> Self {
         self.row_selection_enabled = row_selection_enabled;
+        self
+    }
+
+    /// Observe the input and matching row counts of each Parquet row-filter
+    /// evaluation. This is an in-process qualification hook; readers do no
+    /// extra accounting unless a caller installs it.
+    pub fn with_predicate_evaluation_observer(
+        mut self,
+        observer: Option<fn(usize, usize)>,
+    ) -> Self {
+        self.predicate_evaluation_observer = observer;
         self
     }
 
@@ -309,6 +322,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            predicate_evaluation_observer: self.predicate_evaluation_observer,
             parquet_read_options: self.parquet_read_options,
             scan_counters: self.scan_counters,
             file_opened_observer: self.file_opened_observer,
@@ -334,6 +348,7 @@ pub struct ArrowReader {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    predicate_evaluation_observer: Option<fn(usize, usize)>,
     parquet_read_options: ParquetReadOptions,
     scan_counters: Option<Arc<ScanCounters>>,
     file_opened_observer: Option<FileOpenedObserver>,
