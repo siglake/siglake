@@ -58,6 +58,19 @@ const MIN_AGGREGATE_READER_BUDGET: usize = 2;
 /// [`ScanAdmission`]; `2` doubles the admitted partition count whenever the
 /// paced batch/terminal credits reach the current width.
 const DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE: usize = 2;
+/// #7520: the widest planned scan whose first earned widening fills every
+/// partition instead of doubling.
+///
+/// #7515 (`docs/CLIPPED_ADMISSION_WAVE_LAYOUTS_2026-10-26.md`) held a layout
+/// fixed and varied only the factor. On the four-partition clustered layout —
+/// sixteen files pruned to four — factor 4 removed 12.037 ms of paired-median
+/// collect time with identical requested and decoded bytes: both factors open
+/// all four files, factor 2 just reaches them through `1 -> 2 -> 4`. On the
+/// sixteen-partition rare-scattered layout the same factor doubled requested
+/// and decoded bytes for a timing difference that went both ways. So the fill
+/// is capped at four planned partitions and everything wider keeps
+/// [`DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE`].
+const DEFAULT_SCAN_CLIPPED_ADMISSION_FILL_PARTITIONS: usize = 4;
 /// Raw source batches required to pay one clipped-admission credit.
 ///
 /// The original ramp paid on every batch and therefore reached all 15
@@ -113,33 +126,58 @@ fn ordered_merge_global_fanin_for(state: &dyn Session) -> usize {
     }
 }
 
-/// Resolve the clipped-limit admission ramp factor from the raw
-/// `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` string (`None` = unset). `0` turns the
-/// ramp off (every partition starts at once, the pre-#4865 behavior, and the
-/// negative-control arm of the local A/B); anything else is clamped to at least
-/// 2, because a factor of 1 would never widen the ramp. Unparseable values fall
-/// back to the default. Pure for the same reason as
+/// Resolve an EXPLICIT clipped-limit admission ramp factor from the raw
+/// `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` string. `None` — unset, empty or
+/// unparseable — means no override, so the partition-sensitive default in
+/// [`default_clipped_admission_wave`] applies. `0` turns the ramp off (every
+/// partition starts at once, the pre-#4865 behavior, and the negative-control
+/// arm of the local A/B); anything else is clamped to at least 2, because a
+/// factor of 1 would never widen the ramp. Pure for the same reason as
 /// [`ordered_drain_buffer_bytes_from`].
-fn clipped_admission_wave_from(configured: Option<&str>) -> usize {
+fn clipped_admission_wave_override_from(configured: Option<&str>) -> Option<usize> {
     match configured.and_then(|raw| raw.parse::<usize>().ok()) {
-        Some(0) => 0,
-        Some(factor) => factor.max(2),
-        None => DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE,
+        Some(0) => Some(0),
+        Some(factor) => Some(factor.max(2)),
+        None => None,
+    }
+}
+
+/// #7520: the default ramp factor for a scan that planned `partitions`
+/// partitions, counted at the scan node before any downstream repartitioning.
+///
+/// Two to four planned partitions get a factor equal to the partition count,
+/// so the FIRST earned widening admits all of them; the scan still starts one
+/// reader and still has to earn that credit. Above four, and for the
+/// single-partition case that never builds a ramp at all, the factor is the
+/// shipped [`DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE`]. See that constant's
+/// [`DEFAULT_SCAN_CLIPPED_ADMISSION_FILL_PARTITIONS`] neighbour for the
+/// measurement.
+fn default_clipped_admission_wave(partitions: usize) -> usize {
+    if (2..=DEFAULT_SCAN_CLIPPED_ADMISSION_FILL_PARTITIONS).contains(&partitions) {
+        partitions
+    } else {
+        DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE
     }
 }
 
 /// The admission ramp factor for one scan: the session's
-/// [`ClippedAdmissionWave`] extension when set, else the environment, else the
-/// default.
-fn clipped_admission_wave_for(state: &dyn Session) -> usize {
-    match state.config().get_extension::<ClippedAdmissionWave>() {
-        Some(wave) => wave.factor,
-        None => clipped_admission_wave_from(
-            std::env::var("SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE")
-                .ok()
-                .as_deref(),
-        ),
-    }
+/// [`ClippedAdmissionWave`] extension when set, else an explicit environment
+/// override, else the partition-sensitive default. An explicit factor — `0`
+/// included — is used exactly as given, so a matched A/B still varies one
+/// thing.
+fn clipped_admission_wave_for(state: &dyn Session, partitions: usize) -> usize {
+    state
+        .config()
+        .get_extension::<ClippedAdmissionWave>()
+        .map(|wave| wave.factor)
+        .or_else(|| {
+            clipped_admission_wave_override_from(
+                std::env::var("SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE")
+                    .ok()
+                    .as_deref(),
+            )
+        })
+        .unwrap_or_else(|| default_clipped_admission_wave(partitions))
 }
 
 /// #90: size the ordered-merge fan-in caps to the node instead of the fixed
@@ -718,8 +756,9 @@ fn next_scan_node_id() -> u64 {
 /// Injected through `SessionConfig` so a measurement can run the gated and
 /// ungated arms in one process without `set_var`, which the binary's parallel
 /// tests would observe. When absent the scan reads
-/// `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` and falls back to
-/// [`DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE`].
+/// `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` and falls back to the
+/// partition-sensitive [`default_clipped_admission_wave`]; an explicit factor
+/// here is used as given for every planned width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClippedAdmissionWave {
     pub factor: usize,
@@ -3065,7 +3104,11 @@ impl SiglakeIcebergTableScan {
         // in-order drain and aggregates never carry the hint, so both are
         // untouched. See [`ScanAdmission`] for why waiting cannot drop a row.
         let clipped_admission = {
-            let wave = clipped_admission_wave_for(state);
+            // #7520: the factor reads `partition_count` — the scan's own planned
+            // partitions, after pruning and before any downstream repartitioning
+            // — so a pruned two-to-four-partition scan fills at its first earned
+            // widening instead of climbing `1 -> 2 -> 4`.
+            let wave = clipped_admission_wave_for(state, partition_count);
             (!preserve_task_order
                 && partition_count > 1
                 && wave > 0
@@ -10511,20 +10554,90 @@ mod tests {
     /// nothing here touches the process environment.
     #[test]
     fn clipped_admission_wave_is_overridable_and_never_stalls() {
-        assert_eq!(clipped_admission_wave_from(Some("0")), 0);
-        assert_eq!(clipped_admission_wave_from(Some("4")), 4);
+        assert_eq!(clipped_admission_wave_override_from(Some("0")), Some(0));
+        assert_eq!(clipped_admission_wave_override_from(Some("4")), Some(4));
         assert_eq!(
-            clipped_admission_wave_from(Some("1")),
-            2,
+            clipped_admission_wave_override_from(Some("1")),
+            Some(2),
             "a factor of 1 would leave the ramp at its initial width forever"
         );
         for cleared in [None, Some(""), Some("-1"), Some("garbage")] {
             assert_eq!(
-                clipped_admission_wave_from(cleared),
-                DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE,
-                "wave must default for {cleared:?}"
+                clipped_admission_wave_override_from(cleared),
+                None,
+                "no override means the partition-sensitive default for {cleared:?}"
             );
         }
+    }
+
+    /// #7520's default policy, as arithmetic: two to four planned partitions
+    /// take a factor equal to the partition count; one partition (which never
+    /// builds a ramp) and anything above four keep the shipped factor 2.
+    #[test]
+    fn the_default_admission_wave_fills_two_to_four_planned_partitions() {
+        for (partitions, expected) in [(2usize, 2usize), (3, 3), (4, 4)] {
+            assert_eq!(
+                default_clipped_admission_wave(partitions),
+                expected,
+                "{partitions} planned partitions must fill at the first widening"
+            );
+        }
+        for partitions in [0usize, 1, 5, 6, 16, 64] {
+            assert_eq!(
+                default_clipped_admission_wave(partitions),
+                DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE,
+                "{partitions} planned partitions must keep the shipped factor"
+            );
+        }
+    }
+
+    /// The policy expressed through the ramp it configures: one reader is
+    /// admitted before any credit is earned at every width, the first credit
+    /// opens the whole scan at two to four partitions, and a five-partition
+    /// scan still climbs `1 -> 2 -> 4 -> 5`. #7515 measured only the
+    /// four-partition case; three is the recommendation's arithmetic.
+    #[test]
+    fn the_default_policy_fills_a_small_scan_at_its_first_credit() {
+        for partitions in [2usize, 3, 4, 5, 16] {
+            let admission =
+                ScanAdmission::new(partitions, default_clipped_admission_wave(partitions));
+            assert!(admission.is_admitted(0), "{partitions}: one reader starts");
+            assert!(
+                !admission.is_admitted(1),
+                "{partitions}: the rest wait for an earned credit, not for scan start"
+            );
+            admission.advance();
+            let open = (0..partitions)
+                .filter(|t| admission.is_admitted(*t))
+                .count();
+            let expected = if partitions <= DEFAULT_SCAN_CLIPPED_ADMISSION_FILL_PARTITIONS {
+                partitions
+            } else {
+                DEFAULT_SCAN_CLIPPED_ADMISSION_WAVE
+            };
+            assert_eq!(open, expected, "{partitions} after one credit");
+        }
+    }
+
+    /// Batch pacing is unchanged by the fill: a four-partition scan still holds
+    /// its second reader until the eighth raw source batch pays the credit, and
+    /// only then opens all four.
+    #[test]
+    fn the_default_policy_keeps_the_batch_credit_pacing() {
+        let admission = ScanAdmission::new(4, default_clipped_admission_wave(4));
+        let ticket = admission.register();
+        for batch in 1..SCAN_CLIPPED_ADMISSION_BATCHES_PER_CREDIT {
+            admission.advance_after_batch(&ticket);
+            assert!(
+                !admission.is_admitted(1),
+                "batch {batch} must leave the scan on its first partition"
+            );
+        }
+        admission.advance_after_batch(&ticket);
+        assert!(
+            (0..4).all(|ticket| admission.is_admitted(ticket)),
+            "the eighth batch pays the credit that fills a four-partition scan"
+        );
     }
 
     /// Terminal credits keep the ramp live: ticket 0 runs at once, the rest

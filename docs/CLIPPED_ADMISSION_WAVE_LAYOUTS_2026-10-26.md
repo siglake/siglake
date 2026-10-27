@@ -97,6 +97,11 @@ not implement the rule. The evidence covers one equality predicate and these
 local layouts, so a production patch should retain this test as its regression
 and keep #7487's cancellation checks in the crate gate.
 
+#7520 shipped it as the default policy — the ramp factor reads the scan's own
+planned partition count — and retained both. See
+[`DESIGN_clipped_limit_admission.md`](DESIGN_clipped_limit_admission.md),
+"Admission after predicate pruning".
+
 ## What this does not establish
 
 - No AWS, object-store or distributed-query measurement. This is a local

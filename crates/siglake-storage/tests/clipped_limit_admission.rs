@@ -67,7 +67,15 @@ fn payload(file: usize, row: usize, needle: bool) -> String {
 /// `FILES` appends, each one data file. `needles(file)` says how many of that
 /// file's rows carry the needle, placed at the head of the file.
 async fn table_with(ice: &IcebergContext, needles: impl Fn(usize) -> usize) {
-    for file in 0..FILES {
+    table_with_files(ice, FILES, needles).await
+}
+
+/// `files` appends, each one data file — the scan plans one partition per data
+/// file, so this is #7520's planned partition count. A table built here is the
+/// same shape the pruned four-partition layout reaches by throwing files away;
+/// the ramp reads the count, not how the count came about.
+async fn table_with_files(ice: &IcebergContext, files: usize, needles: impl Fn(usize) -> usize) {
+    for file in 0..files {
         let want = needles(file);
         let events: Vec<Event> = (0..ROWS_PER_FILE)
             .map(|row| Event::now(payload(file, row, row < want)))
@@ -81,7 +89,11 @@ async fn table_with(ice: &IcebergContext, needles: impl Fn(usize) -> usize) {
 /// `LIMIT 100` in the first source batch while the file still has many batches
 /// available for a coalesce pump to decode speculatively.
 async fn dense_table_with_rows(ice: &IcebergContext, rows_per_file: usize) {
-    for file in 0..FILES {
+    dense_table_with_files_and_rows(ice, FILES, rows_per_file).await
+}
+
+async fn dense_table_with_files_and_rows(ice: &IcebergContext, files: usize, rows_per_file: usize) {
+    for file in 0..files {
         let events: Vec<Event> = (0..rows_per_file)
             .map(|row| Event::now(payload(file, row, true)))
             .collect();
@@ -94,6 +106,24 @@ async fn dense_table_with_rows(ice: &IcebergContext, rows_per_file: usize) {
 /// admission ramp factor under test; `0` is the pre-#4865 scan.
 fn clipped_context(limit: usize, wave: usize) -> SessionContext {
     clipped_context_with_group_order(limit, wave, None, false)
+}
+
+/// The same context with NO `ClippedAdmissionWave` extension, so the scan
+/// resolves #7520's partition-sensitive default itself. This is the path the
+/// query server takes; every other test here pins a factor to hold a matched
+/// A/B, which by construction cannot see a default policy change.
+///
+/// `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE` would also override it, but the tests
+/// never set it — the resolver is pure and its override arm is covered by
+/// `clipped_admission_wave_is_overridable_and_never_stalls` in
+/// `query_provider.rs`.
+fn clipped_context_default_wave(limit: usize) -> SessionContext {
+    let base = siglake_storage::session_context_with_target_partitions(Some(PARTITIONS));
+    let mut state = base.state();
+    state
+        .config_mut()
+        .set_extension(Arc::new(siglake_storage::ClippedScanLimit { limit }));
+    SessionContext::new_with_state(state)
 }
 
 fn clipped_context_with_group_order(
@@ -1530,5 +1560,387 @@ async fn cancelling_a_clipped_scan_ends_the_streams_behind_the_ramp() {
     assert!(
         settle.complete,
         "a stream parked behind the ramp was dropped without ending: {settle:?}"
+    );
+}
+
+/// Poll `stream` with a no-op waker: `true` if it never becomes ready.
+///
+/// Used only for the NEGATIVE case — a partition the ramp has not admitted.
+/// An admitted partition is also pending on its first polls (it has a file to
+/// open), so readiness here is proof of admission while pendency is proof of
+/// admission only once something else has shown the credit landed. Each caller
+/// below pays the credit and watches a nearer partition start before reading
+/// this.
+async fn stays_pending(stream: &mut datafusion::physical_plan::SendableRecordBatchStream) -> bool {
+    use futures::task::noop_waker_ref;
+    use std::task::Context as TaskContext;
+
+    let mut cx = TaskContext::from_waker(noop_waker_ref());
+    for _ in 0..8 {
+        if stream.poll_next_unpin(&mut cx).is_ready() {
+            return false;
+        }
+        tokio::task::yield_now().await;
+    }
+    true
+}
+
+/// Drain one already-executed partition stream to exhaustion, which pays the
+/// ramp exactly one terminal credit. The fixture's files are one source batch
+/// each, so the eight-batch pacing pays nothing on the way.
+async fn drain_started_partition(
+    stream: &mut datafusion::physical_plan::SendableRecordBatchStream,
+) -> usize {
+    let mut rows = 0;
+    while let Some(batch) = stream.next().await {
+        rows += batch.unwrap().num_rows();
+    }
+    rows
+}
+
+/// #7520, the policy itself, on the session the query server builds: a scan
+/// that planned two to four partitions still starts ONE reader, and its first
+/// earned credit admits every remaining partition instead of doubling.
+///
+/// Deterministic because nothing but the drained partition can pay: the other
+/// streams are executed (so tickets follow partition index) but unpolled, and
+/// a partition behind the ramp reaches no reader. The four-partition arm is
+/// the one #7515 measured — 12.037 ms of paired-median collect time at
+/// unchanged bytes (`docs/CLIPPED_ADMISSION_WAVE_LAYOUTS_2026-10-26.md`); two
+/// is unchanged from factor 2 and three follows the ramp's arithmetic, not a
+/// measurement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_policy_fills_a_small_scan_at_its_first_credit() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 20;
+
+    for files in [2usize, 3, 4] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(tmp.path()).await.unwrap();
+        table_with_files(&ice, files, |_| MATCHES_PER_FILE).await;
+
+        let ctx = clipped_context_default_wave(LIMIT);
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+        let (plan, scan, task_ctx, partitions) = clipped_scan(&ctx, &sql).await;
+        assert_eq!(
+            partitions, files,
+            "the fixture must plan one partition per file"
+        );
+
+        // Executed in order, so tickets follow partition index.
+        let mut streams: Vec<_> = (0..partitions)
+            .map(|p| scan.execute(p, task_ctx.clone()).unwrap())
+            .collect();
+        let last = partitions - 1;
+        assert!(
+            stays_pending(&mut streams[last]).await,
+            "{files} partitions: the fill must happen at the first earned credit, not at scan start"
+        );
+
+        assert_eq!(
+            drain_started_partition(&mut streams[0]).await,
+            ROWS_PER_FILE,
+            "{files} partitions: the admitted reader owns one whole file"
+        );
+        let batch = tokio::time::timeout(Duration::from_secs(60), streams[last].next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{files} partitions: the first credit must admit the last partition")
+            })
+            .expect("a batch")
+            .unwrap();
+        assert!(batch.num_rows() > 0);
+
+        drop(streams);
+        let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(60)).await;
+        assert!(settle.complete, "{files} partitions: {settle:?}");
+    }
+}
+
+/// The cap. Above four planned partitions the default is still factor 2, so
+/// one credit admits the second partition and no more: #7515 measured that
+/// widening the sixteen-partition rare-scattered layout doubled requested and
+/// decoded bytes for a timing difference that went both ways.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_policy_still_doubles_above_four_partitions() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 20;
+
+    for files in [5usize, FILES] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(tmp.path()).await.unwrap();
+        table_with_files(&ice, files, |_| MATCHES_PER_FILE).await;
+
+        let ctx = clipped_context_default_wave(LIMIT);
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+        let (plan, scan, task_ctx, partitions) = clipped_scan(&ctx, &sql).await;
+        assert_eq!(partitions, files);
+
+        let mut streams: Vec<_> = (0..partitions)
+            .map(|p| scan.execute(p, task_ctx.clone()).unwrap())
+            .collect();
+        let last = partitions - 1;
+        assert!(stays_pending(&mut streams[last]).await);
+
+        assert_eq!(
+            drain_started_partition(&mut streams[0]).await,
+            ROWS_PER_FILE
+        );
+        // The credit landed and the ramp widened: partition 1 runs.
+        tokio::time::timeout(Duration::from_secs(60), streams[1].next())
+            .await
+            .unwrap_or_else(|_| panic!("{files} partitions: one credit must admit partition 1"))
+            .expect("a batch")
+            .unwrap();
+        assert!(
+            stays_pending(&mut streams[last]).await,
+            "{files} partitions: one credit must not open the whole scan"
+        );
+
+        drop(streams);
+        let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(60)).await;
+        assert!(settle.complete, "{files} partitions: {settle:?}");
+    }
+}
+
+/// Override precedence, through a real plan rather than the resolver: an
+/// explicit `ClippedAdmissionWave` is used as given at every planned width, so
+/// a four-partition scan pinned to factor 2 still climbs `1 -> 2 -> 4` and a
+/// scan pinned to `0` starts every partition at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_wave_overrides_the_partition_sensitive_default() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 20;
+    const FOUR: usize = 4;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    table_with_files(&ice, FOUR, |_| MATCHES_PER_FILE).await;
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+
+    let ctx = clipped_context(LIMIT, 2);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+    let (plan, scan, task_ctx, partitions) = clipped_scan(&ctx, &sql).await;
+    assert_eq!(partitions, FOUR);
+    let mut streams: Vec<_> = (0..partitions)
+        .map(|p| scan.execute(p, task_ctx.clone()).unwrap())
+        .collect();
+    assert!(stays_pending(&mut streams[3]).await);
+    assert_eq!(
+        drain_started_partition(&mut streams[0]).await,
+        ROWS_PER_FILE
+    );
+    tokio::time::timeout(Duration::from_secs(60), streams[1].next())
+        .await
+        .expect("factor 2 admits partition 1 on the first credit")
+        .expect("a batch")
+        .unwrap();
+    assert!(
+        stays_pending(&mut streams[3]).await,
+        "an explicit factor 2 must keep the 1 -> 2 -> 4 ramp the default no longer uses"
+    );
+    drop(streams);
+    let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(60)).await;
+    assert!(settle.complete, "{settle:?}");
+
+    // `0` still disables admission staging entirely.
+    let ungated = clipped_context(LIMIT, 0);
+    ice.register_with_datafusion(&ungated).await.unwrap();
+    let (plan, scan, task_ctx, partitions) = clipped_scan(&ungated, &sql).await;
+    assert_eq!(partitions, FOUR);
+    let mut last = scan.execute(partitions - 1, task_ctx).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), last.next())
+        .await
+        .expect("an ungated scan starts every partition")
+        .expect("a batch")
+        .unwrap();
+    drop(last);
+    let settle = siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(60)).await;
+    assert!(settle.complete, "{settle:?}");
+}
+
+/// Exactness under the default policy, across the widths the policy
+/// distinguishes: one partition (never ramped), the filled two-to-four range,
+/// and a width above the cap. Unordered SQL has no defined row selection, so
+/// this checks qualifying membership and cardinality — a dense layout must
+/// fill the clip, and a layout whose only matches live in the LAST file must
+/// return every one of them, which it can only do by widening to that
+/// partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_policy_answers_every_planned_width_exactly() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 20;
+    const TAIL_MATCHES: usize = 7;
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+
+    for files in [1usize, 2, 3, 4, 5] {
+        let dense = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(dense.path()).await.unwrap();
+        table_with_files(&ice, files, |_| MATCHES_PER_FILE).await;
+        let ctx = clipped_context_default_wave(LIMIT);
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let run = tokio::time::timeout(Duration::from_secs(120), run_arm(&ctx, &sql, "raw"))
+            .await
+            .unwrap_or_else(|_| panic!("{files} partitions: the dense arm must not stall"));
+        assert_eq!(
+            run.work.partitions, files,
+            "the fixture must plan one partition per file"
+        );
+        assert_eq!(run.rows.len(), LIMIT, "{files} partitions: {:?}", run.work);
+        assert_all_qualify(&run.rows, &sql);
+
+        // Fewer matches than the clip asks for, and all of them in the last
+        // file: the ramp has to reach the final partition to answer at all.
+        let tail = tempfile::tempdir().unwrap();
+        let ice = IcebergContext::open(tail.path()).await.unwrap();
+        table_with_files(&ice, files, |file| {
+            if file + 1 == files {
+                TAIL_MATCHES
+            } else {
+                0
+            }
+        })
+        .await;
+        let ctx = clipped_context_default_wave(LIMIT);
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let run = tokio::time::timeout(Duration::from_secs(120), run_arm(&ctx, &sql, "raw"))
+            .await
+            .unwrap_or_else(|_| panic!("{files} partitions: the tail arm must not stall"));
+        assert_eq!(
+            run.rows.len(),
+            TAIL_MATCHES,
+            "{files} partitions: every qualifying row must come back: {:?}",
+            run.work
+        );
+        assert_all_qualify(&run.rows, &sql);
+        assert_eq!(
+            files_of(&run.rows),
+            BTreeSet::from([files - 1]),
+            "{files} partitions: the matches live in the last file alone"
+        );
+    }
+}
+
+/// What a two-to-four-partition clipped plan actually looks like, and why the
+/// fill is a scheduling change rather than a read-amount change.
+///
+/// A scan that planned fewer partitions than `target_partitions` gets a
+/// `RepartitionExec: RoundRobinBatch(16), input_partitions=4` between it and
+/// the residual filter, and that node drives EVERY input partition from its
+/// own tasks. So the ends come fast, the ramp earns its credits whatever the
+/// factor is, and both factors open all four files — which is what #7515
+/// measured (identical requested and decoded bytes, 12.037 ms apart). #7487's
+/// close still covers these partitions, but how many of them reach a reader
+/// before the fetch fills is a race with those repartition tasks, so this
+/// asserts the shape and the answer and leaves the counts to #7515's by-hand
+/// comparison. The close's deterministic coverage is
+/// `a_filled_clipped_limit_starts_no_further_reader` at full width and
+/// `a_closed_ramp_pays_no_terminal_credit_and_starts_no_reader` in
+/// `query_provider.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_small_clipped_scan_repartitions_above_the_ramp() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 100;
+    const DENSE_ROWS_PER_FILE: usize = 20_000;
+    const FOUR: usize = 4;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    dense_table_with_files_and_rows(&ice, FOUR, DENSE_ROWS_PER_FILE).await;
+
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context_default_wave(LIMIT);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let shape: Vec<String> = node_output_rows(&plan)
+        .iter()
+        .map(|node| node.name.clone())
+        .collect();
+    assert!(
+        shape.iter().any(|name| name == "RepartitionExec"),
+        "a sub-target-partition clipped scan is driven through a repartition: {shape:?}"
+    );
+    assert_eq!(
+        shape.first().map(String::as_str),
+        Some("ClippedLimitCoalesceExec"),
+        "the clipped root must still own the fetch: {shape:?}"
+    );
+
+    let run = tokio::time::timeout(
+        Duration::from_secs(120),
+        run_planned_arm(&ctx, plan, Duration::ZERO, "raw"),
+    )
+    .await
+    .expect("a filled clipped limit must not stall");
+    eprintln!("CLIPPED-FILL-SHAPE {:?} drain={:?}", run.work, run.drain);
+    assert_eq!(run.work.partitions, FOUR);
+    assert_eq!(run.rows.len(), LIMIT);
+    assert_all_qualify(&run.rows, &sql);
+    assert_eq!(
+        run.rows.iter().collect::<HashSet<_>>().len(),
+        LIMIT,
+        "the clipped limit must be filled from distinct source rows"
+    );
+}
+
+/// Cancellation at the new width: a caller that walks away from a
+/// four-partition default-policy scan must leave every stream ended, including
+/// any the fill admitted in one step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelling_a_filled_small_scan_ends_every_stream() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const LIMIT: usize = 20;
+    const FOUR: usize = 4;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    table_with_files(&ice, FOUR, |_| MATCHES_PER_FILE).await;
+
+    let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
+    let ctx = clipped_context_default_wave(LIMIT);
+    ice.register_with_datafusion(&ctx).await.unwrap();
+    let plan = ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+
+    {
+        #[allow(clippy::disallowed_methods)]
+        let mut stream = execute_stream(plan.clone(), siglake_storage::bounded_task_context())
+            .expect("execute the scan");
+        let first = tokio::time::timeout(Duration::from_secs(60), stream.next())
+            .await
+            .expect("the first batch must arrive before the cancel")
+            .expect("a first batch")
+            .unwrap();
+        assert!(first.num_rows() > 0, "the fixture must match the needle");
+    }
+
+    let settle = tokio::time::timeout(
+        Duration::from_secs(90),
+        siglake_storage::settle_scan_partitions(&plan, Duration::from_secs(60)),
+    )
+    .await
+    .expect("a cancelled clipped scan must settle, not hang");
+    assert!(
+        settle.complete,
+        "a stream parked behind the fill was dropped without ending: {settle:?}"
     );
 }
