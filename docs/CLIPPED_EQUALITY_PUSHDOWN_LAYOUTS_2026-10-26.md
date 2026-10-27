@@ -221,10 +221,12 @@ rare label with no pruning available, and 41.1 ms on a clustered one.
 
 What separates the cases is not whether the residual is retained but how much
 the reader filter rejects relative to what the residual-only route would decode.
-Both of the signals a gate would need are already counted per scan:
-`rows_pruned_selection` for the selection term, and the gap between rows the
-reader filter sees and rows it emits for the predicate term. Neither is
-available at planning time, which is where the current policy is decided.
+`rows_pruned_selection` already counts the selection term. The predicate input
+and output pair was not counted when this report was written: emitted scan rows
+are downstream of clipping and are not predicate output. #7513 adds bounded
+in-process observation for the matched experiment and records the resulting
+learned-gate design in
+[CLIPPED_EQUALITY_PUSHDOWN_GATE_2026-10-27.md](CLIPPED_EQUALITY_PUSHDOWN_GATE_2026-10-27.md).
 
 This investigation makes no production policy change and adds no knob.
 
