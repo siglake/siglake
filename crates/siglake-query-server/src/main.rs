@@ -16,7 +16,8 @@ use siglake_query_server::{
     ServerLimits, TlsConfig,
 };
 use siglake_storage::{
-    configure_query_scan_tuning, iceberg::IcebergContext, PredicatePushdownControl, QueryScanTuning,
+    configure_query_scan_tuning, iceberg::IcebergContext, QueryScanProductionConfig,
+    QueryScanTuning,
 };
 
 #[derive(Parser, Debug)]
@@ -503,7 +504,7 @@ async fn run() -> Result<()> {
         bypass_reader_caches: false,
         ordered_drain_buffer_bytes: None,
     };
-    configure_query_scan_tuning(QueryScanTuning {
+    configure_query_scan_tuning(QueryScanTuning::production(QueryScanProductionConfig {
         reader_budget: query_scan.reader_budget,
         file_concurrency_limit: query_scan.file_concurrency_limit,
         batch_size: query_scan.batch_size,
@@ -516,27 +517,7 @@ async fn run() -> Result<()> {
         file_cache_max_bytes: query_scan.file_cache_max_bytes,
         file_cache_max_entries: query_scan.file_cache_max_entries,
         ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
-        // #4847's row-group population is a local prototype with no operator
-        // surface; the server never turns it on.
-        file_cache_row_group_prototype: false,
-        // #4905's predicate-keyed population is a local prototype with no
-        // operator surface; the server never turns it on.
-        file_cache_predicate_key_prototype: false,
-        // #5074's shared population bound is a local qualification prototype
-        // with no operator surface; the server never turns it on.
-        file_cache_population_bound_prototype: false,
-        // #5786's pre-adoption unbounded-population control is local-only.
-        file_cache_unbounded_population_prototype: false,
-        // #4959's per-file attribution is a local qualification gate with no
-        // response or operator surface; the server never turns it on.
-        file_attribution_prototype: false,
-        // #7457's pushdown attribution arms exist only for the local
-        // measurement fixture; the server always runs shipped policy.
-        predicate_pushdown_control: PredicatePushdownControl::Production,
-        // #7513's row-filter input/output observation exists only for the local
-        // gate measurement; the server never installs an observer.
-        predicate_evaluation_observer: None,
-    });
+    }));
     tracing::info!(
         target_partitions = query_scan.target_partitions,
         reader_budget = query_scan.reader_budget,
