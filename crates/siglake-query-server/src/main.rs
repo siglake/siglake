@@ -533,6 +533,9 @@ async fn run() -> Result<()> {
         // #7457's pushdown attribution arms exist only for the local
         // measurement fixture; the server always runs shipped policy.
         predicate_pushdown_control: PredicatePushdownControl::Production,
+        // #7513's row-filter input/output observation exists only for the local
+        // gate measurement; the server never installs an observer.
+        predicate_evaluation_observer: None,
     });
     tracing::info!(
         target_partitions = query_scan.target_partitions,
