@@ -1845,7 +1845,7 @@ fn attr_get_chain_workspace(expr: &Expr) -> Option<(u64, u64)> {
     }
 }
 
-/// Extend the scalar-mask whitelist only for literal-key `attr_get` equality.
+/// Extend the scalar-mask whitelist only for literal-key `attr_get` string comparisons.
 /// Other UDFs retain the committed-only refusal from #6879.
 fn bounded_filter_workspace(expr: &Expr) -> Option<FilterWorkspace> {
     if let Some(masks) = bounded_filter_mask_count(expr) {
@@ -1868,6 +1868,10 @@ fn bounded_filter_workspace(expr: &Expr) -> Option<FilterWorkspace> {
                 binary.op,
                 Operator::Eq
                     | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
                     | Operator::IsDistinctFrom
                     | Operator::IsNotDistinctFrom
             ) =>

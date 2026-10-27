@@ -121,12 +121,13 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   WAL writers emit uncompressed IPC inside the separately compressed WAL frame.
   Managed-index WAL rows with non-empty carrier attributes and queries whose
   WAL filter or distributed partial contains an unbounded allocating expression
-  currently use the exact committed snapshot. Literal-key `attr_get` equality
-  and NULL tests are the exception on the local union path: their nested result
-  and builder allocations are charged from the decoded source payload before
-  the pre-filter runs. Other user-defined functions retain the committed-only
-  behavior; freshness resumes after the drain commits the rows. The budget
-  covers admitted Arrow payload, not allocator metadata or total process RSS.
+  currently use the exact committed snapshot. Literal-key `attr_get` string
+  comparisons and NULL tests are the exception on the local union path: their
+  nested result and builder allocations are charged from the decoded source
+  payload before the pre-filter runs. Other user-defined functions retain the
+  committed-only behavior; freshness resumes after the drain commits the rows.
+  The budget covers admitted Arrow payload, not allocator metadata or total
+  process RSS.
 - **A pod at the 4Gi floor caches no text indexes by default.** Both caches now
   derive from the pod's memory limit and are subtracted from the query pool, so
   they are inside the budget rather than beside it — and what they get is what
