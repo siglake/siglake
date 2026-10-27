@@ -69,6 +69,7 @@ impl ArrowReader {
                 .with_scan_metrics(scan_metrics.clone()),
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            predicate_evaluation_observer: self.predicate_evaluation_observer,
             parquet_read_options: self.parquet_read_options,
             scan_metrics: scan_metrics.clone(),
             file_opened_observer: self.file_opened_observer,
@@ -128,6 +129,7 @@ struct FileScanTaskReader {
     delete_file_loader: CachingDeleteFileLoader,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    predicate_evaluation_observer: Option<fn(usize, usize)>,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
     file_opened_observer: Option<super::FileOpenedObserver>,
@@ -436,6 +438,7 @@ impl FileScanTaskReader {
                 record_batch_stream_builder.parquet_schema(),
                 &iceberg_field_ids,
                 &field_id_map,
+                self.predicate_evaluation_observer,
             )?;
             record_batch_stream_builder = record_batch_stream_builder.with_row_filter(row_filter);
 
@@ -603,6 +606,7 @@ impl FileScanTaskReader {
                 self.batch_size,
                 chunk_plan,
                 self.cache_bypass,
+                self.predicate_evaluation_observer,
             ));
         }
 
@@ -644,6 +648,7 @@ impl FileScanTaskReader {
         batch_size: Option<usize>,
         chunk_plan: Vec<(usize, Vec<RowSelector>, usize)>,
         cache_bypass: bool,
+        predicate_evaluation_observer: Option<fn(usize, usize)>,
     ) -> ArrowRecordBatchStream {
         let stream = futures::stream::iter(chunk_plan)
             .then(move |(group, selectors, _selected_rows)| {
@@ -694,6 +699,7 @@ impl FileScanTaskReader {
                         group,
                         selectors,
                         cache_bypass,
+                        predicate_evaluation_observer,
                     )
                     .await;
                     match opened {
@@ -733,6 +739,7 @@ impl FileScanTaskReader {
         group: usize,
         selectors: Vec<RowSelector>,
         cache_bypass: bool,
+        predicate_evaluation_observer: Option<fn(usize, usize)>,
     ) -> Result<ArrowRecordBatchStream> {
         let (reader, _) = ArrowReader::open_parquet_file(
             &task.data_file_path,
@@ -763,6 +770,7 @@ impl FileScanTaskReader {
                 builder.parquet_schema(),
                 &field_ids,
                 &field_id_map,
+                predicate_evaluation_observer,
             )?;
             builder = builder.with_row_filter(row_filter);
         }

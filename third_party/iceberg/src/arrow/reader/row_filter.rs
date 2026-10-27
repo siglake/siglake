@@ -42,6 +42,7 @@ impl ArrowReader {
         parquet_schema: &SchemaDescriptor,
         iceberg_field_ids: &HashSet<i32>,
         field_id_map: &HashMap<i32, usize>,
+        observer: Option<fn(usize, usize)>,
     ) -> Result<RowFilter> {
         // Collect Parquet column indices from field ids.
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
@@ -61,8 +62,16 @@ impl ArrowReader {
         // After collecting required leaf column indices used in the predicate,
         // creates the projection mask for the Arrow predicates.
         let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
-        let predicate_func = visit(&mut converter, predicates)?;
-        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
+        let mut predicate_func = visit(&mut converter, predicates)?;
+        let observed_predicate = move |batch: arrow_array::RecordBatch| {
+            let input_rows = batch.num_rows();
+            let matches = predicate_func(batch)?;
+            if let Some(observer) = observer {
+                observer(input_rows, matches.true_count());
+            }
+            Ok(matches)
+        };
+        let arrow_predicate = ArrowPredicateFn::new(projection_mask, observed_predicate);
         Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
 

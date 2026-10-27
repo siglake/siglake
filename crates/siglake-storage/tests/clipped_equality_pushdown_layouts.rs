@@ -16,6 +16,7 @@
 //! than hiding it.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -177,6 +178,26 @@ fn tuning(control: PredicatePushdownControl) -> QueryScanTuning {
     }
 }
 
+static PREDICATE_INPUT_ROWS: AtomicUsize = AtomicUsize::new(0);
+static PREDICATE_OUTPUT_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+fn observe_predicate_evaluation(input_rows: usize, output_rows: usize) {
+    PREDICATE_INPUT_ROWS.fetch_add(input_rows, Ordering::Relaxed);
+    PREDICATE_OUTPUT_ROWS.fetch_add(output_rows, Ordering::Relaxed);
+}
+
+fn reset_predicate_evaluation() {
+    PREDICATE_INPUT_ROWS.store(0, Ordering::Relaxed);
+    PREDICATE_OUTPUT_ROWS.store(0, Ordering::Relaxed);
+}
+
+fn predicate_evaluation() -> (usize, usize) {
+    (
+        PREDICATE_INPUT_ROWS.load(Ordering::Relaxed),
+        PREDICATE_OUTPUT_ROWS.load(Ordering::Relaxed),
+    )
+}
+
 fn scan_nodes(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<dyn ExecutionPlan>> {
     let mut scans = Vec::new();
     plan.apply(|node| {
@@ -330,13 +351,47 @@ async fn plan(
     sql: &str,
     control: PredicatePushdownControl,
 ) -> Arc<dyn ExecutionPlan> {
-    siglake_storage::configure_query_scan_tuning(tuning(control));
+    plan_with_tuning(ctx, sql, tuning(control)).await
+}
+
+async fn plan_with_tuning(
+    ctx: &SessionContext,
+    sql: &str,
+    tuning: QueryScanTuning,
+) -> Arc<dyn ExecutionPlan> {
+    siglake_storage::configure_query_scan_tuning(tuning);
     ctx.sql(sql)
         .await
         .unwrap()
         .create_physical_plan()
         .await
         .unwrap()
+}
+
+fn observed_tuning() -> QueryScanTuning {
+    QueryScanTuning {
+        predicate_evaluation_observer: Some(observe_predicate_evaluation),
+        ..tuning(PredicatePushdownControl::RetainResidual)
+    }
+}
+
+/// A learned signal is deliberately conservative: page selection must have
+/// rejected nothing, and at least one eighth of the rows presented to the
+/// reader predicate must have survived. A missing observation keeps today's
+/// pushed predicate.
+fn learned_gate_control(
+    predicate_input_rows: usize,
+    predicate_output_rows: usize,
+    rows_pruned_selection: usize,
+) -> PredicatePushdownControl {
+    if predicate_input_rows > 0
+        && rows_pruned_selection == 0
+        && predicate_output_rows.saturating_mul(8) >= predicate_input_rows
+    {
+        PredicatePushdownControl::SuppressReaderPredicate
+    } else {
+        PredicatePushdownControl::RetainResidual
+    }
 }
 
 fn assert_exact(run: &Run, arm: &str, layout: Layout) {
@@ -693,6 +748,222 @@ fn report(layout: Layout, result: &LayoutResult) {
     );
 }
 
+#[derive(Debug, Clone, Copy)]
+struct LearnedSignal {
+    predicate_input_rows: usize,
+    predicate_output_rows: usize,
+    rows_pruned_selection: usize,
+}
+
+impl LearnedSignal {
+    fn control(self) -> PredicatePushdownControl {
+        learned_gate_control(
+            self.predicate_input_rows,
+            self.predicate_output_rows,
+            self.rows_pruned_selection,
+        )
+    }
+}
+
+struct GateLayoutResult {
+    signal: LearnedSignal,
+    baseline: Vec<Run>,
+    observed: Vec<Run>,
+    gate: Vec<Run>,
+}
+
+async fn measured_observation(
+    ctx: &SessionContext,
+    plan: Arc<dyn ExecutionPlan>,
+) -> (Run, usize, usize) {
+    reset_predicate_evaluation();
+    let run = run(ctx, plan).await;
+    let (predicate_input_rows, predicate_output_rows) = predicate_evaluation();
+    assert!(
+        predicate_input_rows > 0,
+        "the observed pushed arm must evaluate a reader predicate"
+    );
+    assert!(
+        predicate_output_rows <= predicate_input_rows,
+        "a predicate cannot emit more rows than it sees"
+    );
+    (run, predicate_input_rows, predicate_output_rows)
+}
+
+/// Measure a snapshot-local learned gate. The first pushed execution acquires
+/// the signal while returning the ordinary exact answer. A cold or absent
+/// signal therefore falls back to the baseline; only later executions of the
+/// same snapshot and equality can suppress the reader predicate.
+async fn measure_learned_gate(layout: Layout) -> GateLayoutResult {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    build_fixture(&ice, layout).await;
+
+    let baseline_ctx = context(2);
+    let observed_ctx = context(2);
+    let gate_ctx = context(2);
+    ice.register_with_datafusion(&baseline_ctx).await.unwrap();
+    ice.register_with_datafusion(&observed_ctx).await.unwrap();
+    ice.register_with_datafusion(&gate_ctx).await.unwrap();
+    let sql = format!("SELECT timestamp, raw FROM events WHERE source = '{TARGET}' LIMIT {LIMIT}");
+
+    // Planning warm-up does not read data. The following ordinary pushed run
+    // is the cold-cache fallback and supplies the first verified signal.
+    let _ = plan(
+        &baseline_ctx,
+        &sql,
+        PredicatePushdownControl::RetainResidual,
+    )
+    .await;
+    let probe_plan = plan_with_tuning(&observed_ctx, &sql, observed_tuning()).await;
+    siglake_storage::configure_query_scan_tuning(QueryScanTuning::default());
+    let (probe, predicate_input_rows, predicate_output_rows) =
+        measured_observation(&observed_ctx, probe_plan).await;
+    assert_exact(&probe, "signal_probe", layout);
+    let signal = LearnedSignal {
+        predicate_input_rows,
+        predicate_output_rows,
+        rows_pruned_selection: probe.rows_pruned_selection,
+    };
+    let gate_control = signal.control();
+    assert_eq!(
+        gate_control == PredicatePushdownControl::SuppressReaderPredicate,
+        layout == Layout::Interleaved,
+        "only the common interleaved label should cross the measured threshold"
+    );
+
+    let mut result = GateLayoutResult {
+        signal,
+        baseline: Vec::new(),
+        observed: Vec::new(),
+        gate: Vec::new(),
+    };
+    for pair in 0..PAIRS {
+        let baseline_plan = plan(
+            &baseline_ctx,
+            &sql,
+            PredicatePushdownControl::RetainResidual,
+        )
+        .await;
+        let observed_plan = plan_with_tuning(&observed_ctx, &sql, observed_tuning()).await;
+        let gate_plan = plan(&gate_ctx, &sql, gate_control).await;
+        siglake_storage::configure_query_scan_tuning(QueryScanTuning::default());
+        let scan_fields = |plan: &Arc<dyn ExecutionPlan>| {
+            scan_nodes(plan)[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+        };
+        let baseline_fields = scan_fields(&baseline_plan);
+        assert_eq!(baseline_fields, scan_fields(&observed_plan));
+        assert_eq!(baseline_fields, scan_fields(&gate_plan));
+        assert!(baseline_fields.iter().any(|field| field == "source"));
+        let display = |plan: &Arc<dyn ExecutionPlan>| {
+            datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(false)
+                .to_string()
+        };
+        let baseline_display = display(&baseline_plan);
+        let observed_display = display(&observed_plan);
+        let gate_display = display(&gate_plan);
+        assert!(baseline_display.contains("FilterExec"));
+        assert!(observed_display.contains("FilterExec"));
+        assert!(gate_display.contains("FilterExec"));
+        assert!(baseline_display.contains("predicate:[source = \"us-east-2\"]"));
+        assert!(observed_display.contains("predicate:[source = \"us-east-2\"]"));
+
+        let order = pair % 3;
+        let (baseline, observed, observed_input, observed_output, gate) = match order {
+            0 => {
+                let baseline = run(&baseline_ctx, baseline_plan).await;
+                let (observed, input, output) =
+                    measured_observation(&observed_ctx, observed_plan).await;
+                let gate = run(&gate_ctx, gate_plan).await;
+                (baseline, observed, input, output, gate)
+            }
+            1 => {
+                let (observed, input, output) =
+                    measured_observation(&observed_ctx, observed_plan).await;
+                let gate = run(&gate_ctx, gate_plan).await;
+                let baseline = run(&baseline_ctx, baseline_plan).await;
+                (baseline, observed, input, output, gate)
+            }
+            _ => {
+                let gate = run(&gate_ctx, gate_plan).await;
+                let baseline = run(&baseline_ctx, baseline_plan).await;
+                let (observed, input, output) =
+                    measured_observation(&observed_ctx, observed_plan).await;
+                (baseline, observed, input, output, gate)
+            }
+        };
+        assert_exact(&baseline, "baseline", layout);
+        assert_exact(&observed, "observed", layout);
+        assert_exact(&gate, "gate", layout);
+        assert_eq!(baseline.wrappers, observed.wrappers);
+        assert_eq!(baseline.planned_partitions, observed.planned_partitions);
+        assert_eq!(
+            baseline.rows_pruned_selection,
+            observed.rows_pruned_selection
+        );
+        assert_eq!(
+            learned_gate_control(
+                observed_input,
+                observed_output,
+                observed.rows_pruned_selection,
+            ),
+            gate_control,
+            "{}: repeated observations must keep the same gate decision",
+            layout.name()
+        );
+        if gate_control == PredicatePushdownControl::RetainResidual {
+            assert!(gate_display.contains("predicate:[source = \"us-east-2\"]"));
+            assert_eq!(baseline.wrappers, gate.wrappers);
+            assert_eq!(baseline.planned_partitions, gate.planned_partitions);
+            assert_eq!(baseline.rows_pruned_selection, gate.rows_pruned_selection);
+        } else {
+            assert!(gate_display.contains("predicate:[]"));
+        }
+
+        eprintln!(
+            "CLIPPED-GATE layout={} pair={pair} order={order} signal_input={} \
+             signal_output={} signal_selection={} baseline_collect={:?} \
+             observed_collect={:?} gate_collect={:?}",
+            layout.name(),
+            observed_input,
+            observed_output,
+            observed.rows_pruned_selection,
+            baseline.collect,
+            observed.collect,
+            gate.collect,
+        );
+        result.baseline.push(baseline);
+        result.observed.push(observed);
+        result.gate.push(gate);
+    }
+    result
+}
+
+fn report_gate(layout: Layout, result: &GateLayoutResult) {
+    eprintln!(
+        "CLIPPED-GATE-SUMMARY layout={} pairs={PAIRS} signal_input={} \
+         signal_output={} signal_selection={} decision={:?} \
+         baseline_median_ms={:.3} observed_median_ms={:.3} gate_median_ms={:.3} \
+         paired_observed_minus_baseline_ms={:.3} paired_gate_minus_baseline_ms={:.3}",
+        layout.name(),
+        result.signal.predicate_input_rows,
+        result.signal.predicate_output_rows,
+        result.signal.rows_pruned_selection,
+        result.signal.control(),
+        median_ms(&result.baseline),
+        median_ms(&result.observed),
+        median_ms(&result.gate),
+        median_paired_ms(&result.observed, &result.baseline),
+        median_paired_ms(&result.gate, &result.baseline),
+    );
+}
+
 struct WaveLayoutResult {
     wave2: Vec<Run>,
     wave4: Vec<Run>,
@@ -887,6 +1158,48 @@ async fn clipped_equality_pushdown_layout_attribution() {
         let result = measure(layout).await;
         report(layout, &result);
     }
+}
+
+/// #7513 by-hand measurement. The observed arm proves the signal's source and
+/// incremental counting cost; the gate arm consumes a prior observation. A
+/// missing observation takes the pushed baseline and is therefore not a
+/// separate timed arm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "matched local learned-gate attribution; run alone with --ignored --nocapture"]
+async fn clipped_equality_learned_gate_attribution() {
+    for layout in [
+        Layout::Interleaved,
+        Layout::RareScattered,
+        Layout::RareClustered,
+        Layout::RareClusteredSingleFile,
+    ] {
+        let result = measure_learned_gate(layout).await;
+        report_gate(layout, &result);
+    }
+}
+
+#[test]
+fn learned_gate_requires_complete_high_survival_signal_without_selection() {
+    assert_eq!(
+        learned_gate_control(0, 0, 0),
+        PredicatePushdownControl::RetainResidual,
+        "an absent observation keeps current policy"
+    );
+    assert_eq!(
+        learned_gate_control(40_000, 10_000, 0),
+        PredicatePushdownControl::SuppressReaderPredicate,
+        "the common interleaved fixture crosses the threshold"
+    );
+    assert_eq!(
+        learned_gate_control(80_000, 160, 0),
+        PredicatePushdownControl::RetainResidual,
+        "the scattered rare fixture needs late materialization"
+    );
+    assert_eq!(
+        learned_gate_control(20_480, 10_000, 1),
+        PredicatePushdownControl::RetainResidual,
+        "any verified page pruning keeps the reader predicate"
+    );
 }
 
 /// #7515 by-hand measurement. Factor 2 and factor 4 share each fixture and
