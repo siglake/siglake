@@ -1,0 +1,137 @@
+# Publishes one explicitly pinned engine-only profiling image to GHCR. The
+# source is a full commit id, the tag is immutable, and this workflow has no
+# push trigger. The existing profiling-image.yml ECR/build-only route remains
+# separate and unchanged.
+#
+# A profiling image is about 1.95 GB. The hosted-runner disk cleanup and six
+# hour job bound below are part of the first hosted qualification; they are not
+# settled until benchmark_expansion reviews this gate and runs one dispatch.
+name: profiling-image-ghcr
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_source:
+        description: "Exact 40-character lowercase commit SHA to build"
+        required: true
+        type: string
+
+concurrency:
+  group: profiling-image-ghcr
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  BUILD_SOURCE: ${{ inputs.build_source }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: workflow
+          persist-credentials: false
+      - name: Validate the requested source before using it
+        run: workflow/scripts/prepare-profiling-publication.sh validate
+      - name: Check out the requested source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_SOURCE }}
+          path: source
+          persist-credentials: false
+      - name: Verify the checked-out source
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/source
+        run: workflow/scripts/prepare-profiling-publication.sh resolve
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: source
+          cache-on-failure: true
+      - name: Profiling feature, both tokio_unstable configurations
+        working-directory: source
+        run: scripts/check-profiling-feature.sh
+
+  publish:
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: workflow
+          persist-credentials: false
+      - name: Validate the requested source before using it
+        run: workflow/scripts/prepare-profiling-publication.sh validate
+      - name: Check out the requested source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BUILD_SOURCE }}
+          path: source
+          persist-credentials: false
+      - name: Verify the checked-out source
+        env:
+          SOURCE_DIR: ${{ github.workspace }}/source
+        run: workflow/scripts/prepare-profiling-publication.sh resolve
+      - name: Refuse an existing immutable tag
+        run: workflow/scripts/check-profiling-tag-available.sh
+      - name: Free disk on the hosted runner
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL \
+                      /usr/share/swift \
+                      /usr/local/share/powershell \
+                      /usr/share/miniconda \
+                      /usr/local/julia* \
+                      /usr/local/share/chromium
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          echo "after:"; df -h / | tail -1
+      - name: Bound build resources
+        run: echo 'CARGO_BUILD_JOBS=2' >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push the profiling engine image
+        uses: docker/build-push-action@v7
+        with:
+          context: source
+          file: source/deploy/Dockerfile
+          push: true
+          build-args: |
+            SIGLAKE_GIT_SHA=${{ env.REVISION }}
+            PROFILING=1
+            BUILD_CACHE_ID=profiling-ghcr-${{ env.BUILD_SOURCE_SHA }}
+          tags: ghcr.io/siglake/siglake:${{ env.PROFILE_TAG }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/siglake/siglake
+            org.opencontainers.image.revision=${{ env.BUILD_SOURCE_SHA }}
+            dev.siglake.image.variant=profiling
+            dev.siglake.workflow.revision=${{ github.sha }}
+          cache-from: type=gha,scope=siglake-profiling-ghcr
+          cache-to: type=gha,scope=siglake-profiling-ghcr,mode=max
+      - name: Report the immutable image reference
+        run: |
+          echo "### Profiling image pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`ghcr.io/siglake/siglake:${PROFILE_TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Build source: \`${BUILD_SOURCE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Workflow revision: \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"

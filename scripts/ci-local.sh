@@ -295,6 +295,11 @@ else
   # none. This executes its revision step against a synthetic tagged checkout
   # under both triggers -- no registry, no image build.
   python3 scripts/check-release-provenance.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
+  # The manual public profiling route takes only a full commit id, verifies the
+  # resulting checkout and refuses an existing immutable GHCR tag. Its gate
+  # drives hostile inputs and registry statuses through local stand-ins and
+  # checks the workflow's permissions/build metadata without building an image.
+  python3 scripts/check-profiling-publication.py >>"$LOG_DIR/shell.log" 2>&1 || sh_rc=1
   # The 2026-09-16 sweep rule: the published tree does not discuss non-OSS
   # competitors. #4569 cleared one vendor's name and its event-collector
   # protocol out of sixteen files by hand -- one of them a middleware whose
