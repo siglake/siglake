@@ -221,6 +221,22 @@ fn node_output_rows(plan: &Arc<dyn ExecutionPlan>) -> Vec<NodeOutputRows> {
     out
 }
 
+fn repartition_shapes(plan: &Arc<dyn ExecutionPlan>) -> Vec<(Partitioning, bool, String)> {
+    let mut out = Vec::new();
+    plan.apply(|node| {
+        if let Some(repartition) = node.as_any().downcast_ref::<RepartitionExec>() {
+            out.push((
+                repartition.partitioning().clone(),
+                repartition.preserve_order(),
+                repartition.input().name().to_string(),
+            ));
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .unwrap();
+    out
+}
+
 /// The settled per-request scan attribution, summed across partitions, as the
 /// query server's `summarize_plan_runtime` reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1003,12 +1019,13 @@ async fn clipped_limit_filters_before_round_robin_can_coalesce_reader_batches() 
 
     const LIMIT: usize = 100;
     const DENSE_ROWS_PER_FILE: usize = 20_000;
+    const INPUT_FILES: usize = 15;
 
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(tmp.path()).await.unwrap();
     // Fifteen input file groups against sixteen target partitions reproduces
     // the candidate plan's RoundRobinBatch(16) node between scan and filter.
-    for file in 0..15 {
+    for file in 0..INPUT_FILES {
         let events: Vec<Event> = (0..DENSE_ROWS_PER_FILE)
             .map(|row| Event::now(payload(file, row, true)))
             .collect();
@@ -1035,6 +1052,15 @@ async fn clipped_limit_filters_before_round_robin_can_coalesce_reader_batches() 
         .map(|node| node.name)
         .collect();
     assert_eq!(actual_production_shape, expected_production_shape);
+    let production_filter = production_plan.children()[0].clone();
+    assert_eq!(
+        production_filter
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+        INPUT_FILES,
+        "the filter must inherit the scan's real partition count"
+    );
 
     let control_ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
     ice.register_with_datafusion(&control_ctx).await.unwrap();
@@ -1058,6 +1084,15 @@ async fn clipped_limit_filters_before_round_robin_can_coalesce_reader_batches() 
         .map(|node| node.name)
         .collect();
     assert_eq!(actual_control_shape, expected_control_shape);
+    let control_filter = control_plan.children()[0].clone();
+    assert_eq!(
+        control_filter
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+        PARTITIONS,
+        "the restored receiver must expose its configured partition count"
+    );
 
     let control = run_planned_arm(&control_ctx, control_plan.clone(), Duration::ZERO, "raw").await;
     let production = run_planned_arm(
@@ -1918,6 +1953,14 @@ async fn a_small_clipped_scan_filters_before_the_bounded_coalescer() {
         Some("ClippedLimitCoalesceExec"),
         "the clipped root must still own the fetch: {shape:?}"
     );
+    assert_eq!(
+        plan.children()[0]
+            .properties()
+            .output_partitioning()
+            .partition_count(),
+        FOUR,
+        "the bounded coalescer must accept the scan's planned partition count"
+    );
 
     let run = tokio::time::timeout(
         Duration::from_secs(120),
@@ -1933,6 +1976,58 @@ async fn a_small_clipped_scan_filters_before_the_bounded_coalescer() {
         run.rows.iter().collect::<HashSet<_>>().len(),
         LIMIT,
         "the clipped limit must be filled from distinct source rows"
+    );
+}
+
+/// #7658's rewrite is limited to the direct unordered receiver below the
+/// clipped residual filter. Real planner controls retain non-clipped receivers
+/// and hash distributions belonging to other operators.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn other_repartition_shapes_remain_in_real_plans() {
+    let _fixture_guard = FIXTURE_SERIAL.lock().await;
+
+    const FOUR: usize = 4;
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = IcebergContext::open(tmp.path()).await.unwrap();
+    table_with_files(&ice, FOUR, |_| MATCHES_PER_FILE).await;
+
+    let ordinary = siglake_storage::session_context_with_target_partitions(Some(PARTITIONS));
+    ice.register_with_datafusion(&ordinary).await.unwrap();
+    let non_clipped = ordinary
+        .sql(&format!(
+            "SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT 20"
+        ))
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let non_clipped_repartitions = repartition_shapes(&non_clipped);
+    assert!(
+        non_clipped_repartitions
+            .iter()
+            .any(|(partitioning, preserve_order, input)| {
+                matches!(partitioning, Partitioning::RoundRobinBatch(_))
+                    && !preserve_order
+                    && input == "SiglakeIcebergTableScan"
+            }),
+        "a non-clipped residual plan must retain DataFusion's receiver: \
+         {non_clipped_repartitions:?}"
+    );
+
+    let hash = ordinary
+        .sql("SELECT raw, count(*) FROM events GROUP BY raw")
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let hash_repartitions = repartition_shapes(&hash);
+    assert!(
+        hash_repartitions
+            .iter()
+            .any(|(partitioning, _, _)| matches!(partitioning, Partitioning::Hash(_, _))),
+        "a grouped plan must retain its hash distribution: {hash_repartitions:?}"
     );
 }
 

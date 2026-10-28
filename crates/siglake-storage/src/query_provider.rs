@@ -26,6 +26,7 @@ use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSort
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
@@ -7313,21 +7314,10 @@ fn clipped_scan_admissions(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<ScanAdmissi
 fn remove_clipped_scan_round_robin(
     plan: Arc<dyn ExecutionPlan>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
-    let old_children: Vec<_> = plan.children().into_iter().cloned().collect();
-    let mut changed = false;
-    let mut new_children = Vec::with_capacity(old_children.len());
-    for child in old_children {
-        let rewritten = remove_clipped_scan_round_robin(child.clone())?;
-        changed |= !Arc::ptr_eq(&child, &rewritten);
-        new_children.push(rewritten);
-    }
-    let plan = if changed {
-        plan.with_new_children(new_children)?
-    } else {
-        plan
+    let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() else {
+        return Ok(plan);
     };
-
-    let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>() else {
+    let Some(repartition) = filter.input().as_any().downcast_ref::<RepartitionExec>() else {
         return Ok(plan);
     };
     let direct_clipped_scan = repartition
@@ -7335,13 +7325,26 @@ fn remove_clipped_scan_round_robin(
         .as_any()
         .downcast_ref::<SiglakeIcebergTableScan>()
         .is_some_and(|scan| scan.admission.is_some());
-    if !repartition.preserve_order()
-        && matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
-        && direct_clipped_scan
-    {
-        return Ok(repartition.input().clone());
+    if clipped_scan_round_robin_is_removable(
+        repartition.partitioning(),
+        repartition.preserve_order(),
+        direct_clipped_scan,
+    ) {
+        return plan
+            .clone()
+            .with_new_children(vec![repartition.input().clone()]);
     }
     Ok(plan)
+}
+
+fn clipped_scan_round_robin_is_removable(
+    partitioning: &Partitioning,
+    preserve_order: bool,
+    direct_clipped_scan: bool,
+) -> bool {
+    !preserve_order
+        && matches!(partitioning, Partitioning::RoundRobinBatch(_))
+        && direct_clipped_scan
 }
 
 fn apply_clipped_limit_backpressure(
@@ -9025,6 +9028,31 @@ mod tests {
             clipped_limit: 100,
             reader_batch_size: 8_192,
         }
+    }
+
+    #[test]
+    fn clipped_round_robin_removal_gate_preserves_other_distributions() {
+        let round_robin = Partitioning::RoundRobinBatch(16);
+        assert!(clipped_scan_round_robin_is_removable(
+            &round_robin,
+            false,
+            true
+        ));
+        assert!(!clipped_scan_round_robin_is_removable(
+            &Partitioning::Hash(vec![], 16),
+            false,
+            true
+        ));
+        assert!(!clipped_scan_round_robin_is_removable(
+            &round_robin,
+            true,
+            true
+        ));
+        assert!(!clipped_scan_round_robin_is_removable(
+            &round_robin,
+            false,
+            false
+        ));
     }
 
     #[test]
