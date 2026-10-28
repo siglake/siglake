@@ -7308,9 +7308,10 @@ fn clipped_scan_admissions(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<ScanAdmissi
 /// owns the global fetch, so the repartition adds no liveness or correctness
 /// property to this unordered shape.
 ///
-/// Keep the rewrite deliberately narrow. Hash repartitions, order-preserving
-/// repartitions, and round-robin nodes whose direct child is not a clipped
-/// Siglake scan retain DataFusion's plan unchanged.
+/// Keep the rewrite deliberately narrow. The filter, repartition, and clipped
+/// Siglake scan must be direct neighbours; an intervening projection retains
+/// the repartition. Hash and order-preserving repartitions also retain
+/// DataFusion's plan unchanged.
 fn remove_clipped_scan_round_robin(
     plan: Arc<dyn ExecutionPlan>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {

@@ -28,10 +28,11 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   10 ms ceilings; keyword-last-25 passed its 25 ms ceiling at 19.40 ms. Exact
   answers and policy checks passed. The source plan now filters 1,024-row
   reader batches before DataFusion's 8,192-row round-robin receiver could hold
-  predicate evaluation back (#7658). A matched local fixture cut leaf output
-  from 276,736 to 1,024 rows and decoded bytes from 39,295,376 to 138,364, but
-  this is a bounded-work result rather than an AWS latency result. A new image
-  and matched field qualification are still required for the 10 ms claim.
+  predicate evaluation back (#7658). A matched local fixture bounds production
+  leaf output to sixteen reader batches and requires fewer decoded bytes than
+  its restored-receiver control, but this is a bounded-work result rather than
+  an AWS latency result. A new image and matched field qualification are still
+  required for the 10 ms claim.
 - **The clipped equality learned gate is local-only.** A bounded prototype can
   suppress the Parquet row predicate on a repeated, pruning-free snapshot key,
   while keeping the exact residual. Manifest-file, row-group and page pruning

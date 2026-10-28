@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{execute_stream, ExecutionPlan, Partitioning};
@@ -1007,12 +1008,11 @@ async fn a_filled_clipped_limit_starts_no_further_reader() {
 /// #7658: filter reader-sized batches before the global clipped coalescer.
 ///
 /// The pre-fix control restores DataFusion's round-robin repartition between
-/// the scan and filter. Its sixteen receivers do not expose a batch until one
-/// channel has coalesced 8,192 rows, forcing at least 131,072 source rows
-/// through one scan partition. Production lets each filter see the reader's
-/// 1,024-row batches directly, so a dense predicate fills the limit before the
-/// first admission credit. The assertions grade rows and decoded bytes rather
-/// than local wall time.
+/// the scan and filter. A receiver does not expose a batch until it has
+/// coalesced 8,192 rows across its input senders. Production lets each filter
+/// see the reader's 1,024-row batches directly, so a dense predicate fills the
+/// limit before the first admission credit. The assertions grade operator
+/// batching, rows, and decoded bytes rather than local wall time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn clipped_limit_filters_before_round_robin_can_coalesce_reader_batches() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
@@ -1053,6 +1053,15 @@ async fn clipped_limit_filters_before_round_robin_can_coalesce_reader_batches() 
         .collect();
     assert_eq!(actual_production_shape, expected_production_shape);
     let production_filter = production_plan.children()[0].clone();
+    let production_filter_exec = production_filter
+        .as_any()
+        .downcast_ref::<FilterExec>()
+        .expect("the production child must be the rebuilt residual filter");
+    assert_eq!(
+        production_filter_exec.fetch(),
+        Some(LIMIT),
+        "removing the receiver must preserve the residual filter fetch"
+    );
     assert_eq!(
         production_filter
             .properties()
@@ -1122,15 +1131,50 @@ async fn clipped_limit_filters_before_round_robin_can_coalesce_reader_batches() 
     assert_eq!(production_rows[0].total(), LIMIT);
     assert_eq!(control_rows[0].total(), LIMIT);
     let production_leaf_rows = production_rows[2].total();
-    let control_leaf_rows = control_rows[3].total();
     assert!(
         production_leaf_rows <= 16 * 1_024,
         "filtering reader batches must fill before 16 source batches: {production_leaf_rows}"
     );
+    let contributing_receivers: BTreeSet<_> = control_rows[2]
+        .partitions
+        .iter()
+        .filter_map(|(partition, output_rows)| (*output_rows > 0).then_some(*partition))
+        .collect();
+    let evaluated_filters: BTreeSet<_> = control_rows[1]
+        .evaluated_rows
+        .iter()
+        .filter_map(|(partition, evaluated_rows)| (*evaluated_rows > 0).then_some(*partition))
+        .collect();
     assert!(
-        control_leaf_rows >= 16 * 8_192,
-        "the restored repartition must reproduce its sixteen-channel fill: {control_leaf_rows}"
+        !contributing_receivers.is_empty(),
+        "the control must expose at least one coalesced receiver batch"
     );
+    assert_eq!(
+        contributing_receivers, evaluated_filters,
+        "each receiver output must be evaluated by its corresponding filter"
+    );
+    for partition in contributing_receivers {
+        let receiver_rows = control_rows[2]
+            .partitions
+            .iter()
+            .find(|(candidate, _)| *candidate == partition)
+            .map(|(_, rows)| *rows)
+            .unwrap();
+        let evaluated_rows = control_rows[1]
+            .evaluated_rows
+            .iter()
+            .find(|(candidate, _)| *candidate == partition)
+            .map(|(_, rows)| *rows)
+            .unwrap();
+        assert_eq!(
+            receiver_rows, 8_192,
+            "a contributing receiver must emit one session-sized batch"
+        );
+        assert_eq!(
+            evaluated_rows, receiver_rows,
+            "the residual filter must evaluate the complete receiver batch"
+        );
+    }
     assert!(
         production.work.decoded_bytes < control.work.decoded_bytes,
         "filtering before receiver coalescing must reduce decoded bytes: production={:?} \

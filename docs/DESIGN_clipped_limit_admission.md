@@ -347,14 +347,17 @@ the repartition between scan and residual filter.
 
 The scan reader emits 1,024-row batches when no scan batch size is configured.
 DataFusion's non-order-preserving `RoundRobinBatch(16)` receiver coalesces each
-output to the 8,192-row session batch size. One input partition sends successive
-batches to successive channels, so a channel cannot expose its first 8,192 rows
-until that partition has supplied `16 × 8,192 = 131,072` rows. The predicate
-therefore cannot fill `LIMIT 100` from the first few reader batches; the
-admission ramp widens while the receiver is still accumulating them.
+output to the 8,192-row session batch size. With one input partition, successive
+batches visit successive channels, so returning to the same channel takes
+`16 × 8,192 = 131,072` source rows. The production scan has multiple input
+senders: DataFusion seeds their starting channels from their input partition
+indices, and several senders can feed one output. The valid multi-input
+invariant is that a contributing receiver exposes an 8,192-row batch before
+its filter evaluates those rows, not that one source supplies 131,072 rows.
 
-The final clipped optimizer now removes only a non-order-preserving round-robin
-node whose direct child is a clipped Siglake scan. The resulting plan is
+The final clipped optimizer now removes only the non-order-preserving
+round-robin in the direct `FilterExec → RepartitionExec → clipped scan` chain.
+An intervening projection is not rewritten. The resulting plan is
 `ClippedLimitCoalesceExec → FilterExec → scan`. The clipped coalescer already
 spawns one producer for every input partition, so sparse predicates still poll
 every partition and earn batch or terminal admission credits. Hash repartitions,
@@ -364,19 +367,13 @@ rewritten. The residual filter and global fetch remain in place; NULL, error,
 
 `clipped_limit_filters_before_round_robin_can_coalesce_reader_batches` restores
 the old repartition in a matched test-only control over fifteen 20,000-row files.
-Both arms return 100 distinct qualifying rows. The control scans 276,736 rows
-and decodes 39,295,376 bytes; production scans one 1,024-row batch and decodes
-138,364 bytes. Production's plan has three nodes and its leaf output is gated
-at no more than sixteen reader batches.
-
-The ignored #7515 four-layout comparison was rerun after the rewrite. Wave 2
-and wave 4 retained identical requested and decoded bytes on interleaved,
-four-partition clustered and single-file clustered layouts. The clustered case
-now fills from one reader in both arms (38,126 requested bytes and 166,548
-decoded bytes), so the old 12.037 ms widening benefit does not carry forward.
-The sixteen-partition rare-scattered control still reads 197,906 requested /
-231,376 decoded bytes under wave 2 and 395,810 / 462,752 under wave 4. This
-keeps the wider-layout cost that bounds the default policy.
+Both arms return 100 distinct qualifying rows. Each contributing control
+receiver emits one 8,192-row batch and its filter evaluates those same rows.
+Production preserves the filter's fetch, has the three-node shape, emits at
+most sixteen 1,024-row reader batches, and decodes fewer bytes than the matched
+control. Run-specific counter values are descriptive and are not stored as a
+new measurement here. The earlier #7515 four-layout comparison predates this
+rewrite; no post-rewrite rerun is claimed.
 
 This demonstrates a source-level cause and a local bounded-work reduction. It
 does not demonstrate either 10 ms field ceiling, an AWS latency reduction,
@@ -558,14 +555,12 @@ layout without a repeatable timing benefit. See
 * an explicit session or environment factor, `0` included, overrides the
   policy at every width. No new knob, chart value or CRD field.
 
-#7658 removes that repartition on clipped plans. The successor four-layout run
-kept both factors on one reader for the clustered layout, with 38,126 requested
-bytes and 166,548 decoded bytes, so the earlier 12.037 ms benefit is historical
-and does not describe the three-node plan. The sparse sixteen-partition control
-still doubled requested and decoded bytes under factor 4. The capped policy is
-retained: it cannot widen a common predicate that fills before its first credit,
-and the exactness and cancellation controls cover sparse predicates that do
-earn the credit.
+#7658 removes that repartition on the direct clipped plan. The earlier 12.037 ms
+benefit and sparse-layout byte comparison are historical evidence for the old
+four-node plan, not measurements of the three-node plan. The capped policy is
+retained conservatively; exactness and cancellation controls cover sparse
+predicates that earn the first credit, while no post-rewrite layout rerun is
+claimed.
 
 Deterministic coverage. In `query_provider.rs`:
 `the_default_admission_wave_fills_two_to_four_planned_partitions` and
