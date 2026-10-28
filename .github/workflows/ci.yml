@@ -223,6 +223,12 @@ jobs:
       # the two agree on github.sha only for the first.
       - name: the published images carry the release commit
         run: python3 scripts/check-release-provenance.py
+      # Profiling images are larger, privileged builds with a different feature
+      # set, so their public route is manual and immutable. This drives hostile
+      # source inputs and GHCR outcomes locally, then holds the workflow's exact
+      # permission map, source checks, labels, cache and full-SHA-only tag.
+      - name: profiling publication is pinned, isolated and non-overwriting
+        run: python3 scripts/check-profiling-publication.py
       # `-C link-arg=-fuse-ld=mold` was set for the whole workflow while only
       # four of the five cargo jobs installed mold. The fifth, `docker`, failed
       # every run at its first link under the name of the MinIO and Postgres

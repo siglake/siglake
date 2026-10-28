@@ -2616,9 +2616,19 @@ which are not redundant:
    tokio-metrics reports a much smaller counter set) and
    `-C force-frame-pointers=yes`, and skips `strip --strip-debug` so profiles
    resolve to file:line. That DWARF is most of why the image is ~1.95 GB
-   against ~115–123 MB per stripped binary, so it is built on request
-   (`.github/workflows/profiling-image.yml`, `workflow_dispatch`) and tagged
-   `prof-<sha>`, never published as a release image.
+   against ~115–123 MB per stripped binary, so it is built on request. The
+   public GHCR route (`.github/workflows/profiling-image-ghcr.yml`,
+   `workflow_dispatch`) accepts one full 40-character commit id and publishes
+   only `ghcr.io/siglake/siglake:prof-<full-sha>`. It verifies that the checkout
+   resolved to that commit and refuses to overwrite an existing tag. The image
+   labels keep the full build revision, the profiling distinction and the
+   workflow revision separate; the binary's version uses the checked-out
+   revision's short form. The historical source's Dockerfile is used unchanged:
+   the fixed `ubuntu-24.04` publish job records its CPU, memory and disk envelope
+   before building and stops at its six-hour deadline. The older
+   `.github/workflows/profiling-image.yml` route remains the optional
+   ECR/build-only path. Neither route publishes a release, numeric or `latest`
+   tag.
 2. **An operator.** Even that image mounts nothing until
    `SIGLAKE_PPROF_ENABLED=1` is set in the process environment; any other
    value, including a misspelling, leaves the routes absent. A disarmed
