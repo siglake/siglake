@@ -308,7 +308,7 @@ does not support the earlier decoded-work attribution, a capacity-only cause,
 or a local or AWS latency guarantee. The unchanged matched field qualification
 remains required.
 
-## Per-node LIMIT metrics (#7458)
+## Per-node LIMIT metrics before #7658 (#7458)
 
 The 2026-10-26 candidate profile's `df_output_rows` is the sum of
 `output_rows` from every physical operator. Its four-node clipped plan is
@@ -320,8 +320,8 @@ report calling it an exact multiple of 8,292. Execution 338, for example,
 reports 426,457 total rows and 409,773 leaf rows: 16,684, or
 `100 + 2 × (8,192 + 100)`.
 
-`clipped_limit_output_metrics_separate_runahead_from_emitted_rows` builds the
-same node shape with fifteen files and sixteen target partitions. It reads
+The pre-#7658 version of the current matched-control test built the same node
+shape with fifteen files and sixteen target partitions. It read
 each node's metrics by partition after the scan workers settle. Every
 contributing repartition partition emits one 8,192-row coalesced batch; the
 corresponding filter evaluates those 8,192 rows and emits at most its 100-row
@@ -336,6 +336,49 @@ filter emitting 8,292 rows or ignoring its fetch. Scan output is upstream
 run-ahead, filter selectivity's denominator is rows evaluated, and root output
 is rows returned; the aggregate must not substitute for any of those counts.
 No repair or threshold change follows from this metric pattern.
+
+## Filter before receiver coalescing (#7658)
+
+The reviewed 28d4 field run left keyword and substring scan at 14.05 ms and
+14.03 ms against 10 ms ceilings. Both read all 15 files, emitted about 384,140
+and 376,153 leaf rows, and fetched no data, index or metadata bytes. Their
+four-node plans and equal collect cost narrowed the remaining shared work to
+the repartition between scan and residual filter.
+
+The scan reader emits 1,024-row batches when no scan batch size is configured.
+DataFusion's non-order-preserving `RoundRobinBatch(16)` receiver coalesces each
+output to the 8,192-row session batch size. With one input partition, successive
+batches visit successive channels, so returning to the same channel takes
+`16 × 8,192 = 131,072` source rows. The production scan has multiple input
+senders: DataFusion seeds their starting channels from their input partition
+indices, and several senders can feed one output. The valid multi-input
+invariant is that a contributing receiver exposes an 8,192-row batch before
+its filter evaluates those rows, not that one source supplies 131,072 rows.
+
+The final clipped optimizer now removes only the non-order-preserving
+round-robin in the direct `FilterExec → RepartitionExec → clipped scan` chain.
+An intervening projection is not rewritten. The resulting plan is
+`ClippedLimitCoalesceExec → FilterExec → scan`. The clipped coalescer already
+spawns one producer for every input partition, so sparse predicates still poll
+every partition and earn batch or terminal admission credits. Hash repartitions,
+order-preserving repartitions and plans without `ClippedScanLimit` are not
+rewritten. The residual filter and global fetch remain in place; NULL, error,
+`OFFSET`, `ORDER BY`, aggregate and cancellation boundaries are unchanged.
+
+`clipped_limit_filters_before_round_robin_can_coalesce_reader_batches` restores
+the old repartition in a matched test-only control over fifteen 20,000-row files.
+Both arms return 100 distinct qualifying rows. Each contributing control
+receiver emits one 8,192-row batch and its filter evaluates those same rows.
+Production preserves the filter's fetch, has the three-node shape, emits at
+most sixteen 1,024-row reader batches, and decodes fewer bytes than the matched
+control. Run-specific counter values are descriptive and are not stored as a
+new measurement here. The earlier #7515 four-layout comparison predates this
+rewrite; no post-rewrite rerun is claimed.
+
+This demonstrates a source-level cause and a local bounded-work reduction. It
+does not demonstrate either 10 ms field ceiling, an AWS latency reduction,
+object-store behavior or a release result. Those require a new immutable image
+and the manager-owned matched qualification.
 
 ## Closing admission when the fetch is filled (#7487)
 
@@ -502,7 +545,7 @@ layout without a repeatable timing benefit. See
 #7520 ships that recommendation as the default policy, and nothing else:
 
 * the factor reads `partition_count` — the scan node's own planned partitions,
-  after pruning and before the repartition above it — so two to four planned
+  after pruning — so two to four planned
   partitions take a factor equal to the count and the FIRST earned credit
   admits all of them;
 * one reader still starts alone, and the fill happens at that first credit,
@@ -512,14 +555,12 @@ layout without a repeatable timing benefit. See
 * an explicit session or environment factor, `0` included, overrides the
   policy at every width. No new knob, chart value or CRD field.
 
-Why filling is free at this width and not at sixteen: a scan that planned
-fewer partitions than `target_partitions` is driven through a
-`RepartitionExec: RoundRobinBatch(16), input_partitions=4`, whose tasks poll
-every input partition. The ends therefore come quickly, both factors open all
-four files, and the ramp decides when they start rather than how many run —
-which is exactly what #7515 measured, identical bytes 12.037 ms apart. At
-sixteen partitions there is no repartition and a wider first wave is more
-readers.
+#7658 removes that repartition on the direct clipped plan. The earlier 12.037 ms
+benefit and sparse-layout byte comparison are historical evidence for the old
+four-node plan, not measurements of the three-node plan. The capped policy is
+retained conservatively; exactness and cancellation controls cover sparse
+predicates that earn the first credit, while no post-rewrite layout rerun is
+claimed.
 
 Deterministic coverage. In `query_provider.rs`:
 `the_default_admission_wave_fills_two_to_four_planned_partitions` and
@@ -539,11 +580,10 @@ checks factor 2 and `0` through real plans;
 last-file-only layout at one to five partitions;
 `cancelling_a_filled_small_scan_ends_every_stream` drops the root stream at the
 filled width and requires every stream to end; and
-`a_small_clipped_scan_repartitions_above_the_ramp` pins the repartition shape
-above.
+`a_small_clipped_scan_filters_before_the_bounded_coalescer` pins the new
+three-node shape.
 
 What this does not establish: no AWS, object-store or distributed-query
-measurement, and no three-partition benefit — three follows the ramp's
-arithmetic and the measured factor-4 cap, not a measurement. The timing
-evidence remains #7515's by-hand `#[ignore]`d comparison; nothing in CI grades
-collect time.
+measurement, and no three-partition benefit. The original timing evidence is
+#7515's by-hand `#[ignore]`d comparison; the successor run grades exact answers
+and byte counters, not collect time.

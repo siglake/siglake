@@ -26,10 +26,12 @@ use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSort
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::CardinalityEffect;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
@@ -7294,6 +7296,58 @@ fn clipped_scan_admissions(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<ScanAdmissi
     admissions
 }
 
+/// Remove DataFusion's throughput repartition immediately above a clipped
+/// scan before the residual filter evaluates its input.
+///
+/// The round-robin receiver coalesces the reader's 1,024-row batches to the
+/// session batch size (8,192 rows). With sixteen output channels, one scan
+/// partition must emit up to sixteen batches before the same channel sees its
+/// second batch. That defeats the staged scan admission: a dense predicate
+/// cannot fill its fetch until the ramp has decoded many times the rows it
+/// needs. [`ClippedLimitCoalesceExec`] already polls every input partition and
+/// owns the global fetch, so the repartition adds no liveness or correctness
+/// property to this unordered shape.
+///
+/// Keep the rewrite deliberately narrow. The filter, repartition, and clipped
+/// Siglake scan must be direct neighbours; an intervening projection retains
+/// the repartition. Hash and order-preserving repartitions also retain
+/// DataFusion's plan unchanged.
+fn remove_clipped_scan_round_robin(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let Some(filter) = plan.as_any().downcast_ref::<FilterExec>() else {
+        return Ok(plan);
+    };
+    let Some(repartition) = filter.input().as_any().downcast_ref::<RepartitionExec>() else {
+        return Ok(plan);
+    };
+    let direct_clipped_scan = repartition
+        .input()
+        .as_any()
+        .downcast_ref::<SiglakeIcebergTableScan>()
+        .is_some_and(|scan| scan.admission.is_some());
+    if clipped_scan_round_robin_is_removable(
+        repartition.partitioning(),
+        repartition.preserve_order(),
+        direct_clipped_scan,
+    ) {
+        return plan
+            .clone()
+            .with_new_children(vec![repartition.input().clone()]);
+    }
+    Ok(plan)
+}
+
+fn clipped_scan_round_robin_is_removable(
+    partitioning: &Partitioning,
+    preserve_order: bool,
+    direct_clipped_scan: bool,
+) -> bool {
+    !preserve_order
+        && matches!(partitioning, Partitioning::RoundRobinBatch(_))
+        && direct_clipped_scan
+}
+
 fn apply_clipped_limit_backpressure(
     plan: Arc<dyn ExecutionPlan>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -7319,6 +7373,7 @@ fn apply_clipped_limit_backpressure(
         && input.properties().output_partitioning().partition_count() > 1
         && contains_clipped_scan(&input)
     {
+        let input = remove_clipped_scan_round_robin(input)?;
         return Ok(Arc::new(ClippedLimitCoalesceExec::new(
             input,
             coalesce.fetch(),
@@ -8974,6 +9029,31 @@ mod tests {
             clipped_limit: 100,
             reader_batch_size: 8_192,
         }
+    }
+
+    #[test]
+    fn clipped_round_robin_removal_gate_preserves_other_distributions() {
+        let round_robin = Partitioning::RoundRobinBatch(16);
+        assert!(clipped_scan_round_robin_is_removable(
+            &round_robin,
+            false,
+            true
+        ));
+        assert!(!clipped_scan_round_robin_is_removable(
+            &Partitioning::Hash(vec![], 16),
+            false,
+            true
+        ));
+        assert!(!clipped_scan_round_robin_is_removable(
+            &round_robin,
+            true,
+            true
+        ));
+        assert!(!clipped_scan_round_robin_is_removable(
+            &round_robin,
+            false,
+            false
+        ));
     }
 
     #[test]

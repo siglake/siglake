@@ -24,13 +24,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   causal claim. Current typed/cancellation and exact aggregate checks are
   recorded separately in the [stack qualification report](../results/release-validation/20261019-stack-field-qualification.md).
 - **The clipped-text 10 ms / 25 ms goals remain unmet.** The retained run
-  measured about 386 ms for the keyword query and 27 ms for the last-25 query,
-  while exact results and policy checks passed. This performance work is
-  tracked for 0.4.0; it is not a speed claim for 0.3.0. Since then the clipped
-  scan's first admission has been made deterministic (#6979) — which file the
-  ramp opens first no longer varies run to run — but that fixes the spread,
-  not the level: the same retained runs took 379–508 ms whenever the file they
-  opened had to be read. No matched round has been run against the ceilings.
+  measured 14.05 ms for keyword and 14.03 ms for substring scan against their
+  10 ms ceilings; keyword-last-25 passed its 25 ms ceiling at 19.40 ms. Exact
+  answers and policy checks passed. The source plan now filters 1,024-row
+  reader batches before DataFusion's 8,192-row round-robin receiver could hold
+  predicate evaluation back (#7658). A matched local fixture bounds production
+  leaf output to sixteen reader batches and requires fewer decoded bytes than
+  its restored-receiver control, but this is a bounded-work result rather than
+  an AWS latency result. A new image and matched field qualification are still
+  required for the 10 ms claim.
 - **The clipped equality learned gate is local-only.** A bounded prototype can
   suppress the Parquet row predicate on a repeated, pruning-free snapshot key,
   while keeping the exact residual. Manifest-file, row-group and page pruning
