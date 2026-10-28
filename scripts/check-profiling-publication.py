@@ -2,19 +2,24 @@
 """Hold the immutable, engine-only GHCR profiling publication contract.
 
 The executable fixtures drive source validation against a temporary Git
-checkout and the registry preflight against a stand-in curl. Static checks keep
-the manual workflow's permissions, ordering, tags, labels and build settings
-from drifting. No registry, image build or third-party Python package is used.
+checkout and the registry preflight against controlled responses, including a
+local HTTP server reached by real curl. Static checks keep the manual
+workflow's permissions, ordering, tags, labels and build settings from
+drifting. No external registry, image build or third-party Python package is
+used.
 """
 
 from __future__ import annotations
 
+import http.server
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 
 
 WORKFLOW = pathlib.PurePath(".github/workflows/profiling-image-ghcr.yml")
@@ -246,13 +251,15 @@ def script_problems(prepare: str, available: str) -> list[str]:
         "https://ghcr.io/token?scope=repository:siglake/siglake:pull",
         "https://ghcr.io/v2/siglake/siglake/manifests/$tag",
         "--max-time 15",
-        "--request HEAD",
+        "--head",
         "application/vnd.oci.image.index.v1+json",
         "application/vnd.docker.distribution.manifest.list.v2+json",
         "Docker-Content-Digest:",
     ):
         if fact not in available:
             problems.append(f"registry preflight lost required check: {fact}")
+    if "--request HEAD" in available:
+        problems.append("registry preflight uses a custom HEAD verb without curl HEAD semantics")
     return problems
 
 
@@ -316,6 +323,121 @@ def prepare_fixtures(root: pathlib.Path, prepare: pathlib.Path) -> int:
     return checked
 
 
+class RegistryHandler(http.server.BaseHTTPRequestHandler):
+    """Serve the GHCR exchanges whose HTTP framing matters to real curl."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass
+
+    def response(self, status: int, body: bytes, *, advertised_length: int | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header(
+            "Content-Length",
+            str(len(body) if advertised_length is None else advertised_length),
+        )
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+        self.close_connection = True
+
+    def do_GET(self) -> None:
+        if not self.path.startswith("/token?"):
+            self.response(405, b"manifest lookup requires HEAD")
+            return
+        fixture = getattr(self.server, "fixture")
+        if fixture == "malformed-token":
+            self.response(200, b'{"token":')
+        elif fixture == "truncated-token":
+            self.response(200, b'{"token":"cut', advertised_length=70)
+        else:
+            self.response(200, b'{"token":"fixture-token"}')
+
+    def do_HEAD(self) -> None:
+        if "/manifests/" not in self.path:
+            self.response(404, b"")
+            return
+        fixture = getattr(self.server, "fixture")
+        if fixture == "existing":
+            self.send_response(200)
+            self.send_header("Docker-Content-Digest", "sha256:real-curl-fixture")
+        else:
+            self.send_response(404)
+        # A registry may describe an error body on HEAD while correctly sending
+        # no body. `curl --request HEAD` treats that body as truncated; `--head`
+        # applies HEAD response semantics and returns the status immediately.
+        self.send_header("Content-Length", "70")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+
+def real_curl_registry_fixtures(root: pathlib.Path, available: pathlib.Path) -> int:
+    """Drive the complete preflight through real curl and a local HTTP server."""
+    real_curl = shutil.which("curl")
+    if real_curl is None:
+        raise CheckError("real-curl registry fixtures require curl")
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RegistryHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = pathlib.Path(raw)
+            shim = temporary / "curl"
+            shim.write_text(
+                """#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+origin = os.environ["LOCAL_REGISTRY_ORIGIN"]
+args = [
+    argument.replace("https://ghcr.io", origin, 1)
+    if argument.startswith("https://ghcr.io")
+    else argument
+    for argument in sys.argv[1:]
+]
+raise SystemExit(
+    subprocess.run(
+        [os.environ["REAL_CURL"], "--noproxy", "*", *args], check=False
+    ).returncode
+)
+"""
+            )
+            shim.chmod(0o755)
+            base = os.environ | {
+                "PATH": f"{temporary}:{os.environ['PATH']}",
+                "RUNNER_TEMP": str(temporary),
+                "BUILD_SOURCE_SHA": "b" * 40,
+                "REAL_CURL": real_curl,
+                "LOCAL_REGISTRY_ORIGIN": f"http://127.0.0.1:{server.server_port}",
+            }
+            cases = (
+                ("absent", True, "is absent"),
+                ("existing", False, "sha256:real-curl-fixture"),
+                ("malformed-token", False, "had no token"),
+                ("truncated-token", False, "token request failed or timed out"),
+            )
+            for fixture, should_pass, evidence in cases:
+                setattr(server, "fixture", fixture)
+                result = run([str(available)], cwd=root, env=base)
+                combined = result.stdout + result.stderr
+                if (result.returncode == 0) != should_pass or evidence not in combined:
+                    raise CheckError(
+                        f"real-curl registry fixture {fixture} was misclassified: "
+                        f"{combined.strip()}"
+                    )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+    return len(cases)
+
+
 def registry_fixtures(root: pathlib.Path, available: pathlib.Path) -> int:
     checked = 0
     with tempfile.TemporaryDirectory() as raw:
@@ -332,7 +454,7 @@ while [ "$#" -gt 0 ]; do
     --output) output=$2; shift 2 ;;
     --dump-header) headers=$2; shift 2 ;;
     --write-out|--header|--request|--max-time) shift 2 ;;
-    --silent|--show-error|--location) shift ;;
+    --head|--silent|--show-error|--location) shift ;;
     *) url=$1; shift ;;
   esac
 done
@@ -407,7 +529,11 @@ def main() -> int:
         workflow = (root / WORKFLOW).read_text()
         prepare_text = prepare.read_text()
         available_text = available.read_text()
-        dynamic = prepare_fixtures(root, prepare) + registry_fixtures(root, available)
+        dynamic = (
+            prepare_fixtures(root, prepare)
+            + registry_fixtures(root, available)
+            + real_curl_registry_fixtures(root, available)
+        )
         static = static_fixtures(workflow)
         problems = workflow_problems(workflow) + script_problems(prepare_text, available_text)
     except (CheckError, OSError, subprocess.SubprocessError) as error:
