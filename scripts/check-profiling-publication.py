@@ -173,6 +173,8 @@ def workflow_problems(text: str) -> list[str]:
             problems.append(f"{name} job does not pin its workflow checkout or disable checkout credentials")
     for fact in (
         "dtolnay/rust-toolchain@1.95.0",
+        "timeout-minutes: 120",
+        'CARGO_BUILD_JOBS: "2"',
         "working-directory: source",
         "run: scripts/check-profiling-feature.sh",
     ):
@@ -201,14 +203,20 @@ def workflow_problems(text: str) -> list[str]:
         "dev.siglake.workflow.revision=${{ github.sha }}",
         "cache-from: type=gha,scope=siglake-profiling-ghcr",
         "cache-to: type=gha,scope=siglake-profiling-ghcr,mode=max",
+        "Record hosted runner resource envelope",
+        "getconf _NPROCESSORS_ONLN",
+        "/proc/meminfo",
+        "df -B1 --output=size,avail /",
+        "Job deadline (minutes): 360",
         "Free disk on the hosted runner",
-        "CARGO_BUILD_JOBS=2",
         "context: source",
         "file: source/deploy/Dockerfile",
     )
     for fact in required:
         if fact not in blocks["publish"]:
             problems.append(f"publish job lost required setting: {fact}")
+    if "CARGO_BUILD_JOBS" in blocks["publish"]:
+        problems.append("publish job claims a Cargo bound that does not enter the historical Dockerfile")
     if "siglake-operator" in text or re.search(r"tags:.*(?:latest|prof-\$\{\{ env\.REVISION)", text):
         problems.append("workflow names an operator or mutable/non-full profiling tag")
 
@@ -239,6 +247,8 @@ def script_problems(prepare: str, available: str) -> list[str]:
         "https://ghcr.io/v2/siglake/siglake/manifests/$tag",
         "--max-time 15",
         "--request HEAD",
+        "application/vnd.oci.image.index.v1+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
         "Docker-Content-Digest:",
     ):
         if fact not in available:
@@ -380,6 +390,8 @@ def static_fixtures(workflow: str) -> int:
         workflow.replace("tags: ghcr.io/siglake/siglake:${{ env.PROFILE_TAG }}", "tags: ghcr.io/siglake/siglake:latest", 1),
         workflow.replace("    needs: check\n", "", 1),
         workflow.replace("run: workflow/scripts/check-profiling-tag-available.sh", "run: true", 1),
+        workflow.replace('      CARGO_BUILD_JOBS: "2"\n', "", 1),
+        workflow.replace("      - name: Record hosted runner resource envelope", "      - name: Runner details", 1),
     )
     for index, mutation in enumerate(mutations, 1):
         if not workflow_problems(mutation):

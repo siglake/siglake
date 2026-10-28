@@ -3,9 +3,12 @@
 # push trigger. The existing profiling-image.yml ECR/build-only route remains
 # separate and unchanged.
 #
-# A profiling image is about 1.95 GB. The hosted-runner disk cleanup and six
-# hour job bound below are part of the first hosted qualification; they are not
-# settled until benchmark_expansion reviews this gate and runs one dispatch.
+# A profiling image is about 1.95 GB. Its exact historical Dockerfile controls
+# compilation and receives no synthetic resource arguments. The publish job
+# instead uses the fixed ubuntu-24.04 hosted envelope, records its actual CPU,
+# memory and disk at runtime, and has a six-hour deadline. Those values remain
+# qualification evidence, not a size claim, until benchmark_expansion runs one
+# dispatch.
 name: profiling-image-ghcr
 
 on:
@@ -27,6 +30,11 @@ env:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # This job invokes Cargo on the runner, so the setting reaches the two
+      # direct profiling-feature builds in check-profiling-feature.sh.
+      CARGO_BUILD_JOBS: "2"
     permissions:
       contents: read
     steps:
@@ -87,6 +95,19 @@ jobs:
         run: workflow/scripts/prepare-profiling-publication.sh resolve
       - name: Refuse an existing immutable tag
         run: workflow/scripts/check-profiling-tag-available.sh
+      - name: Record hosted runner resource envelope
+        run: |
+          cpus=$(getconf _NPROCESSORS_ONLN)
+          memory_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+          root_disk=$(df -B1 --output=size,avail / | tail -1 | xargs)
+          {
+            echo "### Hosted runner resource envelope"
+            echo ''
+            echo "CPU count: ${cpus}"
+            echo "Memory (KiB): ${memory_kib}"
+            echo "Root disk total/available (bytes): ${root_disk}"
+            echo "Job deadline (minutes): 360"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Free disk on the hosted runner
         run: |
           echo "before:"; df -h / | tail -1
@@ -101,8 +122,6 @@ jobs:
                       /usr/local/share/chromium
           sudo docker image prune --all --force >/dev/null 2>&1 || true
           echo "after:"; df -h / | tail -1
-      - name: Bound build resources
-        run: echo 'CARGO_BUILD_JOBS=2' >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - name: Login to GHCR
         uses: docker/login-action@v3
