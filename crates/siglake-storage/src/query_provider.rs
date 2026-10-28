@@ -30,6 +30,7 @@ use datafusion::physical_plan::limit::LimitStream;
 use datafusion::physical_plan::metrics::{
     BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet,
 };
+use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::sorts::streaming_merge::StreamingMergeBuilder;
 use datafusion::physical_plan::stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter};
 use datafusion::physical_plan::{DisplayAs, ExecutionPlan, Partitioning, PlanProperties};
@@ -7294,6 +7295,55 @@ fn clipped_scan_admissions(plan: &Arc<dyn ExecutionPlan>) -> Vec<Arc<ScanAdmissi
     admissions
 }
 
+/// Remove DataFusion's throughput repartition immediately above a clipped
+/// scan before the residual filter evaluates its input.
+///
+/// The round-robin receiver coalesces the reader's 1,024-row batches to the
+/// session batch size (8,192 rows). With sixteen output channels, one scan
+/// partition must emit up to sixteen batches before the same channel sees its
+/// second batch. That defeats the staged scan admission: a dense predicate
+/// cannot fill its fetch until the ramp has decoded many times the rows it
+/// needs. [`ClippedLimitCoalesceExec`] already polls every input partition and
+/// owns the global fetch, so the repartition adds no liveness or correctness
+/// property to this unordered shape.
+///
+/// Keep the rewrite deliberately narrow. Hash repartitions, order-preserving
+/// repartitions, and round-robin nodes whose direct child is not a clipped
+/// Siglake scan retain DataFusion's plan unchanged.
+fn remove_clipped_scan_round_robin(
+    plan: Arc<dyn ExecutionPlan>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let old_children: Vec<_> = plan.children().into_iter().cloned().collect();
+    let mut changed = false;
+    let mut new_children = Vec::with_capacity(old_children.len());
+    for child in old_children {
+        let rewritten = remove_clipped_scan_round_robin(child.clone())?;
+        changed |= !Arc::ptr_eq(&child, &rewritten);
+        new_children.push(rewritten);
+    }
+    let plan = if changed {
+        plan.with_new_children(new_children)?
+    } else {
+        plan
+    };
+
+    let Some(repartition) = plan.as_any().downcast_ref::<RepartitionExec>() else {
+        return Ok(plan);
+    };
+    let direct_clipped_scan = repartition
+        .input()
+        .as_any()
+        .downcast_ref::<SiglakeIcebergTableScan>()
+        .is_some_and(|scan| scan.admission.is_some());
+    if !repartition.preserve_order()
+        && matches!(repartition.partitioning(), Partitioning::RoundRobinBatch(_))
+        && direct_clipped_scan
+    {
+        return Ok(repartition.input().clone());
+    }
+    Ok(plan)
+}
+
 fn apply_clipped_limit_backpressure(
     plan: Arc<dyn ExecutionPlan>,
 ) -> DFResult<Arc<dyn ExecutionPlan>> {
@@ -7319,6 +7369,7 @@ fn apply_clipped_limit_backpressure(
         && input.properties().output_partitioning().partition_count() > 1
         && contains_clipped_scan(&input)
     {
+        let input = remove_clipped_scan_round_robin(input)?;
         return Ok(Arc::new(ClippedLimitCoalesceExec::new(
             input,
             coalesce.fetch(),

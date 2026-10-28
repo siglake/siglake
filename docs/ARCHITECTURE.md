@@ -1693,13 +1693,18 @@ before the global limit can cancel them. The scan instead admits partitions in
 widening waves: one to start, doubling when cumulative credits reach the
 admitted width — except that a scan which PLANNED two to four partitions fills
 all of them at its first earned credit instead of doubling (#7520). Pruning is
-what leaves a scan that narrow, and at that width the repartition above the
-scan drives every partition anyway, so both factors open the same files and the
-ramp decides only when: #7515 measured 12.037 ms of paired-median collect time
-for four partitions at identical requested and decoded bytes, against twice the
-bytes and no repeatable timing benefit for the same factor at sixteen. The fill
-is capped there, the first reader still starts alone, and an explicit factor
-overrides the policy at every width. An exhausted partition pays immediately;
+what leaves a scan that narrow. #7515 originally measured 12.037 ms of
+paired-median collect time for filling four partitions at identical requested
+and decoded bytes, against twice the bytes and no repeatable timing benefit for
+the same factor at sixteen. The clipped plan no longer retains the
+`RoundRobinBatch` node which made that widening necessary (#7658): the residual
+filter sees each reader's 1,024-row batch directly, and the bounded coalescer
+polls every scan partition itself. A successor run of the same four layouts
+kept the interleaved and clustered cases on one reader; wave 2 and wave 4 had
+identical requested and decoded bytes. The sparse sixteen-partition control
+still doubled both byte totals under wave 4, so the fill remains capped at four,
+the first reader still starts alone, and an explicit factor overrides the
+policy at every width. An exhausted partition pays immediately;
 raw source batches pay one credit per eight batches because the residual
 predicate above the scan may need several batches to make the final result
 row. This keeps a common clipped
@@ -1728,12 +1733,20 @@ fewer reader and fewer fetched bytes, but equal decoded bytes, so this is a
 combined buffering and cancellation bound rather than a capacity-only or local
 latency claim. Other query shapes keep DataFusion's ordinary parallel
 coalescer.
+The same final optimizer removes a non-order-preserving round-robin repartition
+only when its direct child is the clipped Siglake scan. That receiver withheld
+each output until it had coalesced 8,192 rows; with sixteen channels, the first
+predicate evaluation required at least 131,072 source rows from one partition.
+The three-node production plan is now `ClippedLimitCoalesceExec → FilterExec →
+scan`. A matched local pre-fix control scanned 276,736 rows and decoded
+39,295,376 bytes; production scanned 1,024 rows and decoded 138,364 bytes, with
+both arms returning the same 100 distinct qualifying rows. Hash repartitions,
+order-preserving repartitions and non-clipped plans are unchanged.
 The execution profile's `df_output_rows` adds `output_rows` across every plan
 node; it is operator throughput rather than a count of unique source or result
-rows. On this clipped shape, each contributing partition adds one 8,192-row
-repartition batch and up to 100 filtered rows, while the root adds its global
-100 once. Per-node metrics and the scan leaf remain the sources for evaluating
-LIMIT termination and scan work.
+rows. Per-node metrics and the scan leaf remain the sources for evaluating
+LIMIT termination and scan work; the retained four-node profiles predate
+#7658.
 Observable via
 `siglake_query_scan_clipped_admission_total{outcome}` and
 `siglake_query_scan_clipped_admission_wait_seconds`; `SIGLAKE_SCAN_CLIPPED_ADMISSION_WAVE=0`

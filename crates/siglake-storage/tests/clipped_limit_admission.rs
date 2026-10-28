@@ -30,7 +30,8 @@ use std::time::Duration;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::metrics::MetricValue;
-use datafusion::physical_plan::{execute_stream, ExecutionPlan};
+use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::{execute_stream, ExecutionPlan, Partitioning};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use siglake_core::Event;
@@ -368,6 +369,50 @@ fn replace_clipped_coalescer_with_standard(
     assert_eq!(children.len(), 1, "clipped coalescer must have one child");
     let standard = CoalescePartitionsExec::new(children[0].clone()).with_fetch(plan.fetch());
     (Arc::new(standard), replacements + 1)
+}
+
+/// Test-only pre-#7658 control. Production now removes this throughput
+/// repartition from the clipped path; restoring exactly that one node keeps
+/// the snapshot, filter, fetch and admission ramp fixed while reproducing its
+/// 8,192-row receiver coalescing.
+fn restore_clipped_scan_repartition(
+    plan: Arc<dyn ExecutionPlan>,
+) -> (Arc<dyn ExecutionPlan>, usize) {
+    let old_children: Vec<_> = plan.children().into_iter().cloned().collect();
+    let mut replacements = 0;
+    let mut changed = false;
+    let mut new_children = Vec::with_capacity(old_children.len());
+    for child in old_children {
+        let (replacement, child_replacements) = restore_clipped_scan_repartition(child.clone());
+        changed |= !Arc::ptr_eq(&child, &replacement);
+        replacements += child_replacements;
+        new_children.push(replacement);
+    }
+    let plan = if changed {
+        plan.with_new_children(new_children).unwrap()
+    } else {
+        plan
+    };
+
+    let children = plan.children();
+    if plan.name() != "FilterExec"
+        || children.len() != 1
+        || children[0]
+            .as_any()
+            .downcast_ref::<SiglakeIcebergTableScan>()
+            .is_none()
+    {
+        return (plan, replacements);
+    }
+    let repartition = RepartitionExec::try_new(
+        children[0].clone(),
+        Partitioning::RoundRobinBatch(PARTITIONS),
+    )
+    .unwrap();
+    (
+        plan.with_new_children(vec![Arc::new(repartition)]).unwrap(),
+        replacements + 1,
+    )
 }
 
 /// One bounded/control pair of the #7341 A/B: plan both arms from their own
@@ -943,12 +988,17 @@ async fn a_filled_clipped_limit_starts_no_further_reader() {
     );
 }
 
-/// #7458: `sql execution profile` adds every plan node's `output_rows` before
-/// comparing that sum with the scan leaf. Read the same clipped physical shape
-/// one node and partition at a time so an 8,192-row repartition batch cannot be
-/// mistaken for rows emitted by the filter above it.
+/// #7658: filter reader-sized batches before the global clipped coalescer.
+///
+/// The pre-fix control restores DataFusion's round-robin repartition between
+/// the scan and filter. Its sixteen receivers do not expose a batch until one
+/// channel has coalesced 8,192 rows, forcing at least 131,072 source rows
+/// through one scan partition. Production lets each filter see the reader's
+/// 1,024-row batches directly, so a dense predicate fills the limit before the
+/// first admission credit. The assertions grade rows and decoded bytes rather
+/// than local wall time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn clipped_limit_output_metrics_separate_runahead_from_emitted_rows() {
+async fn clipped_limit_filters_before_round_robin_can_coalesce_reader_batches() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
 
     const LIMIT: usize = 100;
@@ -966,94 +1016,92 @@ async fn clipped_limit_output_metrics_separate_runahead_from_emitted_rows() {
     }
 
     let sql = format!("SELECT raw FROM events WHERE raw LIKE '%{NEEDLE}%' LIMIT {LIMIT}");
-    let ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
-    ice.register_with_datafusion(&ctx).await.unwrap();
-    let plan = ctx
+    let production_ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
+    ice.register_with_datafusion(&production_ctx).await.unwrap();
+    let production_plan = production_ctx
         .sql(&sql)
         .await
         .unwrap()
         .create_physical_plan()
         .await
         .unwrap();
-    let expected_shape = [
+    let expected_production_shape = [
+        "ClippedLimitCoalesceExec",
+        "FilterExec",
+        "SiglakeIcebergTableScan",
+    ];
+    let actual_production_shape: Vec<_> = node_output_rows(&production_plan)
+        .into_iter()
+        .map(|node| node.name)
+        .collect();
+    assert_eq!(actual_production_shape, expected_production_shape);
+
+    let control_ctx = clipped_context_with_group_order(LIMIT, 2, None, true);
+    ice.register_with_datafusion(&control_ctx).await.unwrap();
+    let control_production_plan = control_ctx
+        .sql(&sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    let (control_plan, replacements) = restore_clipped_scan_repartition(control_production_plan);
+    assert_eq!(replacements, 1, "the control must restore one repartition");
+    let expected_control_shape = [
         "ClippedLimitCoalesceExec",
         "FilterExec",
         "RepartitionExec",
         "SiglakeIcebergTableScan",
     ];
-    let actual_shape: Vec<_> = node_output_rows(&plan)
+    let actual_control_shape: Vec<_> = node_output_rows(&control_plan)
         .into_iter()
         .map(|node| node.name)
         .collect();
-    assert_eq!(actual_shape, expected_shape);
+    assert_eq!(actual_control_shape, expected_control_shape);
 
-    let run = run_planned_arm(&ctx, plan.clone(), Duration::ZERO, "raw").await;
-    assert_eq!(run.rows.len(), LIMIT);
-    assert_all_qualify(&run.rows, &sql);
-
-    let rows = node_output_rows(&plan);
-    eprintln!("CLIPPED-LIMIT-OUTPUT-ROWS {rows:?} work={:?}", run.work);
-    assert_eq!(
-        rows[0].total(),
-        LIMIT,
-        "the final limit must emit its fetch"
-    );
-    assert!(
-        rows[1]
-            .partitions
-            .iter()
-            .all(|(_, output_rows)| *output_rows <= LIMIT),
-        "FilterExec's per-partition fetch must be respected: {:?}",
-        rows[1]
-    );
-    let contributing_filters: BTreeSet<_> = rows[1]
-        .partitions
-        .iter()
-        .filter_map(|(partition, output_rows)| (*output_rows > 0).then_some(*partition))
-        .collect();
-    let contributing_repartitions: BTreeSet<_> = rows[2]
-        .partitions
-        .iter()
-        .filter_map(|(partition, output_rows)| (*output_rows > 0).then_some(*partition))
-        .collect();
-    assert!(!contributing_filters.is_empty());
-    assert_eq!(contributing_filters, contributing_repartitions);
-    for partition in &contributing_filters {
+    let control = run_planned_arm(&control_ctx, control_plan.clone(), Duration::ZERO, "raw").await;
+    let production = run_planned_arm(
+        &production_ctx,
+        production_plan.clone(),
+        Duration::ZERO,
+        "raw",
+    )
+    .await;
+    for (name, run) in [("control", &control), ("production", &production)] {
+        assert_eq!(run.rows.len(), LIMIT, "{name} must fill the limit");
+        assert_all_qualify(&run.rows, &sql);
         assert_eq!(
-            rows[1]
-                .partitions
-                .iter()
-                .find(|(candidate, _)| candidate == partition)
-                .map(|(_, output_rows)| *output_rows),
-            Some(LIMIT),
-            "each contributing filter emits its fetch"
-        );
-        assert_eq!(
-            rows[1]
-                .evaluated_rows
-                .iter()
-                .find(|(candidate, _)| candidate == partition)
-                .map(|(_, input_rows)| *input_rows),
-            Some(8_192),
-            "the filter evaluates one coalesced repartition batch"
-        );
-        assert_eq!(
-            rows[2]
-                .partitions
-                .iter()
-                .find(|(candidate, _)| candidate == partition)
-                .map(|(_, output_rows)| *output_rows),
-            Some(8_192),
-            "the repartition emits one coalesced batch"
+            run.rows.iter().collect::<HashSet<_>>().len(),
+            LIMIT,
+            "{name} must return distinct source rows"
         );
     }
 
-    let contributors = contributing_filters.len();
-    let non_leaf_rows = rows[0].total() + rows[1].total() + rows[2].total();
-    assert_eq!(non_leaf_rows, LIMIT + contributors * (8_192 + LIMIT));
+    let production_rows = node_output_rows(&production_plan);
+    let control_rows = node_output_rows(&control_plan);
+    eprintln!(
+        "CLIPPED-FILTER-BEFORE-REPARTITION production={production_rows:?} work={:?} \
+         control={control_rows:?} work={:?}",
+        production.work, control.work
+    );
+    assert_eq!(production_rows[0].total(), LIMIT);
+    assert_eq!(control_rows[0].total(), LIMIT);
+    let production_leaf_rows = production_rows[2].total();
+    let control_leaf_rows = control_rows[3].total();
     assert!(
-        rows[3].total() >= rows[2].total(),
-        "the settled scan cannot emit fewer rows than repartition reports downstream"
+        production_leaf_rows <= 16 * 1_024,
+        "filtering reader batches must fill before 16 source batches: {production_leaf_rows}"
+    );
+    assert!(
+        control_leaf_rows >= 16 * 8_192,
+        "the restored repartition must reproduce its sixteen-channel fill: {control_leaf_rows}"
+    );
+    assert!(
+        production.work.decoded_bytes < control.work.decoded_bytes,
+        "filtering before receiver coalescing must reduce decoded bytes: production={:?} \
+         control={:?}",
+        production.work,
+        control.work
     );
 }
 
@@ -1827,24 +1875,16 @@ async fn the_default_policy_answers_every_planned_width_exactly() {
     }
 }
 
-/// What a two-to-four-partition clipped plan actually looks like, and why the
-/// fill is a scheduling change rather than a read-amount change.
+/// A two-to-four-partition clipped plan filters the scan's reader-sized batches
+/// before the bounded coalescer.
 ///
-/// A scan that planned fewer partitions than `target_partitions` gets a
-/// `RepartitionExec: RoundRobinBatch(16), input_partitions=4` between it and
-/// the residual filter, and that node drives EVERY input partition from its
-/// own tasks. So the ends come fast, the ramp earns its credits whatever the
-/// factor is, and both factors open all four files — which is what #7515
-/// measured (identical requested and decoded bytes, 12.037 ms apart). #7487's
-/// close still covers these partitions, but how many of them reach a reader
-/// before the fetch fills is a race with those repartition tasks, so this
-/// asserts the shape and the answer and leaves the counts to #7515's by-hand
-/// comparison. The close's deterministic coverage is
-/// `a_filled_clipped_limit_starts_no_further_reader` at full width and
-/// `a_closed_ramp_pays_no_terminal_credit_and_starts_no_reader` in
-/// `query_provider.rs`.
+/// DataFusion would otherwise insert `RoundRobinBatch(16)` between this scan
+/// and its residual filter. #7658 removes that node only under the clipped
+/// coalescer, keeping the reader's 1,024-row batch boundary visible to the
+/// filter. The partition-sensitive ramp still fills all four readers on its
+/// first earned credit when the first reader cannot satisfy the limit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_small_clipped_scan_repartitions_above_the_ramp() {
+async fn a_small_clipped_scan_filters_before_the_bounded_coalescer() {
     let _fixture_guard = FIXTURE_SERIAL.lock().await;
 
     const LIMIT: usize = 100;
@@ -1870,8 +1910,8 @@ async fn a_small_clipped_scan_repartitions_above_the_ramp() {
         .map(|node| node.name.clone())
         .collect();
     assert!(
-        shape.iter().any(|name| name == "RepartitionExec"),
-        "a sub-target-partition clipped scan is driven through a repartition: {shape:?}"
+        !shape.iter().any(|name| name == "RepartitionExec"),
+        "a clipped residual filter must see reader batches directly: {shape:?}"
     );
     assert_eq!(
         shape.first().map(String::as_str),
