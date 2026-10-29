@@ -304,11 +304,13 @@ async fn audit_maintenance_preserves_exact_rows_aggregates_and_snapshot_bound() 
 
 /// #7759: the maintained v0.3.0 burn's first audit marker count arrived while
 /// a long audit maintenance pass was still running. Build the same shape in
-/// miniature (one audit data file per commit), hold reclustering in its catalog
-/// commit window, and execute the exact filtered count both during that overlap
-/// and after the rewrite. This fails on the released source because its
-/// all-table recluster never reaches query_audit; it also distinguishes a
-/// catalog/maintenance lock from the released table's unbounded manifest walk.
+/// miniature (one audit data file per commit), hold the recluster's first
+/// catalog update before TestCatalog delegates to the inner catalog, and
+/// execute the exact filtered count both at that rendezvous and after the
+/// rewrite. This excludes only a lock taken at or before that held update in
+/// this process. The released source is expected to time out waiting for the
+/// rendezvous because its all-table recluster never reaches query_audit; that
+/// failing-before behavior is source-derived, not an executed f958 replay.
 #[tokio::test]
 async fn aged_audit_marker_count_finishes_during_and_after_maintenance() {
     let tmp = tempfile::tempdir().unwrap();
@@ -362,7 +364,7 @@ async fn aged_audit_marker_count_finishes_during_and_after_maintenance() {
 
     let during = tokio::time::timeout(Duration::from_secs(10), audit_query_count(&ice, marker))
         .await
-        .expect("audit marker count blocked behind maintenance");
+        .expect("audit marker count did not finish at the pre-inner-update rendezvous");
     assert_eq!(during, 1, "the exact marker has one fixture row");
 
     release_commit.notify_one();
