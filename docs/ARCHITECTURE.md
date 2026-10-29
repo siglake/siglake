@@ -1675,6 +1675,38 @@ side-object aggregates and per-file footers — `rows_scanned: 0`, typically
 single-digit milliseconds warm — with core-plus-boundary decomposition for
 arbitrary windows and strict validity guards before any fast path is trusted.
 
+**A predicate count does not fold a cold aggregate.** The dimensional-count
+fast path serves `WHERE col = 'v'` / `IN (…)` and `!= 'v'` / `NOT IN (…)` from
+the same per-value counts. A positive equality or `IN` count now takes a
+request-path twin of that lookup with identical tiers in identical order —
+snapshot result cache, inline side object, a wide aggregate already folded for
+this generation, then the per-file footer sum — differing only in that a wide
+aggregate still COLD for the generation is left alone rather than folded on the
+request's clock. The request continues to the footer tier instead of first
+listing `siglake-agg-deltas/` and GETting every object in it. A negation cannot
+be bloom-pruned and a range predicate full-scans, so neither can afford to lose
+Tier-1 and both keep folding. Maintenance, the census, the rebuild and every
+`GROUP BY` are unchanged.
+
+Nothing here is a size judgement, and no history test decides it. How many
+objects that listing returns is knowable only by performing it, and the pinned
+entry's sequence number does not bound it: a qualified rewrite pins an older
+generation while later commits keep writing delta keys into the same
+incarnation prefix, and rebuild and short-repair markers are separate objects
+in the same listing.
+
+What this bounds and what it does not. The request still reads the inline side
+object, and still decodes a wide aggregate that is already warm. The footer
+tier it continues to reads one footer per live file of the pinned generation
+and can fall back to decoding raw pages for a column no footer covers — the
+same work the generic lookup does after a fold refuses, over the same file list
+the query would otherwise scan. It is not free, and the request is not I/O-free.
+
+The measured case: an aged `query_audit` table reported 43,042 outstanding
+delta names scheduled on a successful cold request, ahead of an 8-file footer
+fallback that produced the answer. Those requests took 17.7s and 21.97s
+against a 30s deadline.
+
 **Ordered early-stop (WS-3).** `ORDER BY timestamp … LIMIT n` — plain or
 windowed — early-stops without a blocking sort: the scan advertises the
 table's declared direction when partitions are single files or time-disjoint

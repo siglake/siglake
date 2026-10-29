@@ -620,3 +620,105 @@ owned bounded collector with a full sort. The latter covers string, integer and
 float ordering; ascending and descending count/key sorts; dense ties; NULL;
 forward and reverse input; LIMIT 1 through the full input; and a winner arriving
 last. The existing full decoder remains covered independently.
+
+## Taking the read-side fold off the request path (0.3.0, 2026-10-29, #7787)
+
+The fold is background work on the compactor's cadence, but a READER still has
+to catch up with whatever the compactor has not absorbed. The read path below
+Tier-1 lists `siglake-agg-deltas/` and GETs every object in it before it can
+decide anything. That is the design's intent for a caller with no alternative,
+and it is bounded by the fold cadence — until the cadence stops keeping up.
+
+### What the 2026-10-29 burn actually showed
+
+On the aged `query_audit` table, a successful cold equality `COUNT` recorded
+`siglake_group_count_deltas_folded` = 43,042 and took 17.7s and 21.97s against
+a 30s deadline. The same-process repeat recorded no fold and took ~11ms. The
+tier below that fold was 8 files, served by raw-page fallback, and it is what
+produced the answer: the aggregate did not cover the column.
+
+Four things that evidence does NOT say, and that nothing downstream should
+restate as if it did:
+
+- The histogram records the number of OUTSTANDING NAMES at the start of the
+  fold, before any GET. A sample of 43,042 proves the listing happened and
+  that many objects were scheduled. It does not prove 43,042 reads completed.
+- It does not account for an entire 30s deadline. The slow successful counts
+  and the SECOND timeout carry this observation; the first timeout does not —
+  its request recorded no fold histogram delta at all.
+- Process-wide counter deltas around a request are not a causal proof. This
+  is a source lead with retained evidence, not an attributed root cause.
+- Nothing in it establishes that a filtered scan would have been faster than
+  the tiers below the fold.
+
+### The policy
+
+`predicate_count_tier1` / `qualified_predicate_count_tier1` are the
+request-path twins of `grouped_counts_with_summary` /
+`qualified_grouped_counts_with_summary`, under `ColdWideFold::Forbidden`.
+Identical tiers in identical order — snapshot-keyed result cache, inline side
+object, a wide aggregate already memoized for this entry generation, then the
+per-file footer sum — with one difference: a wide aggregate not yet folded for
+this generation is left alone, and the lookup continues to the footer tier
+rather than folding it first. `None` still means only "this column has no
+aggregation path at all", which is when the planner takes the query, unchanged
+for every polarity.
+
+The query server routes only the POSITIVE `=` / `IN` polarity to it. Negation
+and integer ranges keep the folding lookup: neither is bloom-prunable, so
+losing Tier-1 on them is the 1TB timeout the fast path exists to fix.
+Maintenance, the census, the rebuild and every `GROUP BY` are untouched.
+
+### Why there is no size test
+
+Two earlier revisions tried to decide this by how expensive the fold looked.
+Both were wrong, in instructive ways.
+
+The first sent every Tier-1 miss to the planner's scan. Gate 3409 failed
+`promoted_prune::equality_count_on_attribute_serves_from_footers` and
+`typed_promotion::typed_auto_promotion_end_to_end`: both returned correct
+counts while scanning 30 and 300 rows that had been served from footers. A
+Tier-1 miss is mostly not a deferred fold — it is a promoted column the
+aggregate never covered, or a decoded aggregate found short.
+
+The second deferred when the current snapshot's sequence number exceeded a
+bound, on the reasoning that one delta object is written per commit. That is
+not an upper bound on the listing:
+
+- A qualified rewrite pins an OLD generation. Its sequence number is small,
+  while the aggregate prefix it shares with the live table keeps accumulating
+  delta keys from every later commit. The pinned entry would choose "small",
+  then fold every later key and discard the result at the coverage check. The
+  table UUID isolates other incarnations, not later snapshots of this one.
+- Rebuild markers and short-repair attempt markers are separate objects in the
+  same listing, and their count does not track commits. (Delta publication
+  follows a successful commit and a retry reuses the same per-sequence key, so
+  failed attempts are not an extra source of keys.)
+
+So the decision is structural and takes no measurement: the request never
+folds, whatever the table looks like.
+
+### What is bounded, and what is not
+
+The request still reads the inline side object — one GET, memoized per
+generation — and still decodes a warm wide memo. The footer tier it continues
+to reads one footer per live file of the pinned generation, with a raw-page
+decode for a column no footer covers. That is the same work the generic lookup
+performs after a fold refuses, over the same file list the query would
+otherwise scan, but it is real work. The request is not I/O-free, the path is
+not "all bounded", and on a table with many live files the fold this declines
+may have been the cheaper of the two. That comparison is unmeasured.
+
+The no-fold claims are tested against `delta_io_probe`, a `#[cfg(test)]` trap
+on `list_group_count_objects`, `read_group_count_delta` and
+`load_wide_group_counts`, keyed by operator root so a fixture counts only its
+own prefix and work detached onto another task is still counted. The entry's
+memo slot is not an oracle for an absence: a listing that refused early would
+leave it untouched too. `a_pinned_old_generation_never_folds_the_shared_prefix`
+is the regression for the case above — an unwarmed old generation, later
+commits and planted keys in the shared prefix, zero probe activity, and the
+pinned generation's own exact answer.
+
+This is source work. It has not been run against the aged table, and no claim
+is made here that the observed cold failures are fixed; that needs an exact
+image and a retained-state run.

@@ -1796,6 +1796,38 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   event-time twin was excluded from inferred dimensions may still report that
   column as short until the inline aggregate is rebuilt; the read guard refuses
   the short column, so exact SQL answers continue through the per-file path.
+- **An equality / `IN` count is served below a cold wide aggregate, not by
+  folding it.** For a positive `WHERE col = 'v'` or `col IN (…)` count, the
+  dimensional-count fast path takes a lookup that will not fold a wide
+  group-count aggregate that is still COLD for the table generation
+  (`crates/siglake-storage/src/iceberg.rs`, `predicate_count_tier1`). Every
+  tier is otherwise the same and in the same order, so the answer is exact and
+  still costs no data-file scan; what changes is that the per-file footer sum
+  answers where Tier-1 would have after a fold.
+
+  Three consequences. A table whose wide aggregate WOULD have covered the
+  column now pays the footer tier once per generation per column instead of one
+  fold — one footer read per live file, or a raw-page decode for a column no
+  footer covers — and which of those two is cheaper has NOT been measured; on a
+  table with many live files the fold may well have been the cheaper of the two.
+  The deferral is per generation, so under live ingest every commit returns the
+  shape to the footer tier until some other query folds that generation. And
+  because only the positive polarity takes this lookup, a `!=` on the same
+  column may be answered from a folded aggregate while a `=` beside it is
+  answered from footers.
+
+  No size test gates this, deliberately. The number of objects in the aggregate
+  prefix is knowable only from the listing being declined, and the pinned
+  entry's sequence number does not bound it: a qualified rewrite pins an older
+  generation while later commits keep writing delta keys into the same
+  incarnation prefix, and rebuild and short-repair markers are separate objects
+  in the same listing.
+
+  The lookup is not I/O-free and nothing here should be read as saying so. It
+  still reads and caches the inline side object, still decodes a warm wide
+  memo, and the footer tier below it is real work. Only the COLD wide listing
+  and its object reads are declined.
+
 - **The short-aggregate census reports more than it repairs.** Every 15 minutes
   the maintenance pass finds a maintained column short of `total-records` with
   every commit's contribution accounted for and fires

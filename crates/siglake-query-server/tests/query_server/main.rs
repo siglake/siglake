@@ -1,6 +1,7 @@
 mod audit;
 mod auto_promotion_bounds;
 mod batch;
+mod bounded_equality_count;
 mod coordinator;
 mod cost;
 mod debug_memory_pool;
