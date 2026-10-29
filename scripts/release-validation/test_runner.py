@@ -5,7 +5,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 from types import SimpleNamespace
 
 spec = importlib.util.spec_from_file_location('validation', Path(__file__).with_name('run.py'))
@@ -179,6 +179,83 @@ class IsolationTests(unittest.TestCase):
             sleep.assert_called_once_with(2)
             event = (run.out/'events.jsonl').read_text()
             self.assertIn('"check": "query_audit_checkpoint"', event)
+
+    def test_24h_audit_checkpoint_uses_the_final_oracle_with_a_distinct_marker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(
+                out=str(Path(temp)/'run'),
+                version='v0.3.0',
+                profile='72h',
+                dependency_policy='public',
+            )
+            run = v.Run(args)
+            with patch.object(
+                run,
+                'sql',
+                return_value=[{'audit_probe': 1}],
+            ) as sql, patch.object(run, 'await_audit_checkpoint') as checkpoint:
+                marker = run.run_audit_checkpoint('24h', '24h')
+            self.assertEqual(
+                marker,
+                v.audit_marker_query(run.project, '24h'),
+            )
+            self.assertNotEqual(marker, v.audit_marker_query(run.project))
+            sql.assert_called_once_with(marker)
+            checkpoint.assert_called_once_with(marker, '24h')
+
+    def test_execute_wires_distinct_24h_and_unchanged_final_audit_markers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(
+                out=str(Path(temp)/'run'),
+                version='v0.3.0',
+                profile='72h',
+                dependency_policy='public',
+            )
+            run = v.Run(args)
+            run.ingest = 'http://127.0.0.1:40001'
+            run.query = 'http://127.0.0.1:40002'
+            with patch.object(run, 'prepare'), \
+                 patch.object(run, 'refused'), \
+                 patch.object(run, 'event'), \
+                 patch.object(run, 'save'), \
+                 patch.object(run, 'ingest_and_check'), \
+                 patch.object(run, 'resources'), \
+                 patch.object(run, 'batch'), \
+                 patch.object(run, 'restart'), \
+                 patch.object(
+                     run,
+                     'sql',
+                     return_value=[{'audit_probe': 1}],
+                 ) as sql, \
+                 patch.object(run, 'await_audit_checkpoint') as checkpoint, \
+                 patch.object(
+                     v.time,
+                     'monotonic',
+                     side_effect=[0, 0, 86400, 259200, 259200],
+                 ), \
+                 patch.object(v.time, 'sleep'):
+                run.execute()
+
+            marker_24h = v.audit_marker_query(run.project, '24h')
+            marker_final = v.audit_marker_query(run.project)
+            self.assertNotEqual(marker_24h, marker_final)
+            self.assertEqual(
+                marker_final,
+                'SELECT 1 AS audit_probe /* release-validation-audit-'
+                + run.project + ' */',
+            )
+            self.assertEqual(
+                checkpoint.call_args_list,
+                [
+                    call(marker_24h, '24h'),
+                    call(marker_final, 'before_restart'),
+                    call(marker_final, 'after_query_server_restart'),
+                ],
+            )
+            self.assertEqual(
+                sql.call_args_list,
+                [call(marker_24h), call(marker_final)],
+            )
 
     def test_audit_checkpoint_does_not_retry_product_http_errors(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -149,6 +149,14 @@ def audit_checkpoint_problem(probe_rows, aggregate_response):
     return None
 
 
+def audit_marker_query(project, checkpoint=None):
+    suffix = '' if checkpoint is None else '-' + checkpoint
+    return (
+        'SELECT 1 AS audit_probe /* release-validation-audit-'
+        + project + suffix + ' */'
+    )
+
+
 def http(url, data=None, token=TOKEN, timeout=30):
     headers = {'Content-Type': 'application/json'}
     if token:
@@ -381,6 +389,12 @@ class Run:
                 raise AssertionError(f'{phase} query_audit checkpoint failed: {last_problem}')
             time.sleep(2)
 
+    def run_audit_checkpoint(self, phase, marker_label=None):
+        marker_query = audit_marker_query(self.project, marker_label)
+        assert self.sql(marker_query) == [{'audit_probe': 1}]
+        self.await_audit_checkpoint(marker_query, phase)
+        return marker_query
+
     def refused(self, url, body, code):
         try:
             http(url, body, token=None)
@@ -525,16 +539,14 @@ class Run:
                 self.restart('compactor')
                 last_restart = now
             if not checkpoint and now - self.start >= 86400:
+                if self.args.version in QUERY_AUDIT_AGGREGATE_VERSIONS:
+                    self.run_audit_checkpoint('24h', '24h')
                 self.event('24h_checkpoint', result='pass', elapsed_seconds=now-self.start, cleanup='pending')
                 checkpoint = True
             time.sleep(10)
         audit_marker_query = None
         if self.args.version in QUERY_AUDIT_AGGREGATE_VERSIONS:
-            audit_marker_query = (
-                'SELECT 1 AS audit_probe /* release-validation-audit-' + self.project + ' */'
-            )
-            assert self.sql(audit_marker_query) == [{'audit_probe': 1}]
-            self.await_audit_checkpoint(audit_marker_query, 'before_restart')
+            audit_marker_query = self.run_audit_checkpoint('before_restart')
         for service in ('query-server', 'ingester', 'compactor'):
             self.restart(service)
             if service == 'query-server' and audit_marker_query is not None:
