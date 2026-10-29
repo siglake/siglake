@@ -8014,18 +8014,40 @@ async fn try_negation_count_fast_path_records_with_bindings(
     let Some(fp) = detect_negation_count_fast_path(df.logical_plan()) else {
         return Ok(None);
     };
-    // #7787. A POSITIVE equality/IN count is the one polarity here that has an
+    // The lookup every polarity has always used: Tier-1, then the per-file
+    // footer sum, then raw pages. `None` means the column has no aggregation
+    // path at all and the planner takes the query.
+    let generic = async || {
+        match bindings.get(&fp.table_name) {
+            Some(qualified) => {
+                ice.qualified_grouped_counts_with_summary(qualified, &fp.column, shard)
+                    .await
+            }
+            None => {
+                ice.grouped_counts_with_summary(&fp.table_name, &fp.column, shard, None)
+                    .await
+            }
+        }
+        .map_err(ApiError::internal)
+    };
+
+    // #7787. A POSITIVE equality/IN count is the one polarity here with an
     // exact alternative: the planner's filtered scan, which bloom-prunes to the
-    // files holding the value. The generic lookup has none, so on a Tier-1 miss
-    // it lists the delta directory, GETs every outstanding delta and folds the
-    // whole column at Tier-2 — 43,042 deltas ahead of an 8-file fallback on the
-    // aged `query_audit` table, and a 30s timeout for an answer of 1. So the
-    // positive set predicate asks only for an aggregate already paid for, and
-    // hands the shape back to the planner otherwise.
+    // files holding the value. That alternative buys exactly one thing — the
+    // right to decline a COLD wide fold on a table whose commit history makes
+    // it large. On the aged `query_audit` table 43,042 outstanding delta names
+    // were enumerated ahead of an 8-file Tier-2 fallback, and equality counts
+    // there ran 17.7s and 21.97s or hit the 30s deadline.
+    //
+    // It buys nothing else. An ordinary Tier-1 miss — no aggregate, stale
+    // coverage, a short or sketched column, a cold fold that is small — keeps
+    // the original lookup and the tier that already served it. Sending those
+    // to a scan too is what broke the promoted-column and typed-promotion
+    // zero-scan contracts on gate 3409.
     //
     // A negation can't be bloom-pruned (absence is unprovable) and a range
     // predicate full-scans: handing either back is the 1TB timeout this fast
-    // path was written to fix. Both keep the original lookup.
+    // path was written to fix. Both keep the original lookup outright.
     let rows = if matches!(fp.predicate, DimCountPredicate::Set { negated: false, .. }) {
         let bounded = match bindings.get(&fp.table_name) {
             Some(qualified) => {
@@ -8036,46 +8058,27 @@ async fn try_negation_count_fast_path_records_with_bindings(
         }
         .map_err(ApiError::internal)?;
         match bounded {
-            siglake_storage::iceberg::Tier1GroupCountsFold::Hit { rows, .. } => rows,
-            // A refusal is NOT a zero and NOT a reason to continue below
-            // Tier-1. Returning `None` from the whole fast path is what routes
-            // it to the exact filtered scan; returning `None` out of the
-            // generic lookup instead would have entered Tier-2's whole-column
-            // work, which is the cost being refused.
-            outcome @ (siglake_storage::iceberg::Tier1GroupCountsFold::NotInspected
-            | siglake_storage::iceberg::Tier1GroupCountsFold::Refused(_)) => {
+            siglake_storage::iceberg::PredicateCountTier1::Hit(rows) => Some(rows),
+            siglake_storage::iceberg::PredicateCountTier1::Miss => generic().await?,
+            // A deferral is NOT a zero, and NOT a reason to continue below
+            // Tier-1: the tiers below it are reached through the same lookup
+            // that would have folded. Returning `None` from the whole fast
+            // path is what routes the query to the exact filtered scan.
+            siglake_storage::iceberg::PredicateCountTier1::DeferredColdWideFold { commits } => {
                 tracing::debug!(
                     table = %fp.table_name,
                     column = %fp.column,
-                    refusal = if matches!(
-                        outcome,
-                        siglake_storage::iceberg::Tier1GroupCountsFold::Refused(_)
-                    ) {
-                        "refused"
-                    } else {
-                        "not_inspected"
-                    },
-                    "equality count declined the group-count aggregate; exact filtered scan"
+                    commits,
+                    "equality count deferred a cold wide group-count fold; exact filtered scan"
                 );
                 return Ok(None);
             }
         }
     } else {
-        let rows = match bindings.get(&fp.table_name) {
-            Some(qualified) => {
-                ice.qualified_grouped_counts_with_summary(qualified, &fp.column, shard)
-                    .await
-            }
-            None => {
-                ice.grouped_counts_with_summary(&fp.table_name, &fp.column, shard, None)
-                    .await
-            }
-        }
-        .map_err(ApiError::internal)?;
-        let Some(rows) = rows else {
-            return Ok(None);
-        };
-        rows
+        generic().await?
+    };
+    let Some(rows) = rows else {
+        return Ok(None);
     };
     // Negation: rows whose (non-NULL) value is NOT in the set. Equality/IN:
     // rows whose value IS in the set. Ranges: keys parsing into the bounds.
@@ -22620,28 +22623,20 @@ mod terminal_report_tests {
 
 #[cfg(test)]
 mod bounded_equality_count_tests {
-    //! #7787 — `SELECT count(*) WHERE col = 'v'` must not wait on a cold wide
-    //! group-count fold.
-    //!
-    //! The aged `query_audit` table had 43,042 outstanding delta objects. The
-    //! generic lookup lists and GETs all of them before it can decide
-    //! anything, so an equality count whose answer is 1 spent its 30s deadline
-    //! in metadata. The planner answers the same shape exactly from a
-    //! bloom-pruned filtered scan, so the fast path hands it back instead of
-    //! paying. A negation or a range has no such alternative and keeps the
-    //! original lookup — that half is the 1TB timeout this fast path exists to
-    //! fix, and it is pinned here too.
+    //! #7787 at the fast path's own boundary. The end-to-end contract — one
+    //! request, the filtered-scan fallback, buffered rows, a generation moving
+    //! underneath — is in
+    //! `tests/query_server/bounded_equality_count.rs`, which asserts on the
+    //! response a client receives. These pin the routing decision itself,
+    //! which that test can only observe indirectly.
 
     use super::*;
     use siglake_core::Event;
 
-    /// Distinct hosts above the inline per-commit cap of 4096, so `host` can
-    /// only be served by the wide aggregate and a cold lookup must refuse.
-    const HOSTS: usize = 4_100;
     const TARGET: &str = "host-00007";
 
-    fn events() -> Vec<Event> {
-        (0..HOSTS)
+    fn host_events(range: std::ops::Range<usize>) -> Vec<Event> {
+        range
             .map(|i| {
                 let mut event = Event::now(format!("event-{i}"));
                 event.host = format!("host-{i:05}");
@@ -22650,8 +22645,19 @@ mod bounded_equality_count_tests {
             .collect()
     }
 
+    fn tuning(defer_above: Option<i64>) -> siglake_storage::iceberg::IcebergTuning {
+        siglake_storage::iceberg::IcebergTuning {
+            table_group_count_cardinality: Some(10_000),
+            result_caches: Some(false),
+            predicate_count_cold_fold_max_commits: defer_above,
+            ..Default::default()
+        }
+    }
+
     async fn fixture(
         tmp: &tempfile::TempDir,
+        defer_above: Option<i64>,
+        hosts: std::ops::Range<usize>,
     ) -> (
         Arc<siglake_storage::iceberg::IcebergContext>,
         SessionContext,
@@ -22659,12 +22665,13 @@ mod bounded_equality_count_tests {
         let ice = siglake_storage::iceberg::IcebergContext::open(&tmp.path().join("warehouse"))
             .await
             .unwrap()
-            .with_tuning(siglake_storage::iceberg::IcebergTuning {
-                table_group_count_cardinality: Some(10_000),
-                result_caches: Some(false),
-                ..Default::default()
-            });
-        ice.append_events(&events()).await.unwrap();
+            .with_tuning(tuning(defer_above));
+        let events = host_events(hosts);
+        let (first, second) = events.split_at(events.len().saturating_sub(100));
+        ice.append_events(first).await.unwrap();
+        if !second.is_empty() {
+            ice.append_events(second).await.unwrap();
+        }
         let ctx = SessionContext::new();
         let ice = Arc::new(ice);
         crate::sql::register_all_tables(&ice, &ctx).await.unwrap();
@@ -22693,108 +22700,34 @@ mod bounded_equality_count_tests {
         body.rows.as_array().unwrap()[0]["n"].as_i64().unwrap()
     }
 
-    /// What the planner returns when the fast path declines — the exact
-    /// filtered scan the refusal exists to reach.
-    async fn planned_count(ctx: &SessionContext, query: &str) -> i64 {
-        let batches = ctx.sql(query).await.unwrap().collect().await.unwrap();
-        let records = crate::format::batches_to_records(&batches, None).unwrap();
-        records.rows.as_array().unwrap()[0]["n"].as_i64().unwrap()
-    }
-
+    /// The deferral is confined to the positive set polarity.
     #[tokio::test]
-    async fn cold_equality_count_declines_and_the_planner_answers_it_exactly() {
+    async fn only_a_positive_equality_or_in_count_defers() {
         let tmp = tempfile::tempdir().unwrap();
-        let (ice, ctx) = fixture(&tmp).await;
-        let query = format!("SELECT count(*) AS n FROM events WHERE host = '{TARGET}'");
+        let (ice, ctx) = fixture(&tmp, Some(1), 0..4_100).await;
 
-        // Twice in the same process: the refusal must be stable, and must not
-        // have cached a miss that a later request reads back as an answer.
-        for attempt in 1..=2 {
+        for query in [
+            format!("SELECT count(*) AS n FROM events WHERE host = '{TARGET}'"),
+            format!("SELECT count(*) AS n FROM events WHERE host IN ('{TARGET}', 'host-00008')"),
+        ] {
             assert!(
                 fast_path(&ice, &ctx, &query).await.is_none(),
-                "attempt {attempt}: a cold wide aggregate must be handed back to the planner"
+                "an aged cold aggregate must hand this back to the planner: {query}"
             );
         }
-        assert_eq!(
-            planned_count(&ctx, &query).await,
-            1,
-            "the fallback is an exact filtered scan, not an approximation"
-        );
 
-        // An IN list is the same polarity and takes the same route.
-        let in_list =
-            format!("SELECT count(*) AS n FROM events WHERE host IN ('{TARGET}', 'host-00008')");
-        assert!(fast_path(&ice, &ctx, &in_list).await.is_none());
-        assert_eq!(planned_count(&ctx, &in_list).await, 2);
-
-        // Once some other caller has folded this generation, the fast path
-        // serves the same shape again from the memoized aggregate.
-        ice.tier1_group_counts("events", "host")
-            .await
-            .unwrap()
-            .expect("the wide aggregate covers `host` at this cap");
-        let body = fast_path(&ice, &ctx, &query)
-            .await
-            .expect("a warm wide aggregate must still serve an equality count");
-        assert_eq!(served_count(&body), 1);
-        assert_eq!(
-            body.stats.as_ref().unwrap().rows_scanned,
-            0,
-            "a warm hit is still a zero-scan answer"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_inline_covered_equality_count_is_served_cold_as_before() {
-        let tmp = tempfile::tempdir().unwrap();
-        let ice = siglake_storage::iceberg::IcebergContext::open(&tmp.path().join("warehouse"))
-            .await
-            .unwrap()
-            .with_tuning(siglake_storage::iceberg::IcebergTuning {
-                table_group_count_cardinality: Some(10_000),
-                result_caches: Some(false),
-                ..Default::default()
-            });
-        let events: Vec<Event> = (0..8)
-            .map(|i| {
-                let mut event = Event::now(format!("event-{i}"));
-                event.host = format!("host-{:05}", i % 4);
-                event
-            })
-            .collect();
-        ice.append_events(&events).await.unwrap();
-        let ctx = SessionContext::new();
-        let ice = Arc::new(ice);
-        crate::sql::register_all_tables(&ice, &ctx).await.unwrap();
-
-        let body = fast_path(
-            &ice,
-            &ctx,
-            "SELECT count(*) AS n FROM events WHERE host = 'host-00001'",
-        )
-        .await
-        .expect("the inline aggregate covers this column and is unaffected");
-        assert_eq!(served_count(&body), 2);
-    }
-
-    #[tokio::test]
-    async fn negation_and_not_in_counts_keep_the_unbounded_lookup() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (ice, ctx) = fixture(&tmp).await;
-
-        // These have no bloom-prunable alternative: absence is unprovable, so
-        // handing them back is the full scan the fast path was written to
-        // avoid. They must still fold whatever it takes to answer.
+        // A negation has no bloom-prunable alternative, so handing it back is
+        // the full scan this fast path exists to avoid. It pays the fold.
         for (query, expected) in [
             (
                 format!("SELECT count(*) AS n FROM events WHERE host != '{TARGET}'"),
-                (HOSTS - 1) as i64,
+                4_099,
             ),
             (
                 format!(
                     "SELECT count(*) AS n FROM events WHERE host NOT IN ('{TARGET}', 'host-00008')"
                 ),
-                (HOSTS - 2) as i64,
+                4_098,
             ),
         ] {
             let body = fast_path(&ice, &ctx, &query)
@@ -22802,5 +22735,40 @@ mod bounded_equality_count_tests {
                 .unwrap_or_else(|| panic!("negation lost its aggregate path: {query}"));
             assert_eq!(served_count(&body), expected, "{query}");
         }
+    }
+
+    /// An ORDINARY cold table — commit history well under the bound — keeps
+    /// the aggregate path it always had. This is the contract gate 3409 broke:
+    /// a Tier-1 miss is not a deferral.
+    #[tokio::test]
+    async fn an_ordinary_table_keeps_its_aggregate_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ice, ctx) = fixture(&tmp, None, 0..4_100).await;
+        let body = fast_path(
+            &ice,
+            &ctx,
+            &format!("SELECT count(*) AS n FROM events WHERE host = '{TARGET}'"),
+        )
+        .await
+        .expect("a short-history table must still be served from the aggregate");
+        assert_eq!(served_count(&body), 1);
+        assert_eq!(body.stats.as_ref().unwrap().rows_scanned, 0);
+    }
+
+    /// An inline-covered column answers before the policy is consulted at all,
+    /// however aged the table is.
+    #[tokio::test]
+    async fn an_inline_covered_equality_count_is_served_cold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ice, ctx) = fixture(&tmp, Some(1), 0..4).await;
+        let body = fast_path(
+            &ice,
+            &ctx,
+            "SELECT count(*) AS n FROM events WHERE host = 'host-00001'",
+        )
+        .await
+        .expect("the inline aggregate covers this column and is unaffected");
+        assert_eq!(served_count(&body), 1);
+        assert_eq!(body.stats.as_ref().unwrap().rows_scanned, 0);
     }
 }

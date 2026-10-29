@@ -621,52 +621,88 @@ float ordering; ascending and descending count/key sorts; dense ties; NULL;
 forward and reverse input; LIMIT 1 through the full input; and a winner arriving
 last. The existing full decoder remains covered independently.
 
-## The read side is bounded for predicate counts (0.3.0, 2026-10-29, #7787)
+## Deferring a large cold read-side fold (0.3.0, 2026-10-29, #7787)
 
 The fold is background work on the compactor's cadence, but a READER still has
-to catch up with whatever the compactor has not absorbed yet. `read_path`
-below Tier-1 lists `siglake-agg-deltas/` and GETs every outstanding delta
-before it can decide whether the column is even covered. That is the design's
-intent for a caller with no alternative, and it is bounded by the fold cadence
-— until the cadence stops keeping up. On the aged `query_audit` table of the
-2026-10-29 burn it did: 43,042 outstanding deltas, ahead of a Tier-2 fallback
-over 8 files. `SELECT count(*) … WHERE col = 'v'`, answer `1`, spent its whole
-30s deadline in metadata. Two 30s timeouts were followed by seven passes at
-17.7s and 21.97s against the same immutable snapshot, and the same-process
-repeat was 11ms — the signature of a cost paid once per process per
-generation, not of a slow table. (Note for anyone reading the counters: the
-`siglake_group_count_deltas_folded` histogram is recorded BEFORE the reads, so
-a sample is proof of a listing, not of completed GETs.)
+to catch up with whatever the compactor has not absorbed. The read path below
+Tier-1 lists `siglake-agg-deltas/` and GETs every outstanding delta before it
+can decide anything. That is the design's intent for a caller with no
+alternative, and it is bounded by the fold cadence — until the cadence stops
+keeping up.
 
-Raising the fold cadence does not fix the shape, because the reader's cost is
-unbounded in a quantity the reader does not control. Bounding the reader does.
-`predicate_count_tier1` / `qualified_predicate_count_tier1` are a
-request-only entry point under `ColdWideFold::Forbidden`:
+### What the 2026-10-29 burn actually showed
 
-- a warm snapshot-keyed result-cache entry, the inline side object, and a wide
-  aggregate already memoized for this table generation all still answer, with
-  the same `total == record_count` guard and the same NULL-group handling;
-- a cold wide aggregate returns `NotInspected` BEFORE the listing. Nothing is
-  listed, GET, folded, spawned, or memoized — in particular no miss is written
-  to the entry's memo, which would be a false negative for the generation's
-  life;
-- a decoded-but-short, sketched or otherwise unusable aggregate returns
-  `Refused`, which is a refusal and not a zero.
+On the aged `query_audit` table, a successful cold equality `COUNT` recorded
+`siglake_group_count_deltas_folded` = 43,042 and took 17.7s and 21.97s against
+a 30s deadline. The same-process repeat recorded no fold and took ~11ms.
+Tier-2 below that fold was 8 files. Seven checks in the sequence passed; two
+earlier ones hit the 30s deadline.
+
+Three things that evidence does NOT say, and that nothing downstream should
+restate as if it did:
+
+- The histogram records the number of OUTSTANDING NAMES at the start of the
+  fold, before any GET. A sample of 43,042 proves the listing happened and
+  that many objects were scheduled. It does not prove 43,042 reads completed.
+- It does not account for an entire 30s deadline. The slow successful counts
+  and the SECOND timeout carry this observation; the first timeout does not —
+  its request recorded no fold histogram delta at all.
+- Process-wide counter deltas around a request are not a causal proof. This
+  is a source lead with retained evidence, not an attributed root cause.
+
+### The policy
+
+`predicate_count_tier1` / `qualified_predicate_count_tier1` are a request-only
+entry point that returns one of three things:
+
+- `Hit` — from a warm snapshot-keyed result-cache entry, the inline side
+  object, or a wide aggregate already memoized for this entry generation. Same
+  `total == record_count` guard and the same NULL-group handling as always.
+- `Miss` — Tier-1 cannot answer, and establishing that cost nothing unbounded:
+  no `total-records`, no aggregate object, stale coverage, a decoded aggregate
+  that is short or sketched, or a cold fold on a table short enough that the
+  fold is a handful of objects. The caller continues exactly as before, which
+  is what keeps the per-file footer tier reachable.
+- `DeferredColdWideFold { commits }` — the only route left was a cold fold on
+  a table with `commits` commits behind it. Not paid. Not a zero, and not an
+  invitation to the tiers below Tier-1, which are reached through the same
+  lookup that would have folded.
+
+The deferral judges "large" from table metadata alone, because the exact
+outstanding count is only knowable from the listing it is deciding about. One
+delta object is written per commit, so the current snapshot's sequence number
+is a free upper bound on what the fold would enumerate; above
+`predicate_count_cold_fold_max_commits` (1024) the request declines. It
+over-defers on a table whose compactor is keeping up. Under-estimating is
+impossible, which is the direction that matters.
 
 Maintenance, the census, the rebuild and the generic
-`grouped_counts_with_summary` keep `ColdWideFold::Allowed` unchanged: they are
-the callers that have no second way to an exact answer.
+`grouped_counts_with_summary` keep `ColdWideFold::Allowed` unchanged.
 
-The query server routes only the POSITIVE `=` / `IN` polarity of the
-dimensional-count fast path through it, and on a refusal returns `None` from
-the whole fast path so the planner's filtered scan answers the query exactly.
-Returning `None` out of `grouped_counts_with_summary` instead would have
-entered Tier-2's whole-column footer sum, which is the cost being refused. A
-negation and an integer range keep the unbounded lookup: neither is
-bloom-prunable, so handing them back is the full scan this fast path exists to
-avoid. The cost accepted in exchange is in `LIMITATIONS.md` — a
-low-selectivity equality on a short-aggregate column now scans rather than
-summing footers.
+The query server routes only the POSITIVE `=` / `IN` polarity through it. On
+`Hit` it serves; on `Miss` it falls through to the original lookup; on a
+deferral it returns `None` from the whole fast path so the planner's filtered
+scan answers exactly. An earlier revision sent `Miss` to the scan as well and
+regressed two existing zero-scan contracts on gate 3409
+(`promoted_prune::equality_count_on_attribute_serves_from_footers`,
+`typed_promotion::typed_auto_promotion_end_to_end`): both returned correct
+counts while scanning 30 and 300 rows that had been served from footers.
+Negation and integer ranges keep the unbounded lookup: neither is
+bloom-prunable, so handing them back is the full scan the fast path exists to
+avoid.
+
+### What is bounded, and what is not
+
+Only the COLD wide listing and its object reads. The lookup still reads and
+caches the inline side object, and still decodes a warm wide memo. It is not
+I/O-free and the predicate-count path is not "all bounded".
+
+The no-I/O claims are tested against `delta_io_probe`, a `#[cfg(test)]` trap on
+`list_group_count_objects`, `read_group_count_delta` and
+`load_wide_group_counts`, keyed by operator root so a fixture counts only its
+own prefix. The entry's memo slot is not an oracle for an absence: a listing
+that refused early, or work detached onto another task, would leave it
+untouched too.
 
 This is source work. It has not been run against the aged table, and no claim
 is made here that the observed cold failures are fixed; that needs an exact

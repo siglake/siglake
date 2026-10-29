@@ -1796,24 +1796,37 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   event-time twin was excluded from inferred dimensions may still report that
   column as short until the inline aggregate is rebuilt; the read guard refuses
   the short column, so exact SQL answers continue through the per-file path.
-- **An equality / `IN` count never reaches Tier-2.** The dimensional-count fast
-  path refuses a COLD wide aggregate for a positive `WHERE col = 'v'` or
-  `col IN (…)` count rather than list the delta directory and fold every
-  outstanding delta, and the shape then goes to the planner's filtered scan
-  instead of to the Tier-2 per-file footer sum
+- **An equality / `IN` count on a long-lived table scans instead of folding a
+  cold aggregate.** For a positive `WHERE col = 'v'` or `col IN (…)` count,
+  the dimensional-count fast path declines a COLD wide group-count fold when
+  the table's current sequence number is above
+  `predicate_count_cold_fold_max_commits` (default 1024), and the query goes to
+  the planner's filtered scan
   (`crates/siglake-storage/src/iceberg.rs`, `predicate_count_tier1`). The
-  answer stays exact either way. What changes is the cost on the one shape
-  where Tier-2 would have been the cheaper of the two: a LOW-selectivity
-  equality on a column whose inline aggregate is short — a column above the
-  4096-entry inline cap, or an aggregate left stale by a retention or delete
-  commit — now scans the matching files instead of summing a footer per live
-  file at zero scan. Selectivity is not known before the scan, so there is no
-  gate on it; a high-cardinality column, where equality is selective and a cold
-  fold is most expensive, is the case this is tuned for. A negation
-  (`!=`, `NOT IN`) and an integer range keep the unbounded lookup, because
-  neither has a bloom-prunable alternative. Warm aggregates are unaffected:
-  inline hits, already-folded wide aggregates and warm snapshot-keyed
-  result-cache entries all still serve at zero scan.
+  answer is exact either way; what changes is which tier pays.
+
+  Three limits follow from that shape. The bound is an UPPER bound on the
+  fold's size, not a measurement of it — a delta object is written per commit,
+  and the exact outstanding count is only knowable from the listing being
+  declined — so a long-lived table whose compactor is keeping up is deferred
+  although its fold would have been cheap. A LOW-selectivity equality on such
+  a table (a column above the 4096-entry inline cap, or an aggregate left
+  stale by a retention or delete commit) now scans the matching files where it
+  previously summed a footer per live file at zero scan; selectivity is not
+  known before the scan, so there is no gate on it. And the deferral is per
+  generation, so under live ingest every commit returns the shape to the scan
+  until something else folds that generation's aggregate.
+
+  What is NOT affected: a negation (`!=`, `NOT IN`) and an integer range keep
+  the unbounded lookup, having no bloom-prunable alternative; an inline hit, an
+  already-folded wide aggregate and a warm snapshot-keyed result-cache entry
+  all still serve at zero scan; and an ordinary Tier-1 miss on any table —
+  including a cold fold under the bound — continues to the per-file footer sum
+  exactly as before.
+
+  The lookup is not I/O-free, and nothing here should be read as saying so. It
+  still reads and caches the inline side object, and still decodes a warm wide
+  memo. Only the COLD wide listing and object reads are declined.
 - **The short-aggregate census reports more than it repairs.** Every 15 minutes
   the maintenance pass finds a maintained column short of `total-records` with
   every commit's contribution accounted for and fires

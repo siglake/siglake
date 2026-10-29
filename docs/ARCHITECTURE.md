@@ -1675,21 +1675,33 @@ side-object aggregates and per-file footers — `rows_scanned: 0`, typically
 single-digit milliseconds warm — with core-plus-boundary decomposition for
 arbitrary windows and strict validity guards before any fast path is trusted.
 
-**A predicate count never waits on a cold aggregate.** The dimensional-count
+**A predicate count defers a large cold aggregate fold.** The dimensional-count
 fast path serves `WHERE col = 'v'` / `IN (…)` and `!= 'v'` / `NOT IN (…)` from
-the same per-value counts, but the two polarities have different alternatives
-and are now bounded differently. A negation cannot be bloom-pruned — absence is
-unprovable — so it still folds whatever the aggregate costs. A positive
-equality or `IN` count can be answered exactly by the planner's filtered scan,
-which prunes to the files holding the value, so it asks only for an aggregate
-already paid for: a warm snapshot-keyed result-cache entry, the inline side
-object, or a wide aggregate some earlier caller already folded for this table
-generation. A cold wide aggregate is refused *before* the delta directory is
-listed, and the shape goes back to the planner. The refusal leaves no memoized
-miss and never answers zero. The cost it declines is not hypothetical: an aged
-`query_audit` table carried 43,042 outstanding delta objects ahead of an
-8-file Tier-2 fallback, and a `COUNT` whose answer was `1` spent its whole 30s
-deadline listing and reading them.
+the same per-value counts, but the two polarities have different alternatives.
+A negation cannot be bloom-pruned — absence is unprovable — so it folds
+whatever the aggregate costs. A positive equality or `IN` count can be answered
+exactly by the planner's filtered scan, which prunes to the files holding the
+value, and that buys it exactly one thing: the right to decline a COLD wide
+fold on a table whose commit history makes the fold large. The decline happens
+before the delta directory is listed, leaves no memoized miss, and never
+answers zero.
+
+Every other reason Tier-1 cannot answer — no aggregate, stale coverage, a
+short or sketched column, a cold fold on an ordinary table — is an ordinary
+miss, and the query continues to whichever tier served it before. Keeping
+those apart is what keeps the promoted-column and typed-promotion counts
+zero-scan.
+
+"Large" is judged from table metadata, not from the listing the judgement is
+about: a delta object is written per commit, so the current snapshot's
+sequence number bounds what a fold would enumerate, and the default defers
+above 1024 commits. It is an upper bound, so a table whose compactor is
+keeping up can be deferred unnecessarily; the cost of that is one filtered
+scan on a selective predicate.
+
+The measured case: an aged `query_audit` table reported 43,042 outstanding
+delta names on a successful cold request, ahead of an 8-file Tier-2 fallback.
+Those requests took 17.7s and 21.97s against a 30s deadline.
 
 **Ordered early-stop (WS-3).** `ORDER BY timestamp … LIMIT n` — plain or
 windowed — early-stops without a blocking sort: the scan advertises the
