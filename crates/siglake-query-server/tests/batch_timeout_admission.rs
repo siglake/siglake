@@ -167,7 +167,10 @@ async fn a_timed_out_batch_run_counts_one_breaker_and_releases_its_reservation()
             if metrics.reserved == Some(0.0) && metrics.breaker == 1 && metrics.jobs == 1 {
                 return metrics;
             }
-            tokio::task::yield_now().await;
+            // A bare yield may immediately repoll this snapshot loop on the
+            // single-thread test runtime. Suspend it so the spawned run can
+            // emit its terminal metrics and drop the reservation under load.
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
     .await
