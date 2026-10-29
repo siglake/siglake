@@ -110,9 +110,26 @@ impl ScalarUDFImpl for AttrGetUdf {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
-        // Materialize both args to arrays and dispatch row-by-row. The common
-        // shape is `attr_get(col, 'literal')`; even then the per-row work is a
-        // JSON parse, so there's no per-batch setup worth special-casing.
+        // Literal keys are constant for the batch. Borrow the Utf8 value once
+        // instead of allocating and repeating it in an Arrow key array.
+        if let ColumnarValue::Scalar(ScalarValue::Utf8(key)) = &args.args[1] {
+            let key = key.as_deref();
+            let n = args.number_rows;
+            let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
+            let mut builder = StringBuilder::with_capacity(n, n * 16);
+            for i in 0..n {
+                if attrs.is_null(i) || key.is_none() {
+                    builder.append_null();
+                    continue;
+                }
+                match json_attr_lookup(attrs.value(i), key.unwrap()) {
+                    Some(value) => builder.append_value(&value),
+                    None => builder.append_null(),
+                }
+            }
+            return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+        }
+        // Array and non-Utf8 scalar keys retain the existing validation path.
         let n = args.number_rows;
         let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
         let keys = arg_as_str_array(&args.args[1], n, "key")?;
@@ -922,27 +939,31 @@ mod tests {
         }
     }
 
-    /// Test-only candidate for the common literal-key call shape. Array and
-    /// non-Utf8 scalar keys deliberately go through the real UDF.
-    fn attr_scalar_key_candidate(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
-        let key = match &args.args[1] {
-            ColumnarValue::Scalar(ScalarValue::Utf8(key)) => key.as_deref(),
-            _ => return AttrGetUdf::new().invoke_with_args(args),
-        };
+    // Frozen pre-optimization production path for semantic and timing parity.
+    // Keep this independent: baseline timing must not call the optimized UDF.
+    fn attr_scalar_key_baseline(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        // Materialize both args to arrays and dispatch row-by-row. The common
+        // shape is `attr_get(col, 'literal')`; even then the per-row work is a
+        // JSON parse, so there's no per-batch setup worth special-casing.
         let n = args.number_rows;
         let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
+        let keys = arg_as_str_array(&args.args[1], n, "key")?;
         let mut builder = StringBuilder::with_capacity(n, n * 16);
         for i in 0..n {
-            if attrs.is_null(i) || key.is_none() {
+            if attrs.is_null(i) || keys.is_null(i) {
                 builder.append_null();
                 continue;
             }
-            match json_attr_lookup(attrs.value(i), key.unwrap()) {
-                Some(value) => builder.append_value(&value),
+            match json_attr_lookup(attrs.value(i), keys.value(i)) {
+                Some(v) => builder.append_value(&v),
                 None => builder.append_null(),
             }
         }
         Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+
+    fn attr_scalar_key_candidate(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        AttrGetUdf::new().invoke_with_args(args)
     }
 
     fn attr_scalar_key_values(value: ColumnarValue, n: usize) -> Vec<Option<String>> {
@@ -966,7 +987,7 @@ mod tests {
         if candidate {
             attr_scalar_key_candidate(args)
         } else {
-            AttrGetUdf::new().invoke_with_args(args)
+            attr_scalar_key_baseline(args)
         }
     }
 
@@ -1166,14 +1187,13 @@ mod tests {
                                 )
                             })
                             .collect();
-                        let udf = AttrGetUdf::new();
                         let start = std::time::Instant::now();
                         let (_, count) = allocations(|| {
                             for args in args {
                                 let out = if candidate {
                                     attr_scalar_key_candidate(args)
                                 } else {
-                                    udf.invoke_with_args(args)
+                                    attr_scalar_key_baseline(args)
                                 };
                                 std::hint::black_box(out.unwrap());
                             }
