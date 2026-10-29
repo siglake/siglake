@@ -1,21 +1,24 @@
 //! #7787 through the real request path: `POST /api/v1/sql`, one execution,
 //! router to response body.
 //!
-//! The aged `query_audit` table had 43,042 outstanding delta names enumerated
-//! ahead of an 8-file Tier-2 fallback; equality `COUNT`s there ran 17.7s and
-//! 21.97s or hit the 30s deadline. A positive `=` / `IN` count now declines a
-//! COLD wide fold on a table with that much commit history and lets the
-//! planner's filtered scan answer it instead.
+//! On the aged `query_audit` table a successful cold equality `COUNT`
+//! reported 43,042 outstanding delta names scheduled ahead of an 8-file
+//! footer fallback, and such counts ran 17.7s and 21.97s against a 30s
+//! deadline. A positive `=` / `IN` count now takes a lookup that will not
+//! fold a wide aggregate still COLD for the generation, and continues to the
+//! footer tier instead.
 //!
-//! Everything asserted here is asserted on the response a client receives —
-//! the count, and `stats.served_by`, which says WHICH route produced it. A
-//! test that calls the fast path and then runs the plan separately cannot
-//! tell a fallback that happened from one that was merely available, and
-//! cannot see the WAL buffer at all.
+//! What these tests can and cannot see. They assert the count and
+//! `stats.served_by` on the response a client receives, across cold and warm
+//! generations and with sealed-but-uncommitted WAL rows in play — none of
+//! which a test that calls the fast path and then runs the plan separately
+//! can observe. They do NOT prove the absence of the fold: the I/O trap is
+//! `#[cfg(test)]` inside the storage crate and is asserted there, in
+//! `iceberg::bounded_predicate_count_tests`.
 //!
 //! The sibling contracts live in `promoted_prune.rs` and `typed_promotion.rs`:
-//! an ordinary Tier-1 miss must still be served by the footers at zero scan.
-//! Gate 3409 failed both when this path sent every miss to a scan.
+//! a Tier-1 miss must still be served by the footers at zero scan. Gate 3409
+//! failed both when this path sent every miss to a scan.
 
 use std::sync::Arc;
 
@@ -76,15 +79,13 @@ fn host_events(range: std::ops::Range<usize>) -> Vec<Event> {
         .collect()
 }
 
-/// Two commits is "aged" here. The production bound is 1024 commits, and a
-/// test should not have to make 1025 appends to reach the behaviour.
 fn tuning() -> IcebergTuning {
     IcebergTuning {
         // Above the 4096-entry inline cap, so `host` is answerable only by the
-        // wide aggregate and a cold lookup has somewhere to defer from.
+        // wide aggregate or the footer tier, which is where a cold lookup must
+        // land without folding.
         table_group_count_cardinality: Some(10_000),
         result_caches: Some(false),
-        predicate_count_cold_fold_max_commits: Some(1),
         ..Default::default()
     }
 }
@@ -132,12 +133,13 @@ async fn fixture(tmp: &tempfile::TempDir, buffered: bool) -> Router {
 }
 
 #[tokio::test]
-async fn a_cold_equality_count_is_answered_exactly_by_the_filtered_scan() {
+async fn a_cold_equality_count_is_exact_and_still_costs_no_scan() {
     let tmp = tempfile::tempdir().unwrap();
     let app = fixture(&tmp, false).await;
 
-    // Twice in the same process. One request each: refusal, fallback and
-    // answer all inside the execution the client waited on.
+    // Twice in the same process. One request each: the declined fold, the
+    // tier that answers instead, and the count, all inside the execution the
+    // client waited on.
     for attempt in 1..=2 {
         let body = sql(
             &app,
@@ -147,8 +149,8 @@ async fn a_cold_equality_count_is_answered_exactly_by_the_filtered_scan() {
         assert_eq!(count(&body), 1, "attempt {attempt}: {body}");
         assert_eq!(
             served_by(&body),
-            "scan",
-            "attempt {attempt}: the deferral must reach the filtered scan, not a metadata tier: {body}"
+            "metadata",
+            "attempt {attempt}: declining the fold must not cost a scan: {body}"
         );
     }
 
@@ -158,10 +160,9 @@ async fn a_cold_equality_count_is_answered_exactly_by_the_filtered_scan() {
     )
     .await;
     assert_eq!(count(&body), 2, "{body}");
-    assert_eq!(served_by(&body), "scan", "{body}");
+    assert_eq!(served_by(&body), "metadata", "{body}");
 
-    // The other polarity has no bloom-prunable alternative and must keep its
-    // zero-scan metadata answer, cold fold and all.
+    // The other polarity cannot afford to lose Tier-1 and keeps folding.
     let body = sql(
         &app,
         "SELECT count(*) AS n FROM events WHERE host != 'host-00007'",
@@ -181,12 +182,12 @@ async fn buffered_rows_are_counted_by_the_fallback_and_by_the_warm_aggregate() {
     let app = fixture(&tmp, true).await;
     let equality = "SELECT count(*) AS n FROM events WHERE host = 'host-00007'";
 
-    // Cold: the fast path declines and the union plan answers — committed row
-    // plus the sealed-but-uncommitted one. A fallback that lost the buffered
-    // row would be a silent wrong count, not an error.
+    // Cold: the fold is declined, the footer tier serves the committed rows,
+    // and the #61 delta adds the sealed-but-uncommitted one. A path that lost
+    // the buffered row would be a silent wrong count, not an error.
     let body = sql(&app, equality).await;
     assert_eq!(count(&body), 2, "the buffered row must be counted: {body}");
-    assert_eq!(served_by(&body), "scan", "{body}");
+    assert_eq!(served_by(&body), "metadata", "{body}");
 
     // Warm: some other query folds the wide aggregate for this generation
     // through the same server, and the fast path serves the shape again — the
@@ -208,9 +209,10 @@ async fn buffered_rows_are_counted_by_the_fallback_and_by_the_warm_aggregate() {
 }
 
 /// A commit under a warm aggregate puts the next request back on a cold entry.
-/// It must defer again and stay exact, rather than serve the older generation.
+/// It must decline the fold again and stay exact for the NEW generation,
+/// rather than serve the older one.
 #[tokio::test]
-async fn a_commit_under_a_warm_aggregate_returns_the_request_to_the_scan() {
+async fn a_commit_under_a_warm_aggregate_returns_the_request_to_a_cold_entry() {
     let tmp = tempfile::tempdir().unwrap();
     // One context, shared with the server: the later commit must invalidate
     // the same table cache the requests read, which is what a live ingest
@@ -246,7 +248,7 @@ async fn a_commit_under_a_warm_aggregate_returns_the_request_to_the_scan() {
     assert_eq!(count(&body), 2, "the new generation's answer: {body}");
     assert_eq!(
         served_by(&body),
-        "scan",
-        "a fresh generation is cold again and must defer again: {body}"
+        "metadata",
+        "a fresh generation is cold again, and still must not cost a scan: {body}"
     );
 }

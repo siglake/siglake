@@ -18,7 +18,7 @@ use std::sync::Arc;
 use arrow_array::{RecordBatch, StringArray, TimestampMicrosecondArray};
 use chrono::Utc;
 use siglake_core::index_config::{DocMapping, FieldMapping, FieldType, IndexConfig, MappingMode};
-use siglake_storage::iceberg::{IcebergContext, IcebergTuning, PredicateCountTier1};
+use siglake_storage::iceberg::{IcebergContext, IcebergTuning};
 
 /// Distinct `method` values, one row each.
 const VALUES: usize = 4_100;
@@ -89,9 +89,6 @@ async fn bounded_predicate_count_keeps_null_groups_separate_from_values() {
             // is on and `method` can only be served by the wide aggregate.
             table_group_count_cardinality: Some(10_000),
             result_caches: Some(false),
-            // One commit is enough to make this fixture "aged", so the cold
-            // fold is deferred and the warm path below is reached on purpose.
-            predicate_count_cold_fold_max_commits: Some(0),
             ..Default::default()
         });
     let config = config();
@@ -105,29 +102,24 @@ async fn bounded_predicate_count_keeps_null_groups_separate_from_values() {
     .await
     .unwrap();
 
-    // Cold: a deferral, not a zero and not a fold.
-    match ice
+    // Cold, so the wide aggregate is not folded and the footer tier answers.
+    let cold = ice
         .predicate_count_tier1("bounded", "method")
         .await
         .unwrap()
-    {
-        PredicateCountTier1::DeferredColdWideFold { .. } => {}
-        other => panic!("a large cold wide fold must be deferred, got {other:?}"),
-    }
+        .expect("the footer tier answers a cold column");
 
-    // Some other caller folds this generation; the bounded lookup may reuse it.
+    // Warm, so Tier-1 answers. Both must say the same thing about NULLs.
     ice.tier1_group_counts("bounded", "method")
         .await
         .unwrap()
         .expect("the wide aggregate covers `method` at this cap");
-
-    let PredicateCountTier1::Hit(rows) = ice
+    let rows = ice
         .predicate_count_tier1("bounded", "method")
         .await
         .unwrap()
-    else {
-        panic!("a memoized complete wide aggregate must answer");
-    };
+        .expect("a memoized complete wide aggregate must answer");
+    assert_eq!(rows.source_label(), "tier1_wide");
 
     let mut total = 0u64;
     let mut nulls = 0u64;
@@ -150,19 +142,31 @@ async fn bounded_predicate_count_keeps_null_groups_separate_from_values() {
         one, 1,
         "the selective equality answer must not absorb the NULL group"
     );
+
+    // The cold answer came from the footer tier and the warm one from the
+    // wide aggregate. A NULL group that only one of them counts would make the
+    // fold's removal a silent change of meaning.
+    let mut cold_total = 0u64;
+    let mut cold_nulls = 0u64;
+    cold.for_each(|key, count| {
+        cold_total += count;
+        if key.is_none() {
+            cold_nulls += count;
+        }
+    });
+    assert_eq!((cold_total, cold_nulls), (total, nulls));
 }
 
 /// A DELETE commit is the staleness case the read guard exists for: it removes
 /// rows without updating the aggregate, so every maintained column is now
 /// short of `total-records`.
 ///
-/// The bounded lookup must call that an ordinary [`PredicateCountTier1::Miss`]
-/// — the aggregate was decoded and found wanting, so nothing was deferred and
-/// the per-file footer sum below Tier-1 is still the right next tier. Calling
-/// it a deferral would send an answerable shape to a scan; returning the stale
-/// aggregate would return a count that includes deleted rows.
+/// Returning the stale aggregate would be a count that still includes the
+/// deleted row. The bounded lookup must reject it on the same
+/// `total == record_count` guard the generic one uses and land on the per-file
+/// footer tier, cold aggregate or warm.
 #[tokio::test]
-async fn a_delete_commit_is_a_miss_and_the_answer_stays_exact() {
+async fn a_delete_commit_leaves_the_bounded_answer_exact() {
     let tmp = tempfile::tempdir().unwrap();
     let ice = IcebergContext::open(&tmp.path().join("warehouse"))
         .await
@@ -170,7 +174,6 @@ async fn a_delete_commit_is_a_miss_and_the_answer_stays_exact() {
         .with_tuning(IcebergTuning {
             table_group_count_cardinality: Some(10_000),
             result_caches: Some(false),
-            predicate_count_cold_fold_max_commits: Some(0),
             ..Default::default()
         });
     let config = config();
@@ -200,20 +203,17 @@ async fn a_delete_commit_is_a_miss_and_the_answer_stays_exact() {
     assert_eq!(outcome.rows_deleted, 1, "{outcome:?}");
 
     // The delete is a commit, so the entry is a fresh generation with a cold
-    // memo. On this deliberately "aged" fixture that is a deferral — correct,
-    // and never the stale aggregate's own answer.
-    match ice
+    // memo: the bounded lookup takes the footer tier without folding.
+    let cold = ice
         .predicate_count_tier1("bounded", "method")
         .await
         .unwrap()
-    {
-        PredicateCountTier1::DeferredColdWideFold { .. } => {}
-        other => panic!("a cold aged generation defers; it must not answer: {other:?}"),
-    }
+        .expect("the footer tier answers after a delete");
+    assert_eq!(counts(&cold), ((VALUES + NULLS - 1) as u64, 0));
 
-    // Once the new generation HAS been folded, the aggregate is in hand and
-    // found short. That is an ordinary miss: nothing was deferred, and the
-    // footer sum below Tier-1 is still the right next tier.
+    // And once the new generation HAS been folded, the aggregate is in hand
+    // and found short of `total-records`, so the same tier answers again
+    // rather than the stale aggregate.
     assert!(
         ice.tier1_group_counts("bounded", "method")
             .await
@@ -221,29 +221,31 @@ async fn a_delete_commit_is_a_miss_and_the_answer_stays_exact() {
             .is_none(),
         "the delete left every maintained column short of total-records"
     );
-    match ice
+    let warm = ice
         .predicate_count_tier1("bounded", "method")
         .await
         .unwrap()
-    {
-        PredicateCountTier1::Miss => {}
-        other => panic!("a stale aggregate is a miss, not a deferral or an answer: {other:?}"),
-    }
+        .expect("the footer tier answers a decoded-but-short aggregate too");
+    assert_eq!(counts(&warm), ((VALUES + NULLS - 1) as u64, 0));
 
-    // And the tier the miss hands back to is still exact about the delete.
-    let rows = ice
+    // The generic lookup must agree, which is the equivalence that matters.
+    let generic = ice
         .grouped_counts_with_summary("bounded", "method", None, None)
         .await
         .unwrap()
         .expect("the per-file footers answer");
+    assert_eq!(counts(&generic), counts(&warm));
+}
+
+/// `(total rows, rows whose `method` is the deleted value)`.
+fn counts(rows: &siglake_storage::iceberg::GroupCounts) -> (u64, u64) {
     let mut total = 0u64;
-    let mut deleted = 0u64;
+    let mut target = 0u64;
     rows.for_each(|key, count| {
         total += count;
         if key == Some("m-00007") {
-            deleted = count;
+            target = count;
         }
     });
-    assert_eq!(deleted, 0, "the deleted row must not be counted");
-    assert_eq!(total, (VALUES + NULLS - 1) as u64);
+    (total, target)
 }

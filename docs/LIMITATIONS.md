@@ -1796,37 +1796,38 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   event-time twin was excluded from inferred dimensions may still report that
   column as short until the inline aggregate is rebuilt; the read guard refuses
   the short column, so exact SQL answers continue through the per-file path.
-- **An equality / `IN` count on a long-lived table scans instead of folding a
-  cold aggregate.** For a positive `WHERE col = 'v'` or `col IN (…)` count,
-  the dimensional-count fast path declines a COLD wide group-count fold when
-  the table's current sequence number is above
-  `predicate_count_cold_fold_max_commits` (default 1024), and the query goes to
-  the planner's filtered scan
-  (`crates/siglake-storage/src/iceberg.rs`, `predicate_count_tier1`). The
-  answer is exact either way; what changes is which tier pays.
+- **An equality / `IN` count is served below a cold wide aggregate, not by
+  folding it.** For a positive `WHERE col = 'v'` or `col IN (…)` count, the
+  dimensional-count fast path takes a lookup that will not fold a wide
+  group-count aggregate that is still COLD for the table generation
+  (`crates/siglake-storage/src/iceberg.rs`, `predicate_count_tier1`). Every
+  tier is otherwise the same and in the same order, so the answer is exact and
+  still costs no data-file scan; what changes is that the per-file footer sum
+  answers where Tier-1 would have after a fold.
 
-  Three limits follow from that shape. The bound is an UPPER bound on the
-  fold's size, not a measurement of it — a delta object is written per commit,
-  and the exact outstanding count is only knowable from the listing being
-  declined — so a long-lived table whose compactor is keeping up is deferred
-  although its fold would have been cheap. A LOW-selectivity equality on such
-  a table (a column above the 4096-entry inline cap, or an aggregate left
-  stale by a retention or delete commit) now scans the matching files where it
-  previously summed a footer per live file at zero scan; selectivity is not
-  known before the scan, so there is no gate on it. And the deferral is per
-  generation, so under live ingest every commit returns the shape to the scan
-  until something else folds that generation's aggregate.
+  Three consequences. A table whose wide aggregate WOULD have covered the
+  column now pays the footer tier once per generation per column instead of one
+  fold — one footer read per live file, or a raw-page decode for a column no
+  footer covers — and which of those two is cheaper has NOT been measured; on a
+  table with many live files the fold may well have been the cheaper of the two.
+  The deferral is per generation, so under live ingest every commit returns the
+  shape to the footer tier until some other query folds that generation. And
+  because only the positive polarity takes this lookup, a `!=` on the same
+  column may be answered from a folded aggregate while a `=` beside it is
+  answered from footers.
 
-  What is NOT affected: a negation (`!=`, `NOT IN`) and an integer range keep
-  the unbounded lookup, having no bloom-prunable alternative; an inline hit, an
-  already-folded wide aggregate and a warm snapshot-keyed result-cache entry
-  all still serve at zero scan; and an ordinary Tier-1 miss on any table —
-  including a cold fold under the bound — continues to the per-file footer sum
-  exactly as before.
+  No size test gates this, deliberately. The number of objects in the aggregate
+  prefix is knowable only from the listing being declined, and the pinned
+  entry's sequence number does not bound it: a qualified rewrite pins an older
+  generation while later commits keep writing delta keys into the same
+  incarnation prefix, and rebuild and short-repair markers are separate objects
+  in the same listing.
 
-  The lookup is not I/O-free, and nothing here should be read as saying so. It
-  still reads and caches the inline side object, and still decodes a warm wide
-  memo. Only the COLD wide listing and object reads are declined.
+  The lookup is not I/O-free and nothing here should be read as saying so. It
+  still reads and caches the inline side object, still decodes a warm wide
+  memo, and the footer tier below it is real work. Only the COLD wide listing
+  and its object reads are declined.
+
 - **The short-aggregate census reports more than it repairs.** Every 15 minutes
   the maintenance pass finds a maintained column short of `total-records` with
   every commit's contribution accounted for and fires
