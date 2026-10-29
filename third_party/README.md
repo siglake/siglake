@@ -36,6 +36,10 @@ Upstream base: 0.10.1. Key divergences:
   planned/read/bloom-pruned, row groups considered/pruned/read, rows pruned
   by selections, byte and S3-GET accounting — surfaced per-request as
   `stats.scan` in query responses.
+- **Known-empty Data manifest pruning**: scan planning does not read a Data
+  manifest when its manifest-list record explicitly reports zero added and
+  zero existing files. Unknown counts and every Delete manifest keep the
+  upstream read path; metadata and commit behavior are unchanged.
 - **Reversed (tail-first) row-group reads** for newest-first scans on
   ascending-ordered files: per-chunk decode from the file tail with
   progressive chunk growth, correct interaction with row selections and
