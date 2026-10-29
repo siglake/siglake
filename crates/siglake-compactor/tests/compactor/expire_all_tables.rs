@@ -69,6 +69,13 @@ fn audit_batch(commit: usize) -> RecordBatch {
     .expect("exact query_audit batch")
 }
 
+fn single_audit_marker_batch(commit: usize, query: &str) -> RecordBatch {
+    let batch = audit_batch(commit).slice(0, 1);
+    let mut columns = batch.columns().to_vec();
+    columns[4] = Arc::new(StringArray::from(vec![query]));
+    RecordBatch::try_new(query_audit_schema(), columns).expect("single exact audit marker batch")
+}
+
 fn expected_audit_rows(commits: std::ops::RangeInclusive<usize>) -> RecordBatch {
     let batches: Vec<RecordBatch> = commits.map(audit_batch).collect();
     arrow::compute::concat_batches(&query_audit_schema(), &batches)
@@ -113,6 +120,29 @@ async fn assert_audit_rows_equal(ice: &IcebergContext, expected: RecordBatch) {
             field.name()
         );
     }
+}
+
+async fn audit_query_count(ice: &IcebergContext, query: &str) -> i64 {
+    let ctx = SessionContext::new();
+    ice.register_query_audit_with_datafusion(&ctx)
+        .await
+        .expect("register query_audit");
+    let escaped = query.replace('\'', "''");
+    let batches = ctx
+        .sql(&format!(
+            "SELECT count(*) AS n FROM query_audit WHERE query = '{escaped}'"
+        ))
+        .await
+        .expect("plan exact audit marker count")
+        .collect()
+        .await
+        .expect("execute exact audit marker count");
+    batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("count result is Int64")
+        .value(0)
 }
 
 #[tokio::test]
@@ -269,6 +299,93 @@ async fn audit_maintenance_preserves_exact_rows_aggregates_and_snapshot_bound() 
             (Some("rejected".to_string()), (COMMITS + 2) as u64),
         ],
         "query_audit aggregate coverage must include old and fresh rows"
+    );
+}
+
+/// #7759: the maintained v0.3.0 burn's first audit marker count arrived while
+/// a long audit maintenance pass was still running. Build the same shape in
+/// miniature (one audit data file per commit), hold reclustering in its catalog
+/// commit window, and execute the exact filtered count both during that overlap
+/// and after the rewrite. This fails on the released source because its
+/// all-table recluster never reaches query_audit; it also distinguishes a
+/// catalog/maintenance lock from the released table's unbounded manifest walk.
+#[tokio::test]
+async fn aged_audit_marker_count_finishes_during_and_after_maintenance() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap(),
+    );
+    let audit_ident = ice.query_audit_table_ident();
+    const COMMITS: usize = 32;
+    let marker = "SELECT 1 AS audit_probe /* release-validation-audit-bounded-replay */";
+    for commit in 0..COMMITS {
+        let batch = if commit == 7 {
+            single_audit_marker_batch(commit, marker)
+        } else {
+            audit_batch(commit)
+        };
+        ice.append_query_audit(batch)
+            .await
+            .expect("append aged query_audit fixture");
+    }
+    assert_eq!(
+        ice.live_data_files(&audit_ident).await.unwrap().len(),
+        COMMITS,
+        "fixture must retain one small file per audit commit"
+    );
+
+    let entered_commit = Arc::new(tokio::sync::Notify::new());
+    let release_commit = Arc::new(tokio::sync::Notify::new());
+    let hook_entered = entered_commit.clone();
+    let hook_release = release_commit.clone();
+    let catalog = TestCatalog::new(ice.catalog().clone())
+        .before_first_update_with_base(move || {
+            let entered = hook_entered.clone();
+            let release = hook_release.clone();
+            async move {
+                entered.notify_one();
+                release.notified().await;
+            }
+        })
+        .shared();
+    let maintained = ice.as_ref().clone().with_catalog_for_test(catalog.clone());
+    let maintenance = tokio::spawn(async move {
+        maintained
+            .recluster_all_indexes(ReclusterPolicy::default())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), entered_commit.notified())
+        .await
+        .expect("audit recluster did not reach its commit window");
+
+    let during = tokio::time::timeout(Duration::from_secs(10), audit_query_count(&ice, marker))
+        .await
+        .expect("audit marker count blocked behind maintenance");
+    assert_eq!(during, 1, "the exact marker has one fixture row");
+
+    release_commit.notify_one();
+    let stats = tokio::time::timeout(Duration::from_secs(30), maintenance)
+        .await
+        .expect("audit maintenance exceeded the bounded replay")
+        .expect("audit maintenance task panicked")
+        .expect("audit maintenance failed");
+    assert!(catalog.fired(), "the maintenance commit hook must run");
+    assert!(
+        stats.iter().any(|stat| stat.files_removed > 0),
+        "maintenance must compact query_audit"
+    );
+    assert!(
+        ice.live_data_files(&audit_ident).await.unwrap().len() < COMMITS,
+        "maintenance must bound the audit file set"
+    );
+    let after = tokio::time::timeout(Duration::from_secs(10), audit_query_count(&ice, marker))
+        .await
+        .expect("post-maintenance audit marker count timed out");
+    assert_eq!(
+        after, 1,
+        "maintenance must preserve exact marker multiplicity"
     );
 }
 

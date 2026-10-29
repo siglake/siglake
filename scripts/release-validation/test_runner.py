@@ -180,6 +180,29 @@ class IsolationTests(unittest.TestCase):
             event = (run.out/'events.jsonl').read_text()
             self.assertIn('"check": "query_audit_checkpoint"', event)
 
+    def test_24h_audit_checkpoint_uses_the_final_oracle_with_a_distinct_marker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = SimpleNamespace(
+                out=str(Path(temp)/'run'),
+                version='v0.3.0',
+                profile='72h',
+                dependency_policy='public',
+            )
+            run = v.Run(args)
+            with patch.object(
+                run,
+                'sql',
+                return_value=[{'audit_probe': 1}],
+            ) as sql, patch.object(run, 'await_audit_checkpoint') as checkpoint:
+                marker = run.run_audit_checkpoint('24h', '24h')
+            self.assertEqual(
+                marker,
+                v.audit_marker_query(run.project, '24h'),
+            )
+            self.assertNotEqual(marker, v.audit_marker_query(run.project))
+            sql.assert_called_once_with(marker)
+            checkpoint.assert_called_once_with(marker, '24h')
+
     def test_audit_checkpoint_does_not_retry_product_http_errors(self):
         with tempfile.TemporaryDirectory() as temp:
             args = SimpleNamespace(
