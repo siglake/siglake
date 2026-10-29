@@ -82,7 +82,11 @@ static ALLOC: Tracking = Tracking;
 
 /// Heap bytes still live while `build`'s value is held — the retained cost of
 /// the representation, not the traffic that built it.
-fn measured_retained<T>(build: impl FnOnce() -> T) -> usize {
+fn measured_retained<T>(build: impl Fn() -> T) -> usize {
+    // Keep one-time formatter and test-runtime allocations outside the live
+    // delta. The second value is still measured from construction through its
+    // full lifetime, so the retained representation remains the only subject.
+    drop(build());
     let before = LIVE.load(Ordering::Relaxed);
     let held = build();
     let retained = LIVE.load(Ordering::Relaxed).saturating_sub(before);
