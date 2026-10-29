@@ -905,6 +905,293 @@ mod tests {
         );
     }
 
+    fn attr_scalar_key_args(
+        attrs: ColumnarValue,
+        key: ColumnarValue,
+        number_rows: usize,
+    ) -> ScalarFunctionArgs {
+        ScalarFunctionArgs {
+            args: vec![attrs, key],
+            arg_fields: vec![
+                Arc::new(Field::new("attributes", DataType::Utf8, true)),
+                Arc::new(Field::new("key", DataType::Utf8, true)),
+            ],
+            number_rows,
+            return_field: Arc::new(Field::new("out", DataType::Utf8, true)),
+            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+        }
+    }
+
+    /// Test-only candidate for the common literal-key call shape. Array and
+    /// non-Utf8 scalar keys deliberately go through the real UDF.
+    fn attr_scalar_key_candidate(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        let key = match &args.args[1] {
+            ColumnarValue::Scalar(ScalarValue::Utf8(key)) => key.as_deref(),
+            _ => return AttrGetUdf::new().invoke_with_args(args),
+        };
+        let n = args.number_rows;
+        let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
+        let mut builder = StringBuilder::with_capacity(n, n * 16);
+        for i in 0..n {
+            if attrs.is_null(i) || key.is_none() {
+                builder.append_null();
+                continue;
+            }
+            match json_attr_lookup(attrs.value(i), key.unwrap()) {
+                Some(value) => builder.append_value(&value),
+                None => builder.append_null(),
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+
+    fn attr_scalar_key_values(value: ColumnarValue, n: usize) -> Vec<Option<String>> {
+        let array = match value {
+            ColumnarValue::Array(array) => array,
+            ColumnarValue::Scalar(value) => value.to_array_of_size(n).unwrap(),
+        };
+        let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        (0..n)
+            .map(|i| (!array.is_null(i)).then(|| array.value(i).to_owned()))
+            .collect()
+    }
+
+    fn invoke_attr_scalar_key(
+        candidate: bool,
+        attrs: ColumnarValue,
+        key: ColumnarValue,
+        number_rows: usize,
+    ) -> DfResult<ColumnarValue> {
+        let args = attr_scalar_key_args(attrs, key, number_rows);
+        if candidate {
+            attr_scalar_key_candidate(args)
+        } else {
+            AttrGetUdf::new().invoke_with_args(args)
+        }
+    }
+
+    #[test]
+    fn attr_scalar_key_candidate_matches_semantic_golds() {
+        let cases: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/attr_get_semantic_cases.json")).unwrap();
+        assert_eq!(cases["cases"].as_array().unwrap().len(), 19);
+        for case in cases["cases"].as_array().unwrap() {
+            let raw = case["attributes"].as_str().unwrap();
+            let key = case["key"].as_str().unwrap();
+            let expected = case["expected"].as_str().map(str::to_owned);
+            for n in [0, 1, 128, 4096] {
+                let rows: Vec<Option<&str>> = (0..n)
+                    .map(|i| if i % 7 == 6 { None } else { Some(raw) })
+                    .collect();
+                let attrs: Arc<dyn Array> = Arc::new(StringArray::from(rows));
+                let dynamic_keys: Arc<dyn Array> = Arc::new(StringArray::from(
+                    (0..n)
+                        .map(|i| (i % 11 != 10).then_some(key))
+                        .collect::<Vec<_>>(),
+                ));
+                for key_arg in [
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(key.to_owned()))),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(None)),
+                    ColumnarValue::Array(dynamic_keys),
+                ] {
+                    let scalar_null =
+                        matches!(&key_arg, ColumnarValue::Scalar(ScalarValue::Utf8(None)));
+                    let dynamic = matches!(&key_arg, ColumnarValue::Array(_));
+                    let baseline = attr_scalar_key_values(
+                        invoke_attr_scalar_key(
+                            false,
+                            ColumnarValue::Array(attrs.clone()),
+                            key_arg.clone(),
+                            n,
+                        )
+                        .unwrap(),
+                        n,
+                    );
+                    let candidate = attr_scalar_key_values(
+                        invoke_attr_scalar_key(
+                            true,
+                            ColumnarValue::Array(attrs.clone()),
+                            key_arg,
+                            n,
+                        )
+                        .unwrap(),
+                        n,
+                    );
+                    assert_eq!(baseline, candidate, "{} n={n}", case["id"]);
+                    for (i, actual) in baseline.iter().enumerate() {
+                        let gold = if scalar_null || i % 7 == 6 || (dynamic && i % 11 == 10) {
+                            None
+                        } else {
+                            expected.clone()
+                        };
+                        assert_eq!(actual, &gold, "{} row={i}", case["id"]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attr_scalar_key_candidate_accepts_scalar_attributes() {
+        for n in [0, 1, 128, 4096] {
+            let attrs = ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+                r#"{"a.b":"literal","a":{"b":"nested"}}"#.to_owned(),
+            )));
+            let key = ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".to_owned())));
+            let baseline = attr_scalar_key_values(
+                invoke_attr_scalar_key(false, attrs.clone(), key.clone(), n).unwrap(),
+                n,
+            );
+            let candidate =
+                attr_scalar_key_values(invoke_attr_scalar_key(true, attrs, key, n).unwrap(), n);
+            assert_eq!(candidate, baseline);
+            assert_eq!(candidate, vec![Some("literal".to_owned()); n]);
+
+            let attrs = ColumnarValue::Scalar(ScalarValue::Utf8(None));
+            let key = ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".to_owned())));
+            let baseline = attr_scalar_key_values(
+                invoke_attr_scalar_key(false, attrs.clone(), key.clone(), n).unwrap(),
+                n,
+            );
+            let candidate =
+                attr_scalar_key_values(invoke_attr_scalar_key(true, attrs, key, n).unwrap(), n);
+            assert_eq!(candidate, baseline);
+            assert_eq!(candidate, vec![None; n]);
+        }
+    }
+
+    #[test]
+    fn attr_scalar_key_candidate_preserves_wrong_type_refusals() {
+        let utf8_attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![r#"{"x":1}"#]));
+        let int_attrs: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        let int_keys: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        let cases = [
+            (
+                ColumnarValue::Array(int_attrs),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("x".to_owned()))),
+                "attributes must be Utf8",
+            ),
+            (
+                ColumnarValue::Array(utf8_attrs.clone()),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
+                "key must be Utf8",
+            ),
+            (
+                ColumnarValue::Array(utf8_attrs),
+                ColumnarValue::Array(int_keys),
+                "key must be Utf8",
+            ),
+        ];
+        for (attrs, key, expected) in cases {
+            let baseline = invoke_attr_scalar_key(false, attrs.clone(), key.clone(), 1)
+                .unwrap_err()
+                .to_string();
+            let candidate = invoke_attr_scalar_key(true, attrs, key, 1)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(candidate, baseline);
+            assert!(
+                candidate.contains(expected),
+                "unexpected error: {candidate}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "timing belongs to the later fixed-envelope source review"]
+    fn attr_scalar_key_candidate_microbenchmark() {
+        let mut wide = String::from("{");
+        for i in 0..64 {
+            if i > 0 {
+                wide.push(',');
+            }
+            wide.push_str(&format!(r#""key{i}":"value-{i}""#));
+        }
+        wide.push('}');
+        let shapes = [
+            ("narrow_early", r#"{"target":"value"}"#, "target"),
+            ("wide_early", wide.as_str(), "key0"),
+            ("wide_late", wide.as_str(), "key63"),
+            ("wide_missing", wide.as_str(), "absent"),
+            (
+                "literal_dotted_collision",
+                r#"{"a":{"b":"nested"},"a.b":"literal"}"#,
+                "a.b",
+            ),
+        ];
+        for n in [1, 128, 4096] {
+            let operations = 32.max(16_384 / n);
+            for (shape, json, key) in shapes {
+                let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![json; n]));
+                let key = ColumnarValue::Scalar(ScalarValue::Utf8(Some(key.to_owned())));
+
+                // Keep correctness checks outside every timed region.
+                let baseline = attr_scalar_key_values(
+                    invoke_attr_scalar_key(
+                        false,
+                        ColumnarValue::Array(attrs.clone()),
+                        key.clone(),
+                        n,
+                    )
+                    .unwrap(),
+                    n,
+                );
+                let candidate = attr_scalar_key_values(
+                    invoke_attr_scalar_key(
+                        true,
+                        ColumnarValue::Array(attrs.clone()),
+                        key.clone(),
+                        n,
+                    )
+                    .unwrap(),
+                    n,
+                );
+                assert_eq!(candidate, baseline, "shape={shape} n={n}");
+
+                for pair in 0..12 {
+                    for candidate in if pair % 2 == 0 {
+                        [false, true]
+                    } else {
+                        [true, false]
+                    } {
+                        // Preparing each owned argument outside the timer keeps
+                        // framework construction out while retaining the real
+                        // UDF's scalar-to-array expansion in the baseline.
+                        let args: Vec<_> = (0..operations)
+                            .map(|_| {
+                                attr_scalar_key_args(
+                                    ColumnarValue::Array(attrs.clone()),
+                                    key.clone(),
+                                    n,
+                                )
+                            })
+                            .collect();
+                        let udf = AttrGetUdf::new();
+                        let start = std::time::Instant::now();
+                        let (_, count) = allocations(|| {
+                            for args in args {
+                                let out = if candidate {
+                                    attr_scalar_key_candidate(args)
+                                } else {
+                                    udf.invoke_with_args(args)
+                                };
+                                std::hint::black_box(out.unwrap());
+                            }
+                        });
+                        let elapsed = start.elapsed();
+                        if pair >= 2 {
+                            println!(
+                                "scalar_key_candidate shape={shape} rows={n} operations={operations} pair={} candidate={candidate} ns={} allocations={count}",
+                                pair - 2,
+                                elapsed.as_nanos()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// End-to-end: the UDF resolves + executes through the SQL planner once
     /// `register_udfs` has run (the path the query server uses).
     #[tokio::test]

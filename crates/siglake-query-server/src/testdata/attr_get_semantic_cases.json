@@ -1,0 +1,24 @@
+{
+  "scope": "The 19 prepared 28d4 lookup golds, validated against the actual UDF at 15a4804",
+  "cases": [
+    { "id": "simple", "attributes": "{\"x\":\"abc\"}", "key": "x", "expected": "abc" },
+    { "id": "integer", "attributes": "{\"x\":9007199254740993}", "key": "x", "expected": "9007199254740993" },
+    { "id": "negative", "attributes": "{\"x\":-42}", "key": "x", "expected": "-42" },
+    { "id": "fraction", "attributes": "{\"x\":2.5}", "key": "x", "expected": "2.5" },
+    { "id": "true", "attributes": "{\"x\":true}", "key": "x", "expected": "true" },
+    { "id": "false", "attributes": "{\"x\":false}", "key": "x", "expected": "false" },
+    { "id": "null", "attributes": "{\"x\":null}", "key": "x", "expected": null },
+    { "id": "missing", "attributes": "{\"y\":1}", "key": "x", "expected": null },
+    { "id": "escaped_value", "attributes": "{\"x\":\"a\\nb\"}", "key": "x", "expected": "a\nb" },
+    { "id": "escaped_key", "attributes": "{\"a\\u002eb\":\"literal\"}", "key": "a.b", "expected": "literal" },
+    { "id": "nested", "attributes": "{\"a\":{\"b\":\"nested\"}}", "key": "a.b", "expected": "nested" },
+    { "id": "literal_wins", "attributes": "{\"a\":{\"b\":\"nested\"},\"a.b\":\"literal\"}", "key": "a.b", "expected": "literal" },
+    { "id": "literal_null_wins", "attributes": "{\"a\":{\"b\":\"nested\"},\"a.b\":null}", "key": "a.b", "expected": null },
+    { "id": "literal_dotted_child", "attributes": "{\"a\":{\"b.c\":\"child\"}}", "key": "a.b.c", "expected": "child" },
+    { "id": "array", "attributes": "{\"x\":[1,\"a\",true]}", "key": "x", "expected": "[1,\"a\",true]" },
+    { "id": "object", "attributes": "{\"x\":{\"k\":1}}", "key": "x", "expected": "{\"k\":1}" },
+    { "id": "invalid_value", "attributes": "{\"x\":}", "key": "x", "expected": null },
+    { "id": "not_object", "attributes": "[1,2]", "key": "x", "expected": null },
+    { "id": "duplicate_first", "attributes": "{\"x\":\"first\",\"x\":\"second\"}", "key": "x", "expected": "first" }
+  ]
+}
