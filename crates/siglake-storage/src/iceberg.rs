@@ -25101,6 +25101,102 @@ impl IcebergContext {
             .await
     }
 
+    /// Exact Tier-1 counts for a SELECTIVE PREDICATE request, with no cold
+    /// wide fold (#7787).
+    ///
+    /// [`Self::grouped_counts_with_summary`] is shaped for a caller with no
+    /// alternative: on a Tier-1 miss it lists the delta directory, GETs every
+    /// outstanding delta, folds them, and then sums a footer per live file at
+    /// Tier-2. On the aged `query_audit` table that was 43,042 outstanding
+    /// deltas ahead of an 8-file Tier-2 fallback, and a `WHERE col = 'v'`
+    /// `COUNT` whose answer is 1 spent its whole 30s deadline there.
+    ///
+    /// A predicate count DOES have an alternative, and an exact one: the
+    /// planner's filtered scan, which bloom-prunes to the matching files. So
+    /// this consults only what is already paid for — a warm snapshot-keyed
+    /// result-cache entry, the inline side object, and a wide aggregate some
+    /// earlier caller already folded for this entry generation — and refuses
+    /// otherwise.
+    ///
+    /// [`Tier1GroupCountsFold::NotInspected`] and
+    /// [`Tier1GroupCountsFold::Refused`] are REFUSALS, not zeros, and not an
+    /// invitation to continue below Tier-1: the caller must answer the request
+    /// its own way. Nothing here lists, reads, folds, spawns, or memoizes.
+    pub async fn predicate_count_tier1(
+        &self,
+        table_name: &str,
+        column: &str,
+    ) -> Result<Tier1GroupCountsFold<()>> {
+        let table_ident = TableIdent::new(self.namespace.clone(), table_name.to_string());
+        let cached = self.cached_table_entry(&table_ident).await?;
+        self.predicate_count_tier1_for_cached(&table_ident, &cached, column)
+            .await
+    }
+
+    /// [`Self::predicate_count_tier1`] bound to the same promoted generation a
+    /// qualified rewrite registered its provider against, matching
+    /// [`Self::qualified_grouped_counts_with_summary`].
+    pub async fn qualified_predicate_count_tier1(
+        &self,
+        qualified: &QualifiedAttrRewrite,
+        column: &str,
+    ) -> Result<Tier1GroupCountsFold<()>> {
+        let cached = &qualified.aggregate_entry;
+        let table_ident = cached.table.identifier().clone();
+        self.predicate_count_tier1_for_cached(&table_ident, cached, column)
+            .await
+    }
+
+    async fn predicate_count_tier1_for_cached(
+        &self,
+        table_ident: &TableIdent,
+        cached: &CachedTableEntry,
+        column: &str,
+    ) -> Result<Tier1GroupCountsFold<()>> {
+        // A warm snapshot-keyed entry is exact and costs no I/O, so the bounded
+        // path keeps the answer the generic lookup would have returned. READ
+        // ONLY: inserting here would turn a refusal into a cached result.
+        if self.result_caches_enabled() {
+            if let Some(snapshot_id) = cached.snapshot_id {
+                let key: SnapshotAggKey =
+                    (table_ident.to_string(), snapshot_id, column.to_string());
+                let hit = self.snapshot_agg_cache.lock().unwrap().get(&key);
+                if let Some(rows) = hit {
+                    metrics::counter!("siglake_footer_cache_hits_total", "kind" => "snapshot_agg")
+                        .increment(1);
+                    return Ok(Tier1GroupCountsFold::Hit {
+                        rows,
+                        state: (),
+                        folded: false,
+                    });
+                }
+            }
+        }
+        let Some(record_count) = cached
+            .table
+            .metadata()
+            .current_snapshot()
+            .and_then(|snapshot| {
+                snapshot
+                    .summary()
+                    .additional_properties
+                    .get("total-records")
+            })
+            .and_then(|value| value.parse::<u64>().ok())
+        else {
+            return Ok(Tier1GroupCountsFold::NotInspected);
+        };
+        self.tier1_group_count_rows_fold_with_policy(
+            table_ident,
+            cached,
+            column,
+            record_count,
+            (),
+            ColdWideFold::Forbidden,
+        )
+        .await
+    }
+
     /// An approximate top-`k` for `column`, when no exact aggregate covers it.
     ///
     /// **Only top-K by count.** A sketch holds at most `m` counters and has no
@@ -25272,6 +25368,32 @@ impl IcebergContext {
         record_count: u64,
         state: T,
     ) -> Result<Tier1GroupCountsFold<T>> {
+        self.tier1_group_count_rows_fold_with_policy(
+            table_ident,
+            cached,
+            column,
+            record_count,
+            state,
+            ColdWideFold::Allowed,
+        )
+        .await
+    }
+
+    /// [`Self::tier1_group_count_rows_fold`] under an explicit cold-wide
+    /// policy. Maintenance and the generic grouped-count lookup fold a cold
+    /// wide aggregate; a selective predicate request does not — see
+    /// [`ColdWideFold`] and [`Self::predicate_count_tier1`].
+    async fn tier1_group_count_rows_fold_with_policy<
+        T: siglake_bloom::group_counts::StreamingColumnFold,
+    >(
+        &self,
+        table_ident: &TableIdent,
+        cached: &CachedTableEntry,
+        column: &str,
+        record_count: u64,
+        state: T,
+        cold_wide: ColdWideFold,
+    ) -> Result<Tier1GroupCountsFold<T>> {
         // Both arms hand back a BORROWED view of the aggregate they matched.
         // Nothing downstream needs owned keys, and materializing them here is
         // what put 1.1M string allocations on every query — see [`GroupCounts`].
@@ -25295,7 +25417,23 @@ impl IcebergContext {
                 });
             }
         }
-        let Some(wide) = self.cached_wide_group_counts(cached).await? else {
+        let wide = match cold_wide {
+            ColdWideFold::Allowed => self.cached_wide_group_counts(cached).await?,
+            // Take whatever an earlier caller already folded for THIS entry
+            // generation and nothing else. The outer `None` means "never
+            // inspected" and must stay that way: memoizing a miss here would
+            // cache a false negative for the generation's whole life, and
+            // folding one would be the unbounded work this policy exists to
+            // refuse. No listing, no GET, no spawn.
+            ColdWideFold::Forbidden => cached
+                .wide_group_counts
+                .lock()
+                .await
+                .as_ref()
+                .cloned()
+                .flatten(),
+        };
+        let Some(wide) = wide else {
             return Ok(Tier1GroupCountsFold::NotInspected);
         };
         if !aggregate_covers_current_snapshot(&cached.table, wide.coverage) {
@@ -28282,6 +28420,20 @@ pub enum GroupCounts {
         rows: Arc<GroupCountRows>,
         source: OwnedCounts,
     },
+}
+
+/// Whether a Tier-1 lookup may pay for a COLD wide aggregate: the delta
+/// directory listing plus a GET per outstanding delta, folded before the
+/// column is decoded.
+///
+/// Maintenance and the generic grouped-count lookup must — they have no other
+/// way to an exact answer. A selective predicate count must not: it has the
+/// planner's own filtered scan, which is exact and bloom-prunable, and the
+/// cold fold is what put a 30s deadline on a `COUNT` of 1 (#7787).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColdWideFold {
+    Allowed,
+    Forbidden,
 }
 
 /// Outcome of trying to fold a bounded collector into a Tier-1 lookup.
@@ -39487,5 +39639,328 @@ mod timestamp_spool_integration_tests {
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bounded_predicate_count_tests {
+    //! #7787 — a selective predicate count must not pay for a cold wide fold.
+    //!
+    //! The aged `query_audit` table carried 43,042 outstanding delta objects
+    //! ahead of an 8-file Tier-2 fallback. `grouped_counts_with_summary` lists
+    //! that directory and GETs every delta before it can decide anything, so a
+    //! `WHERE col = 'v'` `COUNT` whose answer is 1 spent its whole 30s deadline
+    //! there while the planner's filtered scan would have answered it from a
+    //! bloom-pruned handful of files.
+    //!
+    //! The delta objects below are deliberately UNREADABLE as deltas. A fold
+    //! that so much as GETs one takes the vanished-delta retry and leaves a
+    //! memoized miss behind, so "never listed, never read, never memoized" is
+    //! observable from the entry's own memo slot rather than from a timing.
+
+    use super::*;
+
+    fn ev(raw: &str, host: &str) -> Event {
+        let mut event = Event::now(raw.to_string());
+        event.host = host.to_string();
+        event
+    }
+
+    /// Distinct hosts above [`BASE_GROUP_COUNT_CARDINALITY`], so the inline
+    /// per-commit object is short for `host` and only the wide aggregate can
+    /// answer it exactly.
+    fn wide_only_events(n: usize) -> Vec<Event> {
+        (0..n)
+            .map(|i| ev(&format!("event-{i}"), &format!("host-{i:05}")))
+            .collect()
+    }
+
+    async fn wide_memo_is_uninspected(cached: &CachedTableEntry) -> bool {
+        cached.wide_group_counts.lock().await.is_none()
+    }
+
+    /// Delta names a cold fold would have to enumerate and read. Unreadable on
+    /// purpose: any GET of one is visible in the outcome.
+    async fn plant_unreadable_deltas(cached: &CachedTableEntry, count: i64) {
+        let op = aggregate_operator(&cached.table)
+            .unwrap()
+            .expect("the fixture table owns its aggregate prefix");
+        for seq in 0..count {
+            op.write(
+                &group_count_delta_rel_path(900_000 + seq),
+                b"not a delta".to_vec(),
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn context(
+        tmp: &tempfile::TempDir,
+        cardinality: usize,
+        result_caches: bool,
+    ) -> IcebergContext {
+        IcebergContext::open(&tmp.path().join("warehouse"))
+            .await
+            .unwrap()
+            .with_tuning(IcebergTuning {
+                table_group_count_cardinality: Some(cardinality),
+                result_caches: Some(result_caches),
+                ..Default::default()
+            })
+    }
+
+    #[tokio::test]
+    async fn cold_wide_predicate_count_never_lists_or_reads_delta_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = context(&tmp, 10_000, false).await;
+        ice.append_events(&wide_only_events(4_100)).await.unwrap();
+        let ident = ice.table_ident.clone();
+        let cached = ice.cached_table_entry(&ident).await.unwrap();
+        plant_unreadable_deltas(&cached, 512).await;
+        assert!(
+            wide_memo_is_uninspected(&cached).await,
+            "the fixture must start cold"
+        );
+
+        // Twice, in the same process: a refusal must not become cheaper OR
+        // more expensive on repeat, and must not leave a miss behind for the
+        // next request to read back as an answer.
+        for attempt in 1..=2 {
+            match ice.predicate_count_tier1("events", "host").await.unwrap() {
+                Tier1GroupCountsFold::NotInspected => {}
+                other => panic!("attempt {attempt} folded a cold wide aggregate: {other:?}"),
+            }
+            assert!(
+                wide_memo_is_uninspected(&ice.cached_table_entry(&ident).await.unwrap()).await,
+                "attempt {attempt} listed, read or memoized the delta directory"
+            );
+        }
+
+        // The control proves the fixture is genuinely a cold-wide one: the
+        // unbounded lookup DOES reach the fold, reads the planted names, and
+        // leaves the memoized miss the bounded path refused to leave.
+        assert!(
+            ice.tier1_group_counts("events", "host")
+                .await
+                .unwrap()
+                .is_none(),
+            "unreadable deltas must defeat the unbounded fold, not answer it"
+        );
+        assert!(
+            !wide_memo_is_uninspected(&ice.cached_table_entry(&ident).await.unwrap()).await,
+            "the unbounded lookup is what memoizes; without that this test proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn predicate_count_serves_an_already_memoized_wide_aggregate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = context(&tmp, 10_000, false).await;
+        ice.append_events(&wide_only_events(4_100)).await.unwrap();
+        let ident = ice.table_ident.clone();
+
+        assert!(
+            matches!(
+                ice.predicate_count_tier1("events", "host").await.unwrap(),
+                Tier1GroupCountsFold::NotInspected
+            ),
+            "the inline object is short for `host`, so a cold lookup must refuse"
+        );
+
+        // Any other caller folding this generation is what the request path is
+        // allowed to reuse — a maintenance pass, a GROUP BY, a previous query.
+        let warmed = ice
+            .tier1_group_counts("events", "host")
+            .await
+            .unwrap()
+            .expect("the wide aggregate covers `host` at this cap");
+        assert_eq!(warmed.source_label(), "tier1_wide");
+        assert!(!wide_memo_is_uninspected(&ice.cached_table_entry(&ident).await.unwrap()).await);
+
+        let Tier1GroupCountsFold::Hit { rows, folded, .. } =
+            ice.predicate_count_tier1("events", "host").await.unwrap()
+        else {
+            panic!("a memoized complete wide aggregate must still answer");
+        };
+        assert!(folded, "the wide hit streams the column");
+        let mut total = 0u64;
+        let mut one = 0u64;
+        rows.for_each(|key, count| {
+            total += count;
+            if key == Some("host-00007") {
+                one = count;
+            }
+        });
+        assert_eq!(total, 4_100);
+        assert_eq!(one, 1, "the selective equality answer is the point");
+    }
+
+    #[tokio::test]
+    async fn predicate_count_serves_the_inline_aggregate_without_waking_the_wide_memo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = context(&tmp, 10_000, false).await;
+        ice.append_events(&wide_only_events(4)).await.unwrap();
+        let ident = ice.table_ident.clone();
+        let cached = ice.cached_table_entry(&ident).await.unwrap();
+        plant_unreadable_deltas(&cached, 8).await;
+
+        let Tier1GroupCountsFold::Hit { rows, folded, .. } =
+            ice.predicate_count_tier1("events", "host").await.unwrap()
+        else {
+            panic!("a complete inline aggregate must answer as it always has");
+        };
+        assert!(!folded, "an inline hit leaves the collector untouched");
+        assert_eq!(rows.source_label(), "tier1_inline");
+        let mut total = 0u64;
+        rows.for_each(|_, count| total += count);
+        assert_eq!(total, 4);
+        assert!(
+            wide_memo_is_uninspected(&cached).await,
+            "an inline hit must not reach the delta directory either"
+        );
+    }
+
+    #[tokio::test]
+    async fn predicate_count_refuses_a_short_wide_column_instead_of_returning_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        // One over the inline cap: deltas are on, but `host` exceeds what the
+        // wide aggregate will hold exactly, so it is demoted to a sketch.
+        let ice = context(&tmp, BASE_GROUP_COUNT_CARDINALITY + 1, false).await;
+        ice.append_events(&wide_only_events(4_100)).await.unwrap();
+
+        // Warm the memo through the unbounded path, so the bounded one is
+        // deciding about a DECODED aggregate rather than an absent one.
+        assert!(matches!(
+            ice.tier1_group_counts_fold("events", "host", ())
+                .await
+                .unwrap(),
+            Tier1GroupCountsFold::Refused(_)
+        ));
+
+        match ice.predicate_count_tier1("events", "host").await.unwrap() {
+            Tier1GroupCountsFold::Refused(_) => {}
+            other => panic!("a sketched column must refuse, never answer: {other:?}"),
+        }
+    }
+
+    /// A restart drops every memo. What it must NOT do is leave anything behind
+    /// that lets the next process mistake a refusal for an answer, or that
+    /// makes the first cold lookup after a restart pay for the fold again.
+    #[tokio::test]
+    async fn a_restarted_process_refuses_the_cold_wide_aggregate_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let ice = context(&tmp, 10_000, false).await;
+            ice.append_events(&wide_only_events(4_100)).await.unwrap();
+            let ident = ice.table_ident.clone();
+            plant_unreadable_deltas(&ice.cached_table_entry(&ident).await.unwrap(), 64).await;
+            assert!(matches!(
+                ice.predicate_count_tier1("events", "host").await.unwrap(),
+                Tier1GroupCountsFold::NotInspected
+            ));
+            // Warm it, so the restart has a memo to NOT inherit.
+            let _ = ice.tier1_group_counts("events", "host").await.unwrap();
+        }
+
+        let ice = context(&tmp, 10_000, false).await;
+        let ident = ice.table_ident.clone();
+        match ice.predicate_count_tier1("events", "host").await.unwrap() {
+            Tier1GroupCountsFold::NotInspected => {}
+            other => panic!("a restarted process folded a cold wide aggregate: {other:?}"),
+        }
+        assert!(
+            wide_memo_is_uninspected(&ice.cached_table_entry(&ident).await.unwrap()).await,
+            "the first lookup after a restart must still leave the deltas alone"
+        );
+    }
+
+    /// The qualified entry point must read the SAME immutable generation the
+    /// rewrite registered its provider against — never the mutable table cache
+    /// — exactly as `qualified_grouped_counts_with_summary` does.
+    #[tokio::test]
+    async fn the_qualified_entry_point_stays_bound_to_its_own_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = context(&tmp, 10_000, false).await;
+        ice.append_events(&wide_only_events(4_100)).await.unwrap();
+        let ident = ice.table_ident.clone();
+        let entry = ice.cached_table_entry(&ident).await.unwrap();
+        let qualified = QualifiedAttrRewrite {
+            mapping: HashMap::new(),
+            snapshot: BufferedTableSnapshot::from_cached(entry.clone()),
+            index_config: None,
+            aggregate_entry: entry.clone(),
+        };
+
+        assert!(matches!(
+            ice.qualified_predicate_count_tier1(&qualified, "host")
+                .await
+                .unwrap(),
+            Tier1GroupCountsFold::NotInspected
+        ));
+        assert!(
+            wide_memo_is_uninspected(&entry).await,
+            "the qualified arm must be bounded too"
+        );
+
+        let _ = ice.tier1_group_counts("events", "host").await.unwrap();
+
+        // A newer commit lands. The bound entry keeps answering for ITS
+        // generation; it must not be re-resolved to the current one.
+        ice.append_events(&[ev("later", "host-99999")])
+            .await
+            .unwrap();
+        let current = ice.cached_table_entry(&ident).await.unwrap();
+        assert_ne!(current.snapshot_id, entry.snapshot_id);
+
+        let Tier1GroupCountsFold::Hit { rows, .. } = ice
+            .qualified_predicate_count_tier1(&qualified, "host")
+            .await
+            .unwrap()
+        else {
+            panic!("the bound generation's memoized aggregate must still answer");
+        };
+        let mut total = 0u64;
+        rows.for_each(|_, count| total += count);
+        assert_eq!(
+            total, 4_100,
+            "the answer belongs to the pinned generation, not the newer commit"
+        );
+    }
+
+    #[tokio::test]
+    async fn predicate_count_keeps_a_warm_snapshot_result_cache_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = context(&tmp, 10_000, true).await;
+        ice.append_events(&wide_only_events(4_100)).await.unwrap();
+        let ident = ice.table_ident.clone();
+        plant_unreadable_deltas(&ice.cached_table_entry(&ident).await.unwrap(), 16).await;
+
+        assert!(
+            matches!(
+                ice.predicate_count_tier1("events", "host").await.unwrap(),
+                Tier1GroupCountsFold::NotInspected
+            ),
+            "cold, with nothing cached, the bounded lookup refuses"
+        );
+
+        // Some other query pays Tier-2 once and caches the exact result under
+        // `(table, snapshot, column)`. The bounded path must keep serving from
+        // it rather than send an answerable shape to a scan.
+        let exact = ice
+            .grouped_counts_with_summary("events", "host", None, None)
+            .await
+            .unwrap()
+            .expect("Tier-2 answers from the per-file footers");
+        assert_eq!(exact.source_label(), "materialized");
+
+        let Tier1GroupCountsFold::Hit { rows, .. } =
+            ice.predicate_count_tier1("events", "host").await.unwrap()
+        else {
+            panic!("a warm snapshot-keyed entry is exact and free; it must be kept");
+        };
+        let mut total = 0u64;
+        rows.for_each(|_, count| total += count);
+        assert_eq!(total, 4_100);
     }
 }

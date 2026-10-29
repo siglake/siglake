@@ -620,3 +620,54 @@ owned bounded collector with a full sort. The latter covers string, integer and
 float ordering; ascending and descending count/key sorts; dense ties; NULL;
 forward and reverse input; LIMIT 1 through the full input; and a winner arriving
 last. The existing full decoder remains covered independently.
+
+## The read side is bounded for predicate counts (0.3.0, 2026-10-29, #7787)
+
+The fold is background work on the compactor's cadence, but a READER still has
+to catch up with whatever the compactor has not absorbed yet. `read_path`
+below Tier-1 lists `siglake-agg-deltas/` and GETs every outstanding delta
+before it can decide whether the column is even covered. That is the design's
+intent for a caller with no alternative, and it is bounded by the fold cadence
+— until the cadence stops keeping up. On the aged `query_audit` table of the
+2026-10-29 burn it did: 43,042 outstanding deltas, ahead of a Tier-2 fallback
+over 8 files. `SELECT count(*) … WHERE col = 'v'`, answer `1`, spent its whole
+30s deadline in metadata. Two 30s timeouts were followed by seven passes at
+17.7s and 21.97s against the same immutable snapshot, and the same-process
+repeat was 11ms — the signature of a cost paid once per process per
+generation, not of a slow table. (Note for anyone reading the counters: the
+`siglake_group_count_deltas_folded` histogram is recorded BEFORE the reads, so
+a sample is proof of a listing, not of completed GETs.)
+
+Raising the fold cadence does not fix the shape, because the reader's cost is
+unbounded in a quantity the reader does not control. Bounding the reader does.
+`predicate_count_tier1` / `qualified_predicate_count_tier1` are a
+request-only entry point under `ColdWideFold::Forbidden`:
+
+- a warm snapshot-keyed result-cache entry, the inline side object, and a wide
+  aggregate already memoized for this table generation all still answer, with
+  the same `total == record_count` guard and the same NULL-group handling;
+- a cold wide aggregate returns `NotInspected` BEFORE the listing. Nothing is
+  listed, GET, folded, spawned, or memoized — in particular no miss is written
+  to the entry's memo, which would be a false negative for the generation's
+  life;
+- a decoded-but-short, sketched or otherwise unusable aggregate returns
+  `Refused`, which is a refusal and not a zero.
+
+Maintenance, the census, the rebuild and the generic
+`grouped_counts_with_summary` keep `ColdWideFold::Allowed` unchanged: they are
+the callers that have no second way to an exact answer.
+
+The query server routes only the POSITIVE `=` / `IN` polarity of the
+dimensional-count fast path through it, and on a refusal returns `None` from
+the whole fast path so the planner's filtered scan answers the query exactly.
+Returning `None` out of `grouped_counts_with_summary` instead would have
+entered Tier-2's whole-column footer sum, which is the cost being refused. A
+negation and an integer range keep the unbounded lookup: neither is
+bloom-prunable, so handing them back is the full scan this fast path exists to
+avoid. The cost accepted in exchange is in `LIMITATIONS.md` — a
+low-selectivity equality on a short-aggregate column now scans rather than
+summing footers.
+
+This is source work. It has not been run against the aged table, and no claim
+is made here that the observed cold failures are fixed; that needs an exact
+image and a retained-state run.

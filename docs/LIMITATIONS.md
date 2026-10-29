@@ -1796,6 +1796,24 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   event-time twin was excluded from inferred dimensions may still report that
   column as short until the inline aggregate is rebuilt; the read guard refuses
   the short column, so exact SQL answers continue through the per-file path.
+- **An equality / `IN` count never reaches Tier-2.** The dimensional-count fast
+  path refuses a COLD wide aggregate for a positive `WHERE col = 'v'` or
+  `col IN (…)` count rather than list the delta directory and fold every
+  outstanding delta, and the shape then goes to the planner's filtered scan
+  instead of to the Tier-2 per-file footer sum
+  (`crates/siglake-storage/src/iceberg.rs`, `predicate_count_tier1`). The
+  answer stays exact either way. What changes is the cost on the one shape
+  where Tier-2 would have been the cheaper of the two: a LOW-selectivity
+  equality on a column whose inline aggregate is short — a column above the
+  4096-entry inline cap, or an aggregate left stale by a retention or delete
+  commit — now scans the matching files instead of summing a footer per live
+  file at zero scan. Selectivity is not known before the scan, so there is no
+  gate on it; a high-cardinality column, where equality is selective and a cold
+  fold is most expensive, is the case this is tuned for. A negation
+  (`!=`, `NOT IN`) and an integer range keep the unbounded lookup, because
+  neither has a bloom-prunable alternative. Warm aggregates are unaffected:
+  inline hits, already-folded wide aggregates and warm snapshot-keyed
+  result-cache entries all still serve at zero scan.
 - **The short-aggregate census reports more than it repairs.** Every 15 minutes
   the maintenance pass finds a maintained column short of `total-records` with
   every commit's contribution accounted for and fires

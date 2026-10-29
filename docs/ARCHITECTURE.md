@@ -1675,6 +1675,22 @@ side-object aggregates and per-file footers — `rows_scanned: 0`, typically
 single-digit milliseconds warm — with core-plus-boundary decomposition for
 arbitrary windows and strict validity guards before any fast path is trusted.
 
+**A predicate count never waits on a cold aggregate.** The dimensional-count
+fast path serves `WHERE col = 'v'` / `IN (…)` and `!= 'v'` / `NOT IN (…)` from
+the same per-value counts, but the two polarities have different alternatives
+and are now bounded differently. A negation cannot be bloom-pruned — absence is
+unprovable — so it still folds whatever the aggregate costs. A positive
+equality or `IN` count can be answered exactly by the planner's filtered scan,
+which prunes to the files holding the value, so it asks only for an aggregate
+already paid for: a warm snapshot-keyed result-cache entry, the inline side
+object, or a wide aggregate some earlier caller already folded for this table
+generation. A cold wide aggregate is refused *before* the delta directory is
+listed, and the shape goes back to the planner. The refusal leaves no memoized
+miss and never answers zero. The cost it declines is not hypothetical: an aged
+`query_audit` table carried 43,042 outstanding delta objects ahead of an
+8-file Tier-2 fallback, and a `COUNT` whose answer was `1` spent its whole 30s
+deadline listing and reading them.
+
 **Ordered early-stop (WS-3).** `ORDER BY timestamp … LIMIT n` — plain or
 windowed — early-stops without a blocking sort: the scan advertises the
 table's declared direction when partitions are single files or time-disjoint
