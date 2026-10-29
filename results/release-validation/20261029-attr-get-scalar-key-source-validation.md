@@ -27,9 +27,12 @@ and owned call arguments are constructed outside each timed region.
 
 Commands and exits:
 
+The managed run set `PREPARATION_DIR` to the task's immutable input directory;
+its machine-local value is excluded from this public report.
+
 ```text
-sha256sum /home/todd/workspace/loglake-manager/var/investigations/20261028-signoz-events-links-followthrough-a1/layout-performance-next-steps-a1/microbenchmark-preparation/* # 0
-jq -S '.cases' /home/todd/workspace/loglake-manager/var/investigations/20261028-signoz-events-links-followthrough-a1/layout-performance-next-steps-a1/microbenchmark-preparation/semantic-cases.json > "$TMPDIR/7763-prepared-cases.json"
+sha256sum "$PREPARATION_DIR"/*                                             # 0
+jq -S '.cases' "$PREPARATION_DIR/semantic-cases.json" > "$TMPDIR/7763-prepared-cases.json"
 jq -S '.cases' crates/siglake-query-server/src/testdata/attr_get_semantic_cases.json > "$TMPDIR/7763-rebased-cases.json"
 cmp "$TMPDIR/7763-prepared-cases.json" "$TMPDIR/7763-rebased-cases.json"      # 0
 cargo test -p siglake-query-server attr_scalar_key_candidate -- --nocapture # 0
@@ -42,4 +45,3 @@ The focused run passed three tests and ignored the benchmark. The crate run
 passed all normal targets; ignored tests remained ignored. The timed benchmark
 was not run, so this report makes no latency, allocation-reduction, native,
 API, or production-speedup claim.
-
