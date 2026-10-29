@@ -226,6 +226,18 @@ impl PlanContext {
         // TODO: Ideally we could ditch this intermediate Vec as we return an iterator.
         let mut filtered_mfcs = vec![];
         for manifest_file in manifest_files {
+            // A Data manifest with explicit zero added and existing file counts
+            // cannot contribute a live scan task. Deleted entries remain in the
+            // metadata for commit validation, but scanning need not read them.
+            // Missing counts are unknown, and Delete manifests retain their
+            // existing ordering and processing regardless of these counts.
+            if manifest_file.content == ManifestContentType::Data
+                && manifest_file.added_files_count == Some(0)
+                && manifest_file.existing_files_count == Some(0)
+            {
+                continue;
+            }
+
             let tx = if manifest_file.content == ManifestContentType::Deletes {
                 delete_file_tx.clone()
             } else {

@@ -1474,6 +1474,12 @@ IO), per-tier ceilings clamp per-request limits, a mid-flight rows-scanned
 breaker aborts runaway scans at batch boundaries, and a wall-clock timeout
 backs everything.
 
+The vendored scan planner omits Data manifests whose list records explicitly
+report zero added and zero existing files. This is a scan-only optimization:
+the tombstone manifests remain in Iceberg metadata for commit validation.
+Unknown counts and Delete manifests are still read, so missing summary fields
+or live position/equality deletes cannot be hidden by the shortcut.
+
 Clipped UTF-8 equality scans expose internal counts for data files rejected by
 manifest metrics, row groups rejected by Parquet statistics, page-selected
 rows, and rows accepted by the Parquet predicate. A bounded, snapshot-keyed

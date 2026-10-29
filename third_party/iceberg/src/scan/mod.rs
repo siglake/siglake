@@ -723,8 +723,9 @@ pub mod tests {
     use crate::scan::FileScanTask;
     use crate::spec::{
         DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, DataFileBuilder, DataFileFormat, Datum,
-        Literal, ManifestEntry, ManifestListWriter, ManifestStatus, ManifestWriterBuilder,
-        NestedField, PartitionSpec, PrimitiveType, Schema, Struct, StructType, TableMetadata, Type,
+        Literal, ManifestEntry, ManifestList, ManifestListWriter, ManifestStatus,
+        ManifestWriterBuilder, NestedField, PartitionSpec, PrimitiveType, Schema, Struct,
+        StructType, TableMetadata, Type,
     };
     use crate::table::Table;
     use crate::test_utils::test_runtime;
@@ -739,6 +740,7 @@ pub mod tests {
     pub struct TableTestFixture {
         pub table_location: String,
         pub table: Table,
+        _tmp_dir: TempDir,
     }
 
     impl TableTestFixture {
@@ -782,6 +784,7 @@ pub mod tests {
             Self {
                 table_location: table_location.to_str().unwrap().to_string(),
                 table,
+                _tmp_dir: tmp_dir,
             }
         }
 
@@ -821,6 +824,7 @@ pub mod tests {
             Self {
                 table_location: table_location.to_str().unwrap().to_string(),
                 table,
+                _tmp_dir: tmp_dir,
             }
         }
 
@@ -855,6 +859,7 @@ pub mod tests {
             Self {
                 table_location: table_location.to_str().unwrap().to_string(),
                 table,
+                _tmp_dir: tmp_dir,
             }
         }
 
@@ -904,6 +909,7 @@ pub mod tests {
             Self {
                 table_location: table_location.to_str().unwrap().to_string(),
                 table,
+                _tmp_dir: tmp_dir,
             }
         }
 
@@ -1352,6 +1358,329 @@ pub mod tests {
                 .unwrap();
             manifest_list_write.close().await.unwrap();
         }
+    }
+
+    async fn fixture_with_missing_manifests(
+        added: Option<u32>,
+        existing: Option<u32>,
+        content: crate::spec::ManifestContentType,
+        missing_count: usize,
+        keep_live: bool,
+    ) -> TableTestFixture {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_manifest_files().await;
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let list = snapshot
+            .load_manifest_list(fixture.table.file_io(), fixture.table.metadata())
+            .await
+            .unwrap();
+        let mut missing = list.entries()[0].clone();
+        missing.content = content;
+        missing.added_files_count = added;
+        missing.existing_files_count = existing;
+        missing.deleted_files_count = Some(1);
+        missing.added_rows_count = added.map(u64::from);
+        missing.existing_rows_count = existing.map(u64::from);
+        missing.deleted_rows_count = Some(1);
+
+        let mut entries = Vec::with_capacity(missing_count + usize::from(keep_live));
+        for index in 0..missing_count {
+            let mut entry = missing.clone();
+            entry.manifest_path = format!(
+                "{}/metadata/never-written-{index}.avro",
+                fixture.table_location
+            );
+            assert!(!std::path::Path::new(&entry.manifest_path).exists());
+            entries.push(entry);
+        }
+        if keep_live {
+            entries.extend(list.entries().iter().cloned());
+        }
+
+        let replacement_manifest_list = format!(
+            "{}/metadata/manifest-list-{}.avro",
+            fixture.table_location,
+            Uuid::new_v4()
+        );
+        let output = fixture
+            .table
+            .file_io()
+            .new_output(&replacement_manifest_list)
+            .unwrap();
+        let mut writer = ManifestListWriter::v2(
+            output.writer().await.unwrap(),
+            snapshot.snapshot_id(),
+            snapshot.parent_snapshot_id(),
+            snapshot.sequence_number(),
+        );
+        writer.add_manifests(entries.into_iter()).unwrap();
+        writer.close().await.unwrap();
+
+        // Manifest lists are immutable Iceberg objects. Point a cloned snapshot
+        // at the replacement rather than overwriting setup_manifest_files' list.
+        let mut metadata = fixture.table.metadata().clone();
+        let snapshot_id = snapshot.snapshot_id();
+        let mut replacement_snapshot = snapshot.as_ref().clone();
+        replacement_snapshot.manifest_list = replacement_manifest_list;
+        metadata
+            .snapshots
+            .insert(snapshot_id, Arc::new(replacement_snapshot));
+        fixture.table = Table::builder()
+            .metadata(metadata)
+            .identifier(fixture.table.identifier().clone())
+            .file_io(fixture.table.file_io().clone())
+            .metadata_location(fixture.table.metadata_location().unwrap().to_string())
+            .runtime(test_runtime())
+            .build()
+            .unwrap();
+        fixture
+    }
+
+    #[tokio::test]
+    async fn test_zero_live_data_manifests_are_not_fetched_on_repeated_plans() {
+        const ZERO_LIVE_MANIFESTS: usize = 14_378;
+        let fixture = fixture_with_missing_manifests(
+            Some(0),
+            Some(0),
+            crate::spec::ManifestContentType::Data,
+            ZERO_LIVE_MANIFESTS,
+            true,
+        )
+        .await;
+        let scan = fixture
+            .table
+            .scan()
+            .with_filter(Reference::new("y").equal_to(Datum::long(2)))
+            .with_concurrency_limit(1)
+            .build()
+            .unwrap();
+
+        let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+        let manifest_list = Arc::new(
+            snapshot
+                .load_manifest_list(fixture.table.file_io(), fixture.table.metadata())
+                .await
+                .unwrap(),
+        );
+        let (data_tx, _data_rx) = futures::channel::mpsc::channel(1);
+        let (delete_manifest_tx, _delete_manifest_rx) = futures::channel::mpsc::channel(1);
+        let (delete_index, delete_file_tx) = super::DeleteFileIndex::new(scan.runtime.clone());
+        drop(delete_file_tx);
+        let contexts = scan
+            .plan_context
+            .as_ref()
+            .unwrap()
+            .build_manifest_file_contexts(
+                manifest_list,
+                data_tx,
+                delete_index,
+                delete_manifest_tx,
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            contexts.len(),
+            1,
+            "only the live manifest may reach the manifest-read stage"
+        );
+
+        for pass in 0..3 {
+            let mut paths = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                scan.plan_files()
+                    .await
+                    .unwrap()
+                    .map_ok(|task| task.data_file_path)
+                    .try_collect::<Vec<_>>()
+                    .await
+            })
+            .await
+            .expect("plan must terminate")
+            .expect("known-zero Data manifests must not be fetched");
+            paths.sort();
+            assert_eq!(
+                paths,
+                vec![
+                    format!("{}/1.parquet", fixture.table_location),
+                    format!("{}/3.parquet", fixture.table_location),
+                ],
+                "cold/warm pass {pass}"
+            );
+        }
+
+        for pass in 0..3 {
+            let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                scan.to_arrow()
+                    .await
+                    .unwrap()
+                    .try_fold(0_usize, |rows, batch| async move {
+                        Ok(rows + batch.num_rows())
+                    })
+                    .await
+            })
+            .await
+            .expect("filtered scan must terminate")
+            .expect("known-zero Data manifests must not affect filtered rows");
+            assert_eq!(rows, 1_024, "filtered cold/warm pass {pass}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_all_zero_live_data_manifests_finish_empty() {
+        let fixture = fixture_with_missing_manifests(
+            Some(0),
+            Some(0),
+            crate::spec::ManifestContentType::Data,
+            5,
+            false,
+        )
+        .await;
+        let scan = fixture
+            .table
+            .scan()
+            .with_concurrency_limit(1)
+            .build()
+            .unwrap();
+        let tasks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            scan.plan_files()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .expect("empty plan must terminate")
+        .unwrap();
+        assert!(tasks.is_empty(), "unexpected tasks: {tasks:#?}");
+    }
+
+    #[tokio::test]
+    async fn test_positive_and_delete_manifest_counts_are_fetched() {
+        use crate::spec::ManifestContentType::{Data, Deletes};
+
+        for (added, existing, content) in [
+            (Some(1), Some(0), Data),
+            (Some(0), Some(1), Data),
+            (Some(0), Some(0), Deletes),
+        ] {
+            let fixture =
+                fixture_with_missing_manifests(added, existing, content, 1, false).await;
+            let scan = fixture
+                .table
+                .scan()
+                .with_concurrency_limit(1)
+                .build()
+                .unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                scan.plan_files()
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+            })
+            .await
+            .expect("required missing-manifest fetch must return rather than hang");
+            assert!(
+                result.is_err(),
+                "manifest with added={added:?}, existing={existing:?}, content={content:?} must be fetched"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_data_manifest_counts_are_fetched() {
+        for (added, existing) in [
+            (None, Some(0)),
+            (Some(0), None),
+            (None, None),
+        ] {
+            let mut fixture = TableTestFixture::new();
+            fixture.setup_manifest_files().await;
+            let snapshot = fixture.table.metadata().current_snapshot().unwrap();
+            let list = snapshot
+                .load_manifest_list(fixture.table.file_io(), fixture.table.metadata())
+                .await
+                .unwrap();
+            let mut missing = list.entries()[0].clone();
+            missing.manifest_path = format!(
+                "{}/metadata/unknown-counts-never-written.avro",
+                fixture.table_location
+            );
+            missing.added_files_count = added;
+            missing.existing_files_count = existing;
+
+            let scan = fixture
+                .table
+                .scan()
+                .with_concurrency_limit(1)
+                .build()
+                .unwrap();
+            let (data_tx, _data_rx) = futures::channel::mpsc::channel(1);
+            let (delete_manifest_tx, _delete_manifest_rx) =
+                futures::channel::mpsc::channel(1);
+            let (delete_index, delete_file_tx) =
+                super::DeleteFileIndex::new(scan.runtime.clone());
+            drop(delete_file_tx);
+            let mut contexts = scan
+                .plan_context
+                .as_ref()
+                .unwrap()
+                .build_manifest_file_contexts(
+                    Arc::new(ManifestList::new(vec![missing])),
+                    data_tx,
+                    delete_index,
+                    delete_manifest_tx,
+                )
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(contexts.len(), 1, "unknown counts must retain the context");
+            let error = contexts
+                .pop()
+                .unwrap()
+                .fetch_manifest_and_stream_manifest_entries()
+                .await
+                .expect_err("unknown counts must retain the manifest fetch");
+            assert!(
+                error.to_string().contains("unknown-counts-never-written"),
+                "unexpected missing-manifest error: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropped_plan_stream_drains_before_a_warm_replan() {
+        let mut fixture = TableTestFixture::new();
+        fixture.setup_deadlock_manifests().await;
+        let scan = fixture
+            .table
+            .scan()
+            .with_concurrency_limit(1)
+            .build()
+            .unwrap();
+
+        let mut abandoned = scan.plan_files().await.unwrap();
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            abandoned.try_next(),
+        )
+        .await
+        .expect("first plan must produce a task")
+        .expect("first plan must not fail");
+        assert!(first.is_some());
+        drop(abandoned);
+
+        let tasks = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            scan.plan_files()
+                .await
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+        })
+        .await
+        .expect("warm replan must not inherit blocked channel work")
+        .expect("warm replan must complete after cancellation");
+        assert_eq!(tasks.len(), 10);
     }
 
     #[tokio::test]
