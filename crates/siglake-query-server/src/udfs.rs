@@ -1187,14 +1187,13 @@ mod tests {
                                 )
                             })
                             .collect();
-                        let udf = AttrGetUdf::new();
                         let start = std::time::Instant::now();
                         let (_, count) = allocations(|| {
                             for args in args {
                                 let out = if candidate {
                                     attr_scalar_key_candidate(args)
                                 } else {
-                                    udf.invoke_with_args(args)
+                                    attr_scalar_key_baseline(args)
                                 };
                                 std::hint::black_box(out.unwrap());
                             }
