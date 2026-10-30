@@ -953,8 +953,8 @@ mod tests {
         }
     }
 
-    // Frozen from the owned helper at main 1c69e5c. Keeping the scanner and
-    // decoder here makes the timing baseline independent of production.
+    // Frozen from the owned helper at main 1c69e5c. This remains an untimed
+    // independent semantic oracle for the shared helper and baseline UDF.
     mod attr_owned_baseline {
         pub(super) fn json_attr_lookup(attributes: &str, key: &str) -> Option<String> {
             let raw = find_value_path(attributes, key)?;
@@ -1123,7 +1123,7 @@ mod tests {
                         builder.append_null();
                         continue;
                     }
-                    match attr_owned_baseline::json_attr_lookup(attrs.value(i), key.unwrap()) {
+                    match siglake_core::json_attr_lookup(attrs.value(i), key.unwrap()) {
                         Some(value) => builder.append_value(&value),
                         None => builder.append_null(),
                     }
@@ -1139,7 +1139,7 @@ mod tests {
                     builder.append_null();
                     continue;
                 }
-                match attr_owned_baseline::json_attr_lookup(attrs.value(i), keys.value(i)) {
+                match siglake_core::json_attr_lookup(attrs.value(i), keys.value(i)) {
                     Some(value) => builder.append_value(&value),
                     None => builder.append_null(),
                 }
@@ -1191,6 +1191,116 @@ mod tests {
         } else {
             attr_scalar_key_baseline(args)
         }
+    }
+
+    fn assert_shared_baseline_matches_owned_oracle(attributes: Option<&str>, key: Option<&str>) {
+        let oracle = attributes
+            .zip(key)
+            .and_then(|(attributes, key)| attr_owned_baseline::json_attr_lookup(attributes, key));
+        let shared = attributes
+            .zip(key)
+            .and_then(|(attributes, key)| siglake_core::json_attr_lookup(attributes, key));
+        assert_eq!(shared, oracle);
+
+        let scalar = AttrGetOwnedBaselineUdf::new()
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Scalar(ScalarValue::Utf8(attributes.map(str::to_owned))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(key.map(str::to_owned))),
+                1,
+            ))
+            .unwrap();
+        assert_eq!(attr_scalar_key_values(scalar, 1), vec![oracle.clone()]);
+
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![attributes]));
+        let keys: Arc<dyn Array> = Arc::new(StringArray::from(vec![key]));
+        let array = AttrGetOwnedBaselineUdf::new()
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Array(attrs),
+                ColumnarValue::Array(keys),
+                1,
+            ))
+            .unwrap();
+        assert_eq!(attr_scalar_key_values(array, 1), vec![oracle]);
+    }
+
+    #[test]
+    fn attr_shared_baseline_matches_frozen_owned_oracle() {
+        let conditions = attr_benchmark_conditions();
+        assert_eq!(conditions.len(), 27);
+        for condition in &conditions {
+            assert_shared_baseline_matches_owned_oracle(
+                Some(&condition.attributes),
+                Some(condition.key),
+            );
+        }
+
+        for (attributes, key) in [
+            (Some(r#"{"a":{"b":"nested"},"a.b":"literal"}"#), Some("a.b")),
+            (
+                Some(r#"{"a":{"b":"first"},"a":{"b":"second"}}"#),
+                Some("a.b"),
+            ),
+            (Some(r#"{"a":{"b":"nested"},"a.b":null}"#), Some("a.b")),
+            (Some(r#"{"a":{"b":"nested"},"a.b":tru}"#), Some("a.b")),
+            (Some(r#"{"a":{"b":"nested"},"broken":"#), Some("a.b")),
+            (Some(r#"{"broken":,"a":{"b":"nested"}}"#), Some("a.b")),
+            (
+                Some(r#"{"a":{"b":"nested"},"a.b":"unterminated}"#),
+                Some("a.b"),
+            ),
+            (
+                Some(r#"{"a":{"b":"nested"},"a\u002eb":"escaped-literal"}"#),
+                Some("a.b"),
+            ),
+            (Some(r#"{"\u0061":{"b":"escaped-head"}}"#), Some("a.b")),
+            (Some(r#"{"target":"null-key"}"#), None),
+            (None, Some("target")),
+        ] {
+            assert_shared_baseline_matches_owned_oracle(attributes, key);
+        }
+
+        let utf8_attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![r#"{"x":1}"#]));
+        let int_attrs: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        let int_keys: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        for (attrs, key, expected) in [
+            (
+                ColumnarValue::Array(int_attrs),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("x".to_owned()))),
+                "attributes must be Utf8",
+            ),
+            (
+                ColumnarValue::Array(utf8_attrs.clone()),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
+                "key must be Utf8",
+            ),
+            (
+                ColumnarValue::Array(utf8_attrs),
+                ColumnarValue::Array(int_keys),
+                "key must be Utf8",
+            ),
+        ] {
+            let error = AttrGetOwnedBaselineUdf::new()
+                .invoke_with_args(attr_scalar_key_args(attrs, key, 1))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let output = {
+            let attributes = String::from(r#"{"a":{"b":"nested-source"}}"#);
+            let key = String::from("a.b");
+            AttrGetOwnedBaselineUdf::new()
+                .invoke_with_args(attr_scalar_key_args(
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(attributes))),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(key))),
+                    2,
+                ))
+                .unwrap()
+        };
+        assert_eq!(
+            attr_scalar_key_values(output, 2),
+            vec![Some("nested-source".to_owned()); 2]
+        );
     }
 
     #[test]
