@@ -5,7 +5,7 @@
 mod free_page_reclaim;
 pub use free_page_reclaim::{reclaim_allocator_free_pages, AllocatorFreePageReclaim};
 mod json_attr;
-pub use json_attr::json_attr_lookup;
+pub use json_attr::{json_attr_lookup, PreparedDottedJsonAttrKey};
 pub mod audit_schema;
 mod build_info;
 pub mod index_config;

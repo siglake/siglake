@@ -77,7 +77,7 @@ pub fn register_udfs(ctx: &SessionContext) {
     )));
 }
 
-use siglake_core::json_attr_lookup;
+use siglake_core::{json_attr_lookup, PreparedDottedJsonAttrKey};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct AttrGetUdf {
@@ -117,6 +117,19 @@ impl ScalarUDFImpl for AttrGetUdf {
             let n = args.number_rows;
             let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
             let mut builder = StringBuilder::with_capacity(n, n * 16);
+            if let Some(prepared) = key.and_then(PreparedDottedJsonAttrKey::new) {
+                for i in 0..n {
+                    if attrs.is_null(i) {
+                        builder.append_null();
+                        continue;
+                    }
+                    match prepared.lookup(attrs.value(i)) {
+                        Some(value) => builder.append_value(&value),
+                        None => builder.append_null(),
+                    }
+                }
+                return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+            }
             for i in 0..n {
                 if attrs.is_null(i) || key.is_none() {
                     builder.append_null();
@@ -1316,6 +1329,72 @@ mod tests {
     }
 
     #[test]
+    fn attr_get_scalar_dotted_specialization_preserves_legacy_edges() {
+        let attributes = vec![
+            Some(r#"{"a":{"b":"nested"},"a.b":"literal"}"#),
+            Some(r#"{"a":{"b":"first"},"a":{"b":"second"}}"#),
+            Some(r#"{"a":{"b":"nested"},"a.b":null}"#),
+            Some(r#"{"a":{"b":"nested"},"a.b":tru}"#),
+            Some(r#"{"a":{"b":"nested"},"broken":"#),
+            Some(r#"{"broken":,"a":{"b":"nested"}}"#),
+            Some(r#"{"a":{"b":"nested"},"a.b":"unterminated}"#),
+            Some(r#"{"a":{"b":"nested"},"a\u002eb":"escaped-literal"}"#),
+            Some(r#"{"\u0061":{"b":"escaped-head"}}"#),
+            None,
+        ];
+        let expected = vec![
+            Some("literal".to_owned()),
+            Some("first".to_owned()),
+            None,
+            None,
+            Some("nested".to_owned()),
+            None,
+            Some("nested".to_owned()),
+            Some("escaped-literal".to_owned()),
+            Some("escaped-head".to_owned()),
+            None,
+        ];
+        let number_rows = attributes.len();
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(attributes));
+        let scalar_key = ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".to_owned())));
+        let baseline = invoke_attr_scalar_key(
+            false,
+            ColumnarValue::Array(attrs.clone()),
+            scalar_key.clone(),
+            number_rows,
+        )
+        .unwrap();
+        let candidate = invoke_attr_scalar_key(
+            true,
+            ColumnarValue::Array(attrs.clone()),
+            scalar_key,
+            number_rows,
+        )
+        .unwrap();
+        assert_attr_outputs_equal(baseline, candidate.clone(), number_rows);
+        assert_eq!(attr_scalar_key_values(candidate, number_rows), expected);
+
+        let array_keys: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some("a.b"); number_rows]));
+        let baseline = invoke_attr_scalar_key(
+            false,
+            ColumnarValue::Array(attrs.clone()),
+            ColumnarValue::Array(array_keys.clone()),
+            number_rows,
+        )
+        .unwrap();
+        let candidate = invoke_attr_scalar_key(
+            true,
+            ColumnarValue::Array(attrs),
+            ColumnarValue::Array(array_keys),
+            number_rows,
+        )
+        .unwrap();
+        assert_attr_outputs_equal(baseline, candidate.clone(), number_rows);
+        assert_eq!(attr_scalar_key_values(candidate, number_rows), expected);
+    }
+
+    #[test]
     fn attr_scalar_key_candidate_accepts_scalar_attributes() {
         for n in [0, 1, 128, 4096] {
             let attrs = ColumnarValue::Scalar(ScalarValue::Utf8(Some(
@@ -1455,6 +1534,29 @@ mod tests {
         assert_eq!(output.value(0), "borrowed-source");
         assert_eq!(output.value(1), "escaped\nsource");
         assert!(output.is_null(2));
+
+        let dotted_output = {
+            let attributes: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+                Some(r#"{"a":{"b":"nested-source"}}"#),
+                Some(r#"{"a":{"b":"nested"},"a.b":"literal-source"}"#),
+            ]));
+            attr_scalar_key_array(
+                invoke_attr_scalar_key(
+                    true,
+                    ColumnarValue::Array(attributes),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".to_owned()))),
+                    2,
+                )
+                .unwrap(),
+                2,
+            )
+        };
+        let dotted_output = dotted_output
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(dotted_output.value(0), "nested-source");
+        assert_eq!(dotted_output.value(1), "literal-source");
     }
 
     struct AttrBenchmarkCondition {
@@ -1470,6 +1572,23 @@ mod tests {
                 json.push(',');
             }
             json.push_str(&format!(r#""field_{i}":"value-{i}""#));
+        }
+        json.push('}');
+        json
+    }
+
+    fn attr_benchmark_literal_dotted_object(position: usize) -> String {
+        assert!(position < 32);
+        let mut json = String::from("{");
+        for i in 0..32 {
+            if i > 0 {
+                json.push(',');
+            }
+            if i == position {
+                json.push_str(r#""customer.segment":"target-value""#);
+            } else {
+                json.push_str(&format!(r#""field_{i}":"value-{i}""#));
+            }
         }
         json.push('}');
         json
@@ -1595,6 +1714,18 @@ mod tests {
                 key: "target",
             },
         ]);
+        conditions.extend([
+            AttrBenchmarkCondition {
+                name: "fields32_literal_dotted_index15",
+                attributes: attr_benchmark_literal_dotted_object(15),
+                key: "customer.segment",
+            },
+            AttrBenchmarkCondition {
+                name: "fields32_literal_dotted_index31",
+                attributes: attr_benchmark_literal_dotted_object(31),
+                key: "customer.segment",
+            },
+        ]);
         conditions
     }
 
@@ -1602,8 +1733,10 @@ mod tests {
     const ATTR_BENCHMARK_WARMUPS: usize = 2;
     const ATTR_BENCHMARK_MEASURED_ROUNDS: usize = 7;
     const ATTR_BENCHMARK_ROWS_PER_SAMPLE: usize = 4096;
-    const ATTR_BENCHMARK_TIMED_ROWS: usize = 5_529_600;
-    const ATTR_BENCHMARK_TOTAL_LOOKUP_CEILING: usize = 6_000_000;
+    const ATTR_BENCHMARK_TIMED_ROWS: usize = 5_971_968;
+    const ATTR_BENCHMARK_TOTAL_LOOKUPS: usize = 6_436_718;
+    const ATTR_BENCHMARK_TOTAL_LOOKUP_CEILING: usize = 7_000_000;
+    const ATTR_BENCHMARK_ALLOCATION_RECORDS: usize = 168;
 
     fn attr_benchmark_invocations(row_count: usize) -> usize {
         ATTR_BENCHMARK_ROWS_PER_SAMPLE / row_count
@@ -1809,19 +1942,25 @@ mod tests {
     #[test]
     fn attr_get_arrow_benchmark_schedule_is_fixed_and_bounded() {
         let conditions = attr_benchmark_conditions();
-        assert_eq!(conditions.len(), 25);
+        assert_eq!(conditions.len(), 27);
         let rounds = ATTR_BENCHMARK_WARMUPS + ATTR_BENCHMARK_MEASURED_ROUNDS;
         let samples = conditions.len() * ATTR_BENCHMARK_ROW_COUNTS.len() * rounds * 2;
-        assert_eq!(samples, 1350);
+        assert_eq!(samples, 1458);
         let timed_rows = samples * ATTR_BENCHMARK_ROWS_PER_SAMPLE;
         assert_eq!(timed_rows, ATTR_BENCHMARK_TIMED_ROWS);
 
         let parity_rows = conditions.len() * 2 * ATTR_BENCHMARK_ROW_COUNTS.iter().sum::<usize>();
         let scalar_allocation_rows = parity_rows;
         let array_allocation_rows = 2 * ATTR_BENCHMARK_ROW_COUNTS.iter().sum::<usize>();
-        assert!(
-            timed_rows + parity_rows + scalar_allocation_rows + array_allocation_rows
-                <= ATTR_BENCHMARK_TOTAL_LOOKUP_CEILING
+        let total_lookups =
+            timed_rows + parity_rows + scalar_allocation_rows + array_allocation_rows;
+        assert_eq!(total_lookups, ATTR_BENCHMARK_TOTAL_LOOKUPS);
+        assert!(total_lookups <= ATTR_BENCHMARK_TOTAL_LOOKUP_CEILING);
+        let scalar_allocation_records = conditions.len() * ATTR_BENCHMARK_ROW_COUNTS.len() * 2;
+        let array_allocation_records = ATTR_BENCHMARK_ROW_COUNTS.len() * 2;
+        assert_eq!(
+            scalar_allocation_records + array_allocation_records,
+            ATTR_BENCHMARK_ALLOCATION_RECORDS
         );
         for row_count in ATTR_BENCHMARK_ROW_COUNTS {
             let invocations = attr_benchmark_invocations(row_count);
