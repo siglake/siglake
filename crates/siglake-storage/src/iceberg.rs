@@ -10779,6 +10779,7 @@ pub(crate) mod delta_io_probe {
         lists: AtomicUsize,
         delta_reads: AtomicUsize,
         base_loads: AtomicUsize,
+        bytes: AtomicUsize,
     }
 
     impl Counts {
@@ -10792,6 +10793,17 @@ pub(crate) mod delta_io_probe {
 
         pub(crate) fn base_loads(&self) -> usize {
             self.base_loads.load(Ordering::SeqCst)
+        }
+
+        /// Payload bytes GOT through this prefix — delta bodies plus the
+        /// folded base object.
+        ///
+        /// The fold reads through the aggregate `opendal::Operator`, not
+        /// through Iceberg's `FileIO`, so none of it reaches
+        /// `iceberg::arrow::object_store_bytes_read()`. Without this the fold
+        /// side of a footer-versus-fold comparison has no byte figure at all.
+        pub(crate) fn bytes(&self) -> usize {
+            self.bytes.load(Ordering::SeqCst)
         }
 
         /// Every aggregate-object operation this prefix has seen.
@@ -10827,6 +10839,14 @@ pub(crate) mod delta_io_probe {
         };
         field.fetch_add(1, Ordering::SeqCst);
     }
+
+    /// Payload bytes for a GET already counted by [`note`].
+    pub(crate) fn note_bytes(op: &opendal::Operator, bytes: usize) {
+        let Some(counts) = watched().lock().unwrap().get(&op.info().root()).cloned() else {
+            return;
+        };
+        counts.bytes.fetch_add(bytes, Ordering::SeqCst);
+    }
 }
 
 /// Read one delta. `None` means the object is gone — which is a real state, not
@@ -10840,7 +10860,12 @@ async fn read_group_count_delta(
     #[cfg(test)]
     delta_io_probe::note(op, delta_io_probe::Op::DeltaRead);
     match op.read(rel_path).await {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes.to_bytes()).ok()),
+        Ok(bytes) => {
+            let bytes = bytes.to_bytes();
+            #[cfg(test)]
+            delta_io_probe::note_bytes(op, bytes.len());
+            Ok(serde_json::from_slice(&bytes).ok())
+        }
         Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("read group-count delta {rel_path}")),
     }
@@ -10858,9 +10883,12 @@ async fn load_wide_group_counts(
             let bytes = op
                 .read(WIDE_GROUP_COUNTS_REL_PATH)
                 .await
-                .context("read wide group counts")?;
+                .context("read wide group counts")?
+                .to_bytes();
+            #[cfg(test)]
+            delta_io_probe::note_bytes(op, bytes.len());
             Ok((
-                serde_json::from_slice(&bytes.to_bytes()).ok(),
+                serde_json::from_slice(&bytes).ok(),
                 meta.etag().map(str::to_string),
             ))
         }
@@ -29246,6 +29274,35 @@ impl ChunkReader for RawPageColumnChunk {
     }
 }
 
+/// Bytes pulled through [`RawPageAsyncReader`] — the one choke point for the
+/// footer tier's per-file metadata reads and its raw-page fallback.
+///
+/// Those reads go through `FileIO` directly rather than through the
+/// instrumented Arrow reader, so `iceberg::arrow::object_store_bytes_read()`
+/// does not see them and a footer-versus-fold comparison has no byte figure
+/// for the footer side without this. Process-global: a reader must run its
+/// measurement with `--test-threads=1`.
+#[cfg(test)]
+pub(crate) mod footer_io_probe {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static READS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn note(bytes: u64) {
+        BYTES.fetch_add(bytes, Ordering::Relaxed);
+        READS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `(reads, bytes)` since the last reset, and zero them.
+    pub(crate) fn take() -> (u64, u64) {
+        (
+            READS.swap(0, Ordering::Relaxed),
+            BYTES.swap(0, Ordering::Relaxed),
+        )
+    }
+}
+
 struct RawPageAsyncReader {
     file_size: u64,
     reader: Box<dyn FileRead>,
@@ -29271,7 +29328,11 @@ impl parquet::arrow::async_reader::AsyncFileReader for RawPageAsyncReader {
         self.reader
             .read(range)
             .map(|result| {
-                result.map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))
+                let bytes =
+                    result.map_err(|err| parquet::errors::ParquetError::External(Box::new(err)))?;
+                #[cfg(test)]
+                footer_io_probe::note(bytes.len() as u64);
+                Ok(bytes)
             })
             .boxed()
     }
@@ -40195,5 +40256,512 @@ mod bounded_predicate_count_tests {
             .unwrap();
         assert_eq!(total_and_target(&second), (4_100, 1));
         assert_eq!(io.total(), 0, "the repeat must not fold either");
+    }
+}
+
+#[cfg(test)]
+mod predicate_count_tier_cost_measurement {
+    //! #7790 — what the footer tier costs against the cold wide fold it
+    //! declines, measured rather than assumed.
+    //!
+    //! #7787 left one comparison unmeasured
+    //! (`docs/DESIGN_incremental_group_count_aggregate.md`,
+    //! `docs/LIMITATIONS.md` "An equality / `IN` count is served below a cold
+    //! wide aggregate"): on the FIRST touch of a generation,
+    //! `predicate_count_tier1` pays one footer read per live file, while the
+    //! fold it declines would pay one LIST plus one GET per outstanding delta
+    //! plus the base object and its decode. Both land in the same
+    //! snapshot-keyed cache, so the comparison is once per generation per
+    //! column.
+    //!
+    //! These are reports, not gates: they print a table and assert only that
+    //! the two tiers agree exactly. Run them one at a time, because
+    //! `iceberg::arrow::object_store_bytes_read()` is process-global:
+    //!
+    //! ```text
+    //! cargo test --release -p siglake-storage --lib \
+    //!   predicate_count_tier_cost_measurement -- --ignored --nocapture --test-threads=1
+    //! ```
+    //!
+    //! Fold-side bytes come from [`delta_io_probe`]'s byte counter, not from
+    //! the FileIO counter: the fold reads through the aggregate
+    //! `opendal::Operator` and never touches `FileIO`.
+
+    use std::path::Path;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// A host with exactly one row — the selective shape.
+    const RARE_HOST: &str = "host-00007";
+    /// A host with half the table's rows — the broad-match shape.
+    const BROAD_HOST: &str = "host-broad";
+    /// Distinct rare hosts. Above the 4096 inline cap, so the inline side
+    /// object is always short and only the wide aggregate or the footer tier
+    /// can answer `host`.
+    const RARE_HOSTS: usize = 5_120;
+    /// Rows carrying [`BROAD_HOST`], held constant so total rows do not move
+    /// with the file count.
+    const BROAD_ROWS: usize = 5_120;
+    /// Wide cap that holds every distinct host exactly.
+    const WIDE_COVERS: usize = 10_000;
+    /// Wide cap one over the inline cap: deltas are on, but `host` is demoted
+    /// to a sketch, so a fold produces nothing usable and the footer tier
+    /// answers anyway — the aged `query_audit` shape.
+    const WIDE_SKETCHES: usize = BASE_GROUP_COUNT_CARDINALITY + 1;
+
+    fn ev(raw: &str, host: &str) -> Event {
+        let mut event = Event::now(raw.to_string());
+        event.host = host.to_string();
+        event
+    }
+
+    /// One batch per commit: a slice of the rare hosts plus an equal share of
+    /// the broad rows, so every file carries both shapes.
+    fn commits(files: usize) -> Vec<Vec<Event>> {
+        let rare_per_file = RARE_HOSTS.div_ceil(files);
+        let broad_per_file = BROAD_ROWS.div_ceil(files);
+        (0..files)
+            .map(|f| {
+                let lo = (f * rare_per_file).min(RARE_HOSTS);
+                let hi = ((f + 1) * rare_per_file).min(RARE_HOSTS);
+                let mut batch: Vec<Event> = (lo..hi)
+                    .map(|i| ev(&format!("event-{i}"), &format!("host-{i:05}")))
+                    .collect();
+                batch
+                    .extend((0..broad_per_file).map(|i| ev(&format!("broad-{f}-{i}"), BROAD_HOST)));
+                batch
+            })
+            .collect()
+    }
+
+    async fn open(dir: &Path, cardinality: usize) -> IcebergContext {
+        IcebergContext::open(dir)
+            .await
+            .unwrap()
+            .with_tuning(IcebergTuning {
+                table_group_count_cardinality: Some(cardinality),
+                result_caches: Some(false),
+                ..Default::default()
+            })
+    }
+
+    fn aggregate_op(cached: &CachedTableEntry) -> opendal::Operator {
+        aggregate_operator(&cached.table)
+            .unwrap()
+            .expect("the fixture table owns its aggregate prefix")
+    }
+
+    /// Extra delta names in the incarnation prefix, beyond the one each commit
+    /// wrote. This is how the fold's input grows independently of live files:
+    /// a compactor that has absorbed nothing leaves exactly this shape.
+    async fn plant_deltas(op: &opendal::Operator, count: usize) {
+        for seq in 0..count as i64 {
+            let body = serde_json::to_vec(&GroupCountDelta {
+                sequence_number: 900_000 + seq,
+                snapshot_id: None,
+                coverage_link: None,
+                group_counts: None,
+                sketches: None,
+            })
+            .unwrap();
+            op.write(&group_count_delta_rel_path(900_000 + seq), body)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Build a warehouse of `files` commits with `extra_deltas` planted delta
+    /// names, and return its directory.
+    async fn build(
+        tmp: &tempfile::TempDir,
+        cardinality: usize,
+        files: usize,
+        extra_deltas: usize,
+    ) -> std::path::PathBuf {
+        let dir = tmp.path().join("warehouse");
+        let ice = open(&dir, cardinality).await;
+        for batch in commits(files) {
+            ice.append_events(&batch).await.unwrap();
+        }
+        let ident = ice.table_ident.clone();
+        let cached = ice.cached_table_entry(&ident).await.unwrap();
+        plant_deltas(&aggregate_op(&cached), extra_deltas).await;
+        dir
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Tier {
+        /// `predicate_count_tier1` — the bounded lookup a positive `=` / `IN`
+        /// count takes. Declines a cold fold, lands on the footer sum.
+        Bounded,
+        /// `grouped_counts_with_summary` — the generic lookup, which folds.
+        Generic,
+    }
+
+    #[derive(Debug)]
+    struct Reading {
+        elapsed_ms: f64,
+        source: String,
+        /// Reads and bytes pulled through `RawPageAsyncReader`: the per-file
+        /// footer metadata reads and any raw-page fallback decode. This is the
+        /// footer tier's whole object-store bill.
+        footer_reads: u64,
+        footer_bytes: u64,
+        lists: usize,
+        delta_reads: usize,
+        base_loads: usize,
+        /// Bytes GOT through the aggregate prefix: delta bodies plus base.
+        agg_bytes: usize,
+        total: u64,
+        rare: u64,
+        broad: u64,
+    }
+
+    /// One FIRST TOUCH of a generation: a freshly opened context, so the entry
+    /// memo, the per-file footer cache and the snapshot aggregate cache are
+    /// all cold, exactly as they are for the first request after a commit.
+    ///
+    /// The table entry is warmed before the clock starts so neither arm is
+    /// charged for catalog metadata the other would also have paid.
+    async fn measure(dir: &Path, cardinality: usize, tier: Tier) -> Reading {
+        let ice = open(dir, cardinality).await;
+        let ident = ice.table_ident.clone();
+        let cached = ice.cached_table_entry(&ident).await.unwrap();
+        let io = delta_io_probe::watch(&aggregate_op(&cached));
+        drop(cached);
+
+        let _ = footer_io_probe::take();
+        let started = Instant::now();
+        let rows = match tier {
+            Tier::Bounded => ice.predicate_count_tier1("events", "host").await,
+            Tier::Generic => {
+                ice.grouped_counts_with_summary("events", "host", None, None)
+                    .await
+            }
+        }
+        .unwrap()
+        .expect("every shape here is answerable");
+        let elapsed = started.elapsed();
+        let (footer_reads, footer_bytes) = footer_io_probe::take();
+
+        let (mut total, mut rare, mut broad) = (0u64, 0u64, 0u64);
+        rows.for_each(|key, count| {
+            total += count;
+            match key {
+                Some(RARE_HOST) => rare = count,
+                Some(BROAD_HOST) => broad = count,
+                _ => {}
+            }
+        });
+        Reading {
+            elapsed_ms: elapsed.as_secs_f64() * 1e3,
+            source: rows.source_label().to_string(),
+            footer_reads,
+            footer_bytes,
+            lists: io.lists(),
+            delta_reads: io.delta_reads(),
+            base_loads: io.base_loads(),
+            agg_bytes: io.bytes(),
+            total,
+            rare,
+            broad,
+        }
+    }
+
+    fn header(title: &str) {
+        println!("\n## {title}");
+        println!(
+            "{:>6} {:>8} {:>8} {:>13} {:>11} {:>6} {:>7} {:>6} {:>11} {:>8} {:>11} {:>5} {:>6}",
+            "files",
+            "deltas",
+            "tier",
+            "source",
+            "elapsed_ms",
+            "lists",
+            "d_gets",
+            "bases",
+            "agg_bytes",
+            "f_reads",
+            "footer_B",
+            "rare",
+            "broad",
+        );
+    }
+
+    fn row(files: usize, deltas: usize, tier: Tier, r: &Reading) {
+        println!(
+            "{:>6} {:>8} {:>8} {:>13} {:>11.2} {:>6} {:>7} {:>6} {:>11} {:>8} {:>11} {:>5} {:>6}",
+            files,
+            deltas,
+            match tier {
+                Tier::Bounded => "bounded",
+                Tier::Generic => "generic",
+            },
+            r.source,
+            r.elapsed_ms,
+            r.lists,
+            r.delta_reads,
+            r.base_loads,
+            r.agg_bytes,
+            r.footer_reads,
+            r.footer_bytes,
+            r.rare,
+            r.broad,
+        );
+    }
+
+    /// Both tiers must produce the same exact counts, for the selective key
+    /// and the broad one alike. A cost comparison between two answers that
+    /// disagree would be meaningless.
+    fn agree(files: usize, deltas: usize, bounded: &Reading, generic: &Reading) {
+        let expected_total = (RARE_HOSTS + BROAD_ROWS) as u64;
+        for (label, r) in [("bounded", bounded), ("generic", generic)] {
+            assert_eq!(
+                (r.total, r.rare, r.broad),
+                (expected_total, 1, BROAD_ROWS as u64),
+                "{label} is wrong at files={files} deltas={deltas}: {r:?}"
+            );
+        }
+    }
+
+    async fn sweep(title: &str, cardinality: usize, shapes: &[(usize, usize)]) {
+        header(title);
+        for &(files, deltas) in shapes {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = build(&tmp, cardinality, files, deltas).await;
+            let bounded = measure(&dir, cardinality, Tier::Bounded).await;
+            let generic = measure(&dir, cardinality, Tier::Generic).await;
+            agree(files, deltas, &bounded, &generic);
+            row(files, deltas, Tier::Bounded, &bounded);
+            row(files, deltas, Tier::Generic, &generic);
+        }
+    }
+
+    /// The main comparison: live-file count and outstanding-delta count varied
+    /// independently, on a column the wide aggregate CAN cover (so the generic
+    /// arm's fold pays off with a Tier-1 answer).
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measurement, not a gate"]
+    async fn report_footer_tier_against_the_fold_it_declines() {
+        sweep(
+            "wide aggregate covers `host` (generic arm answers from tier1_wide)",
+            WIDE_COVERS,
+            &[
+                (8, 0),
+                (8, 1_024),
+                (8, 8_192),
+                (32, 0),
+                (32, 1_024),
+                (128, 0),
+                (128, 1_024),
+                (256, 0),
+            ],
+        )
+        .await;
+    }
+
+    /// The aged `query_audit` shape: the wide aggregate does not cover the
+    /// column, so the generic arm pays the whole fold and then lands on the
+    /// same footer sum the bounded arm went to directly. Here the fold is pure
+    /// loss and its cost is exactly what #7787 removed.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measurement, not a gate"]
+    async fn report_footer_tier_when_the_fold_covers_nothing() {
+        sweep(
+            "wide aggregate sketches `host` (both arms end at the footer sum)",
+            WIDE_SKETCHES,
+            &[(8, 0), (8, 1_024), (8, 8_192), (32, 1_024), (128, 1_024)],
+        )
+        .await;
+    }
+
+    /// The shape the card asks for by name: a real DELETE commit leaves a
+    /// COMPLETE aggregate short of `total-records`, so the generic arm folds
+    /// the whole prefix, decodes the column, rejects it on the row-count
+    /// guard, and pays the footer tier anyway. The deleted file also carries
+    /// positional deletes, which takes it off the footer path and onto the
+    /// raw-page decode — the one footer-side cost the sweeps above do not
+    /// show.
+    ///
+    /// Needs an index table, because `create_delete_task` is addressed by
+    /// index id; the events fixture above has no index config.
+    mod after_delete {
+        use arrow_array::{StringArray, TimestampMicrosecondArray};
+        use siglake_core::index_config::{DocMapping, FieldMapping, MappingMode};
+
+        use super::*;
+
+        const INDEX: &str = "tier_cost";
+        /// Distinct `method` values per commit — above the 4096 inline cap in
+        /// the first commit alone, so only a wide tier or the footers answer.
+        const METHODS: usize = 4_200;
+
+        fn field(name: &str, field_type: FieldType, required: bool) -> FieldMapping {
+            FieldMapping {
+                name: name.to_string(),
+                field_type,
+                required,
+            }
+        }
+
+        fn config() -> IndexConfig {
+            IndexConfig {
+                index_id: INDEX.to_string(),
+                doc_mapping: DocMapping {
+                    mode: MappingMode::Dynamic,
+                    field_mappings: vec![
+                        field("timestamp", FieldType::Datetime, true),
+                        field(
+                            "method",
+                            FieldType::Text {
+                                tokenizer: Some("raw".to_string()),
+                            },
+                            false,
+                        ),
+                    ],
+                    timestamp_field: "timestamp".to_string(),
+                    tag_fields: vec!["method".to_string()],
+                    default_search_fields: vec![],
+                },
+                retention: None,
+                index_at_flush: None,
+            }
+        }
+
+        fn batch(config: &IndexConfig, commit: usize) -> RecordBatch {
+            let base_us = 1_700_000_000_000_000 + (commit * METHODS) as i64;
+            let schema = config.to_arrow_schema();
+            let ts: Vec<Option<i64>> = (0..METHODS as i64).map(|i| Some(base_us + i)).collect();
+            let methods: Vec<Option<String>> = (0..METHODS)
+                .map(|i| Some(format!("m-{:05}", commit * METHODS + i)))
+                .collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(TimestampMicrosecondArray::from(ts).with_timezone("+00:00")),
+                    Arc::new(StringArray::from(methods)),
+                    // Dynamic mapping appends the WS-7 residual `attributes`.
+                    Arc::new(StringArray::from(vec![None::<&str>; METHODS])),
+                ],
+            )
+            .unwrap()
+        }
+
+        /// `(elapsed_ms, source, footer_reads, footer_bytes, delta_gets,
+        /// agg_bytes, total)`.
+        async fn measure_method(
+            dir: &Path,
+            cardinality: usize,
+            tier: Tier,
+        ) -> (f64, String, u64, u64, usize, usize, u64) {
+            let ice = open(dir, cardinality).await;
+            let ident = ice.index_table_ident(INDEX);
+            let cached = ice.cached_table_entry(&ident).await.unwrap();
+            let io = delta_io_probe::watch(&aggregate_op(&cached));
+            drop(cached);
+
+            let _ = footer_io_probe::take();
+            let started = Instant::now();
+            let rows = match tier {
+                Tier::Bounded => ice.predicate_count_tier1(INDEX, "method").await,
+                Tier::Generic => {
+                    ice.grouped_counts_with_summary(INDEX, "method", None, None)
+                        .await
+                }
+            }
+            .unwrap()
+            .expect("the footer tier answers a short aggregate");
+            let elapsed = started.elapsed().as_secs_f64() * 1e3;
+            let (footer_reads, footer_bytes) = footer_io_probe::take();
+            let mut total = 0u64;
+            rows.for_each(|_, count| total += count);
+            (
+                elapsed,
+                rows.source_label().to_string(),
+                footer_reads,
+                footer_bytes,
+                io.delta_reads(),
+                io.bytes(),
+                total,
+            )
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        #[ignore = "measurement, not a gate"]
+        async fn report_footer_tier_after_a_delete_shortens_the_aggregate() {
+            println!("\n## a DELETE leaves a complete aggregate short of total-records");
+            println!(
+                "{:>6} {:>8} {:>8} {:>13} {:>11} {:>8} {:>11} {:>7} {:>11}",
+                "files",
+                "deltas",
+                "tier",
+                "source",
+                "elapsed_ms",
+                "f_reads",
+                "footer_B",
+                "d_gets",
+                "agg_bytes",
+            );
+            for &(files, extra) in &[(8usize, 0usize), (8, 1_024), (32, 1_024)] {
+                let tmp = tempfile::tempdir().unwrap();
+                let dir = tmp.path().join("warehouse");
+                // Every commit contributes its own distinct values, so the cap
+                // has to hold the whole table for the aggregate to be COMPLETE
+                // before the delete shortens it.
+                let cardinality = files * METHODS + 1_000;
+                let ice = open(&dir, cardinality).await;
+                let config = config();
+                ice.create_index(&config).await.unwrap();
+                let ident = ice.index_table_ident(INDEX);
+                for commit in 0..files {
+                    ice.append_to_table(&ident, batch(&config, commit), &["method"])
+                        .await
+                        .unwrap();
+                }
+                // Fold once so the aggregate is genuinely COMPLETE before the
+                // delete shortens it. Without this the measurement would be
+                // the never-folded case the sweeps already cover.
+                ice.tier1_group_counts(INDEX, "method")
+                    .await
+                    .unwrap()
+                    .expect("complete before the delete");
+                let cached = ice.cached_table_entry(&ident).await.unwrap();
+                plant_deltas(&aggregate_op(&cached), extra).await;
+                drop(cached);
+
+                ice.create_delete_task(INDEX, "method = 'm-00007'", None, None)
+                    .await
+                    .unwrap();
+                let outcome = ice.execute_delete_tasks(INDEX).await.unwrap();
+                assert_eq!(outcome.rows_deleted, 1, "{outcome:?}");
+                drop(ice);
+
+                let expected = (files * METHODS - 1) as u64;
+                for tier in [Tier::Bounded, Tier::Generic] {
+                    let (ms, source, f_reads, f_bytes, d_gets, agg_bytes, total) =
+                        measure_method(&dir, cardinality, tier).await;
+                    assert_eq!(
+                        total, expected,
+                        "{tier:?} miscounted after the delete at files={files}"
+                    );
+                    println!(
+                        "{:>6} {:>8} {:>8} {:>13} {:>11.2} {:>8} {:>11} {:>7} {:>11}",
+                        files,
+                        extra,
+                        match tier {
+                            Tier::Bounded => "bounded",
+                            Tier::Generic => "generic",
+                        },
+                        source,
+                        ms,
+                        f_reads,
+                        f_bytes,
+                        d_gets,
+                        agg_bytes,
+                    );
+                }
+            }
+        }
     }
 }
