@@ -90,6 +90,7 @@ parquet = { workspace = true }
 rcgen = "0.13"
 tempfile = "3"
 libc = "0.2"
+proptest = { workspace = true }
 
 [lints]
 workspace = true

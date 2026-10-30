@@ -77,7 +77,7 @@ pub fn register_udfs(ctx: &SessionContext) {
     )));
 }
 
-use siglake_core::json_attr_lookup;
+use siglake_core::{json_attr_lookup, PreparedDottedJsonAttrKey};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct AttrGetUdf {
@@ -117,6 +117,19 @@ impl ScalarUDFImpl for AttrGetUdf {
             let n = args.number_rows;
             let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
             let mut builder = StringBuilder::with_capacity(n, n * 16);
+            if let Some(prepared) = key.and_then(PreparedDottedJsonAttrKey::new) {
+                for i in 0..n {
+                    if attrs.is_null(i) {
+                        builder.append_null();
+                        continue;
+                    }
+                    match prepared.lookup(attrs.value(i)) {
+                        Some(value) => builder.append_value(&value),
+                        None => builder.append_null(),
+                    }
+                }
+                return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+            }
             for i in 0..n {
                 if attrs.is_null(i) || key.is_none() {
                     builder.append_null();
@@ -581,6 +594,7 @@ mod tests {
     use datafusion::arrow::datatypes::Field;
     use datafusion::common::scalar::ScalarValue;
     use datafusion::logical_expr::ScalarFunctionArgs;
+    use proptest::prelude::*;
 
     struct CountingAllocator;
 
@@ -939,27 +953,203 @@ mod tests {
         }
     }
 
-    // Frozen pre-optimization production path for semantic and timing parity.
-    // Keep this independent: baseline timing must not call the optimized UDF.
-    fn attr_scalar_key_baseline(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
-        // Materialize both args to arrays and dispatch row-by-row. The common
-        // shape is `attr_get(col, 'literal')`; even then the per-row work is a
-        // JSON parse, so there's no per-batch setup worth special-casing.
-        let n = args.number_rows;
-        let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
-        let keys = arg_as_str_array(&args.args[1], n, "key")?;
-        let mut builder = StringBuilder::with_capacity(n, n * 16);
-        for i in 0..n {
-            if attrs.is_null(i) || keys.is_null(i) {
-                builder.append_null();
-                continue;
-            }
-            match json_attr_lookup(attrs.value(i), keys.value(i)) {
-                Some(v) => builder.append_value(&v),
-                None => builder.append_null(),
+    // Frozen from the owned helper at main 1c69e5c. This remains an untimed
+    // independent semantic oracle for the shared helper and baseline UDF.
+    mod attr_owned_baseline {
+        pub(super) fn json_attr_lookup(attributes: &str, key: &str) -> Option<String> {
+            let raw = find_value_path(attributes, key)?;
+            match serde_json::from_str::<serde_json::Value>(raw).ok()? {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some(s),
+                v => Some(v.to_string()),
             }
         }
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+
+        fn find_value_path<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+            if let Some(v) = find_top_level_value(json, key) {
+                return Some(v);
+            }
+            let (head, tail) = key.split_once('.')?;
+            let inner = find_top_level_value(json, head)?;
+            find_value_path(inner, tail)
+        }
+
+        fn find_top_level_value<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+            let b = json.as_bytes();
+            let mut i = skip_ws(b, 0);
+            if *b.get(i)? != b'{' {
+                return None;
+            }
+            i += 1;
+            loop {
+                i = skip_ws(b, i);
+                match *b.get(i)? {
+                    b'}' => return None,
+                    b'"' => {}
+                    _ => return None,
+                }
+                let key_quote = i;
+                let (k_start, k_end, after_key) = scan_string(b, i)?;
+                i = skip_ws(b, after_key);
+                if *b.get(i)? != b':' {
+                    return None;
+                }
+                i = skip_ws(b, i + 1);
+                let v_start = i;
+                let v_end = scan_value_end(b, i)?;
+
+                let raw_key = &json[k_start..k_end];
+                let matches = if raw_key.as_bytes().contains(&b'\\') {
+                    serde_json::from_str::<String>(&json[key_quote..after_key])
+                        .ok()
+                        .as_deref()
+                        == Some(key)
+                } else {
+                    raw_key == key
+                };
+                if matches {
+                    return Some(&json[v_start..v_end]);
+                }
+
+                i = skip_ws(b, v_end);
+                match *b.get(i)? {
+                    b',' => i += 1,
+                    _ => return None,
+                }
+            }
+        }
+
+        fn skip_ws(b: &[u8], mut i: usize) -> usize {
+            while matches!(b.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                i += 1;
+            }
+            i
+        }
+
+        fn scan_string(b: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+            let start = i + 1;
+            let mut j = start;
+            while j < b.len() {
+                match b[j] {
+                    b'\\' => j += 2,
+                    b'"' => return Some((start, j, j + 1)),
+                    _ => j += 1,
+                }
+            }
+            None
+        }
+
+        fn scan_value_end(b: &[u8], i: usize) -> Option<usize> {
+            match b.get(i)? {
+                b'"' => scan_string(b, i).map(|(_, _, after)| after),
+                b'{' | b'[' => {
+                    let mut depth = 0usize;
+                    let mut j = i;
+                    while j < b.len() {
+                        match b[j] {
+                            b'"' => j = scan_string(b, j)?.2,
+                            b'{' | b'[' => {
+                                depth += 1;
+                                j += 1;
+                            }
+                            b'}' | b']' => {
+                                depth -= 1;
+                                j += 1;
+                                if depth == 0 {
+                                    return Some(j);
+                                }
+                            }
+                            _ => j += 1,
+                        }
+                    }
+                    None
+                }
+                _ => {
+                    let mut j = i;
+                    while j < b.len()
+                        && !matches!(b[j], b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r')
+                    {
+                        j += 1;
+                    }
+                    (j > i).then_some(j)
+                }
+            }
+        }
+    }
+
+    // Frozen owned-result production UDF for semantic and timing parity.
+    // Keep this independent: baseline timing must not call the candidate UDF.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct AttrGetOwnedBaselineUdf {
+        signature: Signature,
+    }
+
+    impl AttrGetOwnedBaselineUdf {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(
+                    vec![DataType::Utf8, DataType::Utf8],
+                    Volatility::Immutable,
+                ),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for AttrGetOwnedBaselineUdf {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn name(&self) -> &str {
+            ATTR_GET_FN
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
+            Ok(DataType::Utf8)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+            if let ColumnarValue::Scalar(ScalarValue::Utf8(key)) = &args.args[1] {
+                let key = key.as_deref();
+                let n = args.number_rows;
+                let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
+                let mut builder = StringBuilder::with_capacity(n, n * 16);
+                for i in 0..n {
+                    if attrs.is_null(i) || key.is_none() {
+                        builder.append_null();
+                        continue;
+                    }
+                    match siglake_core::json_attr_lookup(attrs.value(i), key.unwrap()) {
+                        Some(value) => builder.append_value(&value),
+                        None => builder.append_null(),
+                    }
+                }
+                return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+            }
+            let n = args.number_rows;
+            let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
+            let keys = arg_as_str_array(&args.args[1], n, "key")?;
+            let mut builder = StringBuilder::with_capacity(n, n * 16);
+            for i in 0..n {
+                if attrs.is_null(i) || keys.is_null(i) {
+                    builder.append_null();
+                    continue;
+                }
+                match siglake_core::json_attr_lookup(attrs.value(i), keys.value(i)) {
+                    Some(value) => builder.append_value(&value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+        }
+    }
+
+    fn attr_scalar_key_baseline(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        AttrGetOwnedBaselineUdf::new().invoke_with_args(args)
     }
 
     fn attr_scalar_key_candidate(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
@@ -967,14 +1157,26 @@ mod tests {
     }
 
     fn attr_scalar_key_values(value: ColumnarValue, n: usize) -> Vec<Option<String>> {
-        let array = match value {
-            ColumnarValue::Array(array) => array,
-            ColumnarValue::Scalar(value) => value.to_array_of_size(n).unwrap(),
-        };
+        let array = attr_scalar_key_array(value, n);
         let array = array.as_any().downcast_ref::<StringArray>().unwrap();
         (0..n)
             .map(|i| (!array.is_null(i)).then(|| array.value(i).to_owned()))
             .collect()
+    }
+
+    fn attr_scalar_key_array(value: ColumnarValue, n: usize) -> Arc<dyn Array> {
+        match value {
+            ColumnarValue::Array(array) => array,
+            ColumnarValue::Scalar(value) => value.to_array_of_size(n).unwrap(),
+        }
+    }
+
+    fn assert_attr_outputs_equal(baseline: ColumnarValue, candidate: ColumnarValue, n: usize) {
+        let baseline = attr_scalar_key_array(baseline, n);
+        let candidate = attr_scalar_key_array(candidate, n);
+        assert_eq!(baseline.data_type(), &DataType::Utf8);
+        assert_eq!(candidate.data_type(), &DataType::Utf8);
+        assert_eq!(candidate.to_data(), baseline.to_data());
     }
 
     fn invoke_attr_scalar_key(
@@ -989,6 +1191,116 @@ mod tests {
         } else {
             attr_scalar_key_baseline(args)
         }
+    }
+
+    fn assert_shared_baseline_matches_owned_oracle(attributes: Option<&str>, key: Option<&str>) {
+        let oracle = attributes
+            .zip(key)
+            .and_then(|(attributes, key)| attr_owned_baseline::json_attr_lookup(attributes, key));
+        let shared = attributes
+            .zip(key)
+            .and_then(|(attributes, key)| siglake_core::json_attr_lookup(attributes, key));
+        assert_eq!(shared, oracle);
+
+        let scalar = AttrGetOwnedBaselineUdf::new()
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Scalar(ScalarValue::Utf8(attributes.map(str::to_owned))),
+                ColumnarValue::Scalar(ScalarValue::Utf8(key.map(str::to_owned))),
+                1,
+            ))
+            .unwrap();
+        assert_eq!(attr_scalar_key_values(scalar, 1), vec![oracle.clone()]);
+
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![attributes]));
+        let keys: Arc<dyn Array> = Arc::new(StringArray::from(vec![key]));
+        let array = AttrGetOwnedBaselineUdf::new()
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Array(attrs),
+                ColumnarValue::Array(keys),
+                1,
+            ))
+            .unwrap();
+        assert_eq!(attr_scalar_key_values(array, 1), vec![oracle]);
+    }
+
+    #[test]
+    fn attr_shared_baseline_matches_frozen_owned_oracle() {
+        let conditions = attr_benchmark_conditions();
+        assert_eq!(conditions.len(), 27);
+        for condition in &conditions {
+            assert_shared_baseline_matches_owned_oracle(
+                Some(&condition.attributes),
+                Some(condition.key),
+            );
+        }
+
+        for (attributes, key) in [
+            (Some(r#"{"a":{"b":"nested"},"a.b":"literal"}"#), Some("a.b")),
+            (
+                Some(r#"{"a":{"b":"first"},"a":{"b":"second"}}"#),
+                Some("a.b"),
+            ),
+            (Some(r#"{"a":{"b":"nested"},"a.b":null}"#), Some("a.b")),
+            (Some(r#"{"a":{"b":"nested"},"a.b":tru}"#), Some("a.b")),
+            (Some(r#"{"a":{"b":"nested"},"broken":"#), Some("a.b")),
+            (Some(r#"{"broken":,"a":{"b":"nested"}}"#), Some("a.b")),
+            (
+                Some(r#"{"a":{"b":"nested"},"a.b":"unterminated}"#),
+                Some("a.b"),
+            ),
+            (
+                Some(r#"{"a":{"b":"nested"},"a\u002eb":"escaped-literal"}"#),
+                Some("a.b"),
+            ),
+            (Some(r#"{"\u0061":{"b":"escaped-head"}}"#), Some("a.b")),
+            (Some(r#"{"target":"null-key"}"#), None),
+            (None, Some("target")),
+        ] {
+            assert_shared_baseline_matches_owned_oracle(attributes, key);
+        }
+
+        let utf8_attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![r#"{"x":1}"#]));
+        let int_attrs: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        let int_keys: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        for (attrs, key, expected) in [
+            (
+                ColumnarValue::Array(int_attrs),
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("x".to_owned()))),
+                "attributes must be Utf8",
+            ),
+            (
+                ColumnarValue::Array(utf8_attrs.clone()),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(1))),
+                "key must be Utf8",
+            ),
+            (
+                ColumnarValue::Array(utf8_attrs),
+                ColumnarValue::Array(int_keys),
+                "key must be Utf8",
+            ),
+        ] {
+            let error = AttrGetOwnedBaselineUdf::new()
+                .invoke_with_args(attr_scalar_key_args(attrs, key, 1))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let output = {
+            let attributes = String::from(r#"{"a":{"b":"nested-source"}}"#);
+            let key = String::from("a.b");
+            AttrGetOwnedBaselineUdf::new()
+                .invoke_with_args(attr_scalar_key_args(
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(attributes))),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(key))),
+                    2,
+                ))
+                .unwrap()
+        };
+        assert_eq!(
+            attr_scalar_key_values(output, 2),
+            vec![Some("nested-source".to_owned()); 2]
+        );
     }
 
     #[test]
@@ -1018,28 +1330,22 @@ mod tests {
                     let scalar_null =
                         matches!(&key_arg, ColumnarValue::Scalar(ScalarValue::Utf8(None)));
                     let dynamic = matches!(&key_arg, ColumnarValue::Array(_));
-                    let baseline = attr_scalar_key_values(
-                        invoke_attr_scalar_key(
-                            false,
-                            ColumnarValue::Array(attrs.clone()),
-                            key_arg.clone(),
-                            n,
-                        )
-                        .unwrap(),
+                    let baseline = invoke_attr_scalar_key(
+                        false,
+                        ColumnarValue::Array(attrs.clone()),
+                        key_arg.clone(),
                         n,
-                    );
-                    let candidate = attr_scalar_key_values(
-                        invoke_attr_scalar_key(
-                            true,
-                            ColumnarValue::Array(attrs.clone()),
-                            key_arg,
-                            n,
-                        )
-                        .unwrap(),
+                    )
+                    .unwrap();
+                    let candidate = invoke_attr_scalar_key(
+                        true,
+                        ColumnarValue::Array(attrs.clone()),
+                        key_arg,
                         n,
-                    );
-                    assert_eq!(baseline, candidate, "{} n={n}", case["id"]);
-                    for (i, actual) in baseline.iter().enumerate() {
+                    )
+                    .unwrap();
+                    assert_attr_outputs_equal(baseline.clone(), candidate, n);
+                    for (i, actual) in attr_scalar_key_values(baseline, n).iter().enumerate() {
                         let gold = if scalar_null || i % 7 == 6 || (dynamic && i % 11 == 10) {
                             None
                         } else {
@@ -1050,6 +1356,152 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn attr_get_candidate_matches_owned_baseline_for_edge_arrays() {
+        let long = format!(r#"{{"target":"{}"}}"#, "x".repeat(8192));
+        let control = "{\"target\":\"a\u{1}b\"}".to_owned();
+        let cases = vec![
+            (Some(r#"{"target":"plain"}"#.to_owned()), Some("target")),
+            (
+                Some(r#"{"target":"line\nquote\"slash\\"}"#.to_owned()),
+                Some("target"),
+            ),
+            (
+                Some(r#"{"target":"λ雪🦀значение"}"#.to_owned()),
+                Some("target"),
+            ),
+            (Some(long), Some("target")),
+            (Some(control), Some("target")),
+            (
+                Some(r#"{"target":"first","target":"second"}"#.to_owned()),
+                Some("target"),
+            ),
+            (
+                Some(r#"{"a":{"b":"nested"},"a.b":"literal"}"#.to_owned()),
+                Some("a.b"),
+            ),
+            (
+                Some(r#"{"target":9007199254740993}"#.to_owned()),
+                Some("target"),
+            ),
+            (Some(r#"{"target":true}"#.to_owned()), Some("target")),
+            (
+                Some(r#"{"target":[1,"x",null]}"#.to_owned()),
+                Some("target"),
+            ),
+            (
+                Some(r#"{"target":{"a":1,"b":"x"}}"#.to_owned()),
+                Some("target"),
+            ),
+            (Some(r#"{"target":null}"#.to_owned()), Some("target")),
+            (Some(r#"{"other":"missing"}"#.to_owned()), Some("target")),
+            (Some(r#"{"target":}"#.to_owned()), Some("target")),
+            (
+                Some(r#"{"target":"unterminated"#.to_owned()),
+                Some("target"),
+            ),
+            (
+                Some(r#"{"target":"ok","broken":}"#.to_owned()),
+                Some("target"),
+            ),
+            (
+                Some(r#"{"target":"ok","broken":"#.to_owned()),
+                Some("target"),
+            ),
+            (
+                Some(r#"{"broken":,"target":"late"}"#.to_owned()),
+                Some("target"),
+            ),
+            (None, Some("target")),
+            (Some(r#"{"target":"null-key"}"#.to_owned()), None),
+        ];
+        let (attributes, keys): (Vec<_>, Vec<_>) = cases.into_iter().unzip();
+        let number_rows = attributes.len();
+        let attributes: Arc<dyn Array> = Arc::new(StringArray::from(attributes));
+        let keys: Arc<dyn Array> = Arc::new(StringArray::from(keys));
+        let baseline = invoke_attr_scalar_key(
+            false,
+            ColumnarValue::Array(attributes.clone()),
+            ColumnarValue::Array(keys.clone()),
+            number_rows,
+        )
+        .unwrap();
+        let candidate = invoke_attr_scalar_key(
+            true,
+            ColumnarValue::Array(attributes),
+            ColumnarValue::Array(keys),
+            number_rows,
+        )
+        .unwrap();
+        assert_attr_outputs_equal(baseline, candidate, number_rows);
+    }
+
+    #[test]
+    fn attr_get_scalar_dotted_specialization_preserves_legacy_edges() {
+        let attributes = vec![
+            Some(r#"{"a":{"b":"nested"},"a.b":"literal"}"#),
+            Some(r#"{"a":{"b":"first"},"a":{"b":"second"}}"#),
+            Some(r#"{"a":{"b":"nested"},"a.b":null}"#),
+            Some(r#"{"a":{"b":"nested"},"a.b":tru}"#),
+            Some(r#"{"a":{"b":"nested"},"broken":"#),
+            Some(r#"{"broken":,"a":{"b":"nested"}}"#),
+            Some(r#"{"a":{"b":"nested"},"a.b":"unterminated}"#),
+            Some(r#"{"a":{"b":"nested"},"a\u002eb":"escaped-literal"}"#),
+            Some(r#"{"\u0061":{"b":"escaped-head"}}"#),
+            None,
+        ];
+        let expected = vec![
+            Some("literal".to_owned()),
+            Some("first".to_owned()),
+            None,
+            None,
+            Some("nested".to_owned()),
+            None,
+            Some("nested".to_owned()),
+            Some("escaped-literal".to_owned()),
+            Some("escaped-head".to_owned()),
+            None,
+        ];
+        let number_rows = attributes.len();
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(attributes));
+        let scalar_key = ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".to_owned())));
+        let baseline = invoke_attr_scalar_key(
+            false,
+            ColumnarValue::Array(attrs.clone()),
+            scalar_key.clone(),
+            number_rows,
+        )
+        .unwrap();
+        let candidate = invoke_attr_scalar_key(
+            true,
+            ColumnarValue::Array(attrs.clone()),
+            scalar_key,
+            number_rows,
+        )
+        .unwrap();
+        assert_attr_outputs_equal(baseline, candidate.clone(), number_rows);
+        assert_eq!(attr_scalar_key_values(candidate, number_rows), expected);
+
+        let array_keys: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![Some("a.b"); number_rows]));
+        let baseline = invoke_attr_scalar_key(
+            false,
+            ColumnarValue::Array(attrs.clone()),
+            ColumnarValue::Array(array_keys.clone()),
+            number_rows,
+        )
+        .unwrap();
+        let candidate = invoke_attr_scalar_key(
+            true,
+            ColumnarValue::Array(attrs),
+            ColumnarValue::Array(array_keys),
+            number_rows,
+        )
+        .unwrap();
+        assert_attr_outputs_equal(baseline, candidate.clone(), number_rows);
+        assert_eq!(attr_scalar_key_values(candidate, number_rows), expected);
     }
 
     #[test]
@@ -1118,94 +1570,610 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "timing belongs to the later fixed-envelope source review"]
-    fn attr_scalar_key_candidate_microbenchmark() {
-        let mut wide = String::from("{");
-        for i in 0..64 {
-            if i > 0 {
-                wide.push(',');
-            }
-            wide.push_str(&format!(r#""key{i}":"value-{i}""#));
+    proptest! {
+        #[test]
+        fn attr_get_candidate_matches_owned_baseline_for_arbitrary_scalar_inputs(
+            attributes in proptest::option::of(any::<String>()),
+            key in proptest::option::of(any::<String>()),
+            number_rows in 0usize..24,
+        ) {
+            let attrs = ColumnarValue::Scalar(ScalarValue::Utf8(attributes));
+            let key = ColumnarValue::Scalar(ScalarValue::Utf8(key));
+            let baseline = invoke_attr_scalar_key(
+                false,
+                attrs.clone(),
+                key.clone(),
+                number_rows,
+            ).unwrap();
+            let candidate = invoke_attr_scalar_key(true, attrs, key, number_rows).unwrap();
+            assert_attr_outputs_equal(baseline, candidate, number_rows);
         }
-        wide.push('}');
-        let shapes = [
-            ("narrow_early", r#"{"target":"value"}"#, "target"),
-            ("wide_early", wide.as_str(), "key0"),
-            ("wide_late", wide.as_str(), "key63"),
-            ("wide_missing", wide.as_str(), "absent"),
-            (
-                "literal_dotted_collision",
-                r#"{"a":{"b":"nested"},"a.b":"literal"}"#,
-                "a.b",
+
+        #[test]
+        fn attr_get_candidate_matches_owned_baseline_for_arbitrary_array_inputs(
+            rows in proptest::collection::vec(
+                (proptest::option::of(any::<String>()), proptest::option::of(any::<String>())),
+                0..24,
             ),
-        ];
-        for n in [1, 128, 4096] {
-            let operations = 32.max(16_384 / n);
-            for (shape, json, key) in shapes {
-                let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![json; n]));
-                let key = ColumnarValue::Scalar(ScalarValue::Utf8(Some(key.to_owned())));
+        ) {
+            let (attributes, keys): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+            let number_rows = attributes.len();
+            let attrs: Arc<dyn Array> = Arc::new(StringArray::from(attributes));
+            let keys: Arc<dyn Array> = Arc::new(StringArray::from(keys));
+            let baseline = invoke_attr_scalar_key(
+                false,
+                ColumnarValue::Array(attrs.clone()),
+                ColumnarValue::Array(keys.clone()),
+                number_rows,
+            ).unwrap();
+            let candidate = invoke_attr_scalar_key(
+                true,
+                ColumnarValue::Array(attrs),
+                ColumnarValue::Array(keys),
+                number_rows,
+            ).unwrap();
+            assert_attr_outputs_equal(baseline, candidate, number_rows);
+        }
+    }
 
-                // Keep correctness checks outside every timed region.
-                let baseline = attr_scalar_key_values(
-                    invoke_attr_scalar_key(
-                        false,
-                        ColumnarValue::Array(attrs.clone()),
-                        key.clone(),
-                        n,
-                    )
-                    .unwrap(),
-                    n,
-                );
-                let candidate = attr_scalar_key_values(
-                    invoke_attr_scalar_key(
-                        true,
-                        ColumnarValue::Array(attrs.clone()),
-                        key.clone(),
-                        n,
-                    )
-                    .unwrap(),
-                    n,
-                );
-                assert_eq!(candidate, baseline, "shape={shape} n={n}");
+    #[test]
+    fn attr_get_output_owns_buffers_after_inputs_drop() {
+        let output = {
+            let attributes: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+                Some(r#"{"target":"borrowed-source"}"#),
+                Some(r#"{"target":"escaped\nsource"}"#),
+                None,
+            ]));
+            let keys: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+                Some("target"),
+                Some("target"),
+                Some("target"),
+            ]));
+            attr_scalar_key_array(
+                invoke_attr_scalar_key(
+                    true,
+                    ColumnarValue::Array(attributes),
+                    ColumnarValue::Array(keys),
+                    3,
+                )
+                .unwrap(),
+                3,
+            )
+        };
+        let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(output.value(0), "borrowed-source");
+        assert_eq!(output.value(1), "escaped\nsource");
+        assert!(output.is_null(2));
 
-                for pair in 0..12 {
-                    for candidate in if pair % 2 == 0 {
+        let dotted_output = {
+            let attributes: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+                Some(r#"{"a":{"b":"nested-source"}}"#),
+                Some(r#"{"a":{"b":"nested"},"a.b":"literal-source"}"#),
+            ]));
+            attr_scalar_key_array(
+                invoke_attr_scalar_key(
+                    true,
+                    ColumnarValue::Array(attributes),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".to_owned()))),
+                    2,
+                )
+                .unwrap(),
+                2,
+            )
+        };
+        let dotted_output = dotted_output
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(dotted_output.value(0), "nested-source");
+        assert_eq!(dotted_output.value(1), "literal-source");
+    }
+
+    struct AttrBenchmarkCondition {
+        name: &'static str,
+        attributes: String,
+        key: &'static str,
+    }
+
+    fn attr_benchmark_field_object(fields: usize) -> String {
+        let mut json = String::from("{");
+        for i in 0..fields {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(r#""field_{i}":"value-{i}""#));
+        }
+        json.push('}');
+        json
+    }
+
+    fn attr_benchmark_literal_dotted_object(position: usize) -> String {
+        assert!(position < 32);
+        let mut json = String::from("{");
+        for i in 0..32 {
+            if i > 0 {
+                json.push(',');
+            }
+            if i == position {
+                json.push_str(r#""customer.segment":"target-value""#);
+            } else {
+                json.push_str(&format!(r#""field_{i}":"value-{i}""#));
+            }
+        }
+        json.push('}');
+        json
+    }
+
+    fn attr_benchmark_conditions() -> Vec<AttrBenchmarkCondition> {
+        let mut conditions = Vec::new();
+        for (size, fields) in [("tiny", 3), ("fields32", 32), ("fields128", 128)] {
+            let attributes = attr_benchmark_field_object(fields);
+            for (position, key) in [
+                ("first", "field_0"),
+                (
+                    "middle",
+                    if fields == 3 {
+                        "field_1"
+                    } else if fields == 32 {
+                        "field_16"
+                    } else {
+                        "field_64"
+                    },
+                ),
+                (
+                    "last",
+                    if fields == 3 {
+                        "field_2"
+                    } else if fields == 32 {
+                        "field_31"
+                    } else {
+                        "field_127"
+                    },
+                ),
+                ("missing", "absent"),
+            ] {
+                let name = match (size, position) {
+                    ("tiny", "first") => "tiny_first",
+                    ("tiny", "middle") => "tiny_middle",
+                    ("tiny", "last") => "tiny_last",
+                    ("tiny", "missing") => "tiny_missing",
+                    ("fields32", "first") => "fields32_first",
+                    ("fields32", "middle") => "fields32_middle",
+                    ("fields32", "last") => "fields32_last",
+                    ("fields32", "missing") => "fields32_missing",
+                    ("fields128", "first") => "fields128_first",
+                    ("fields128", "middle") => "fields128_middle",
+                    ("fields128", "last") => "fields128_last",
+                    ("fields128", "missing") => "fields128_missing",
+                    _ => unreachable!(),
+                };
+                conditions.push(AttrBenchmarkCondition {
+                    name,
+                    attributes: attributes.clone(),
+                    key,
+                });
+            }
+        }
+
+        let long_ascii = "x".repeat(4096);
+        let escaped = format!(r#"prefix {} suffix"#, r#"quote:\" slash:\\ "#.repeat(256));
+        conditions.extend([
+            AttrBenchmarkCondition {
+                name: "long_ascii_string",
+                attributes: format!(r#"{{"target":"{long_ascii}"}}"#),
+                key: "target",
+            },
+            AttrBenchmarkCondition {
+                name: "escaped_string",
+                attributes: format!(r#"{{"target":"{escaped}"}}"#),
+                key: "target",
+            },
+            AttrBenchmarkCondition {
+                name: "unicode_string",
+                attributes: format!(r#"{{"target":"{}"}}"#, "λ雪🦀".repeat(512)),
+                key: "target",
+            },
+            AttrBenchmarkCondition {
+                name: "nested_dotted_path",
+                attributes: r#"{"outer":{"middle":{"target":"nested"}}}"#.to_owned(),
+                key: "outer.middle.target",
+            },
+            AttrBenchmarkCondition {
+                name: "literal_dotted_precedence",
+                attributes: r#"{"outer.middle.target":"literal","outer":{"middle":{"target":"nested"}}}"#.to_owned(),
+                key: "outer.middle.target",
+            },
+            AttrBenchmarkCondition {
+                name: "short_no_match",
+                attributes: r#"{"a":0}"#.to_owned(),
+                key: "z",
+            },
+            AttrBenchmarkCondition {
+                name: "short_truncated_no_match",
+                attributes: r#"{"a":"#.to_owned(),
+                key: "z",
+            },
+            AttrBenchmarkCondition {
+                name: "sl_signoz_v1_envelope",
+                attributes: r#"{"sl_signoz_v1":{"record_id":"01JBC8Z2W9T1H6P9","severity_number":13,"severity_text":"WARN","attributes_string":"{\"customer.segment\":\"enterprise\",\"http.route\":\"/checkout\",\"region\":\"us-east-1\",\"request.kind\":\"write\",\"customer.tier\":\"gold\",\"deployment.ring\":\"canary\"}","resources_string":"{\"service.name\":\"checkout\",\"cloud.provider\":\"aws\"}"},"otel":{"scope":{"name":"example"}},"tail":"done"}"#.to_owned(),
+                key: "sl_signoz_v1.attributes_string",
+            },
+            AttrBenchmarkCondition {
+                name: "selected_number",
+                attributes: r#"{"target":9007199254740993}"#.to_owned(),
+                key: "target",
+            },
+            AttrBenchmarkCondition {
+                name: "selected_bool",
+                attributes: r#"{"target":true}"#.to_owned(),
+                key: "target",
+            },
+            AttrBenchmarkCondition {
+                name: "selected_array",
+                attributes: r#"{"target":[1,"x",null]}"#.to_owned(),
+                key: "target",
+            },
+            AttrBenchmarkCondition {
+                name: "selected_object",
+                attributes: r#"{"target":{"a":1,"b":"x"}}"#.to_owned(),
+                key: "target",
+            },
+            AttrBenchmarkCondition {
+                name: "selected_null",
+                attributes: r#"{"target":null}"#.to_owned(),
+                key: "target",
+            },
+        ]);
+        conditions.extend([
+            AttrBenchmarkCondition {
+                name: "fields32_literal_dotted_index15",
+                attributes: attr_benchmark_literal_dotted_object(15),
+                key: "customer.segment",
+            },
+            AttrBenchmarkCondition {
+                name: "fields32_literal_dotted_index31",
+                attributes: attr_benchmark_literal_dotted_object(31),
+                key: "customer.segment",
+            },
+        ]);
+        conditions
+    }
+
+    const ATTR_BENCHMARK_ROW_COUNTS: [usize; 3] = [1, 128, 4096];
+    const ATTR_BENCHMARK_WARMUPS: usize = 2;
+    const ATTR_BENCHMARK_MEASURED_ROUNDS: usize = 7;
+    const ATTR_BENCHMARK_ROWS_PER_SAMPLE: usize = 4096;
+    const ATTR_BENCHMARK_TIMED_ROWS: usize = 5_971_968;
+    const ATTR_BENCHMARK_TOTAL_LOOKUPS: usize = 6_436_718;
+    const ATTR_BENCHMARK_TOTAL_LOOKUP_CEILING: usize = 7_000_000;
+    const ATTR_BENCHMARK_ALLOCATION_RECORDS: usize = 168;
+
+    fn attr_benchmark_invocations(row_count: usize) -> usize {
+        ATTR_BENCHMARK_ROWS_PER_SAMPLE / row_count
+    }
+
+    fn attr_benchmark_args(
+        condition: &AttrBenchmarkCondition,
+        row_count: usize,
+        invocations: usize,
+        array_key: bool,
+    ) -> Vec<ScalarFunctionArgs> {
+        let attributes: Arc<dyn Array> =
+            Arc::new(StringArray::from(vec![
+                condition.attributes.as_str();
+                row_count
+            ]));
+        let key = if array_key {
+            let keys: Arc<dyn Array> = Arc::new(StringArray::from(vec![condition.key; row_count]));
+            ColumnarValue::Array(keys)
+        } else {
+            ColumnarValue::Scalar(ScalarValue::Utf8(Some(condition.key.to_owned())))
+        };
+        (0..invocations)
+            .map(|_| {
+                attr_scalar_key_args(
+                    ColumnarValue::Array(attributes.clone()),
+                    key.clone(),
+                    row_count,
+                )
+            })
+            .collect()
+    }
+
+    struct AttrBenchmarkUdfs {
+        baseline: AttrGetOwnedBaselineUdf,
+        candidate: AttrGetUdf,
+    }
+
+    impl AttrBenchmarkUdfs {
+        fn new() -> Self {
+            Self {
+                baseline: AttrGetOwnedBaselineUdf::new(),
+                candidate: AttrGetUdf::new(),
+            }
+        }
+
+        fn callable(&self, candidate: bool) -> &dyn ScalarUDFImpl {
+            if candidate {
+                &self.candidate
+            } else {
+                &self.baseline
+            }
+        }
+    }
+
+    fn attr_benchmark_invoke(
+        callable: &dyn ScalarUDFImpl,
+        args: ScalarFunctionArgs,
+    ) -> ColumnarValue {
+        callable.invoke_with_args(args).unwrap()
+    }
+
+    fn attr_benchmark_checksum(value: &ColumnarValue, row_count: usize) -> u64 {
+        const OFFSET: u64 = 0xcbf29ce484222325;
+        const PRIME: u64 = 0x100000001b3;
+        let array = match value {
+            ColumnarValue::Array(array) => array.clone(),
+            ColumnarValue::Scalar(value) => value.to_array_of_size(row_count).unwrap(),
+        };
+        let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        let mut hash = OFFSET;
+        let mut absorb = |byte| {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        };
+        for i in 0..row_count {
+            if array.is_null(i) {
+                absorb(0);
+            } else {
+                absorb(1);
+                let value = array.value(i);
+                for byte in u64::try_from(value.len()).unwrap().to_le_bytes() {
+                    absorb(byte);
+                }
+                for byte in value.bytes() {
+                    absorb(byte);
+                }
+            }
+        }
+        hash
+    }
+
+    fn attr_benchmark_sample(
+        callable: &dyn ScalarUDFImpl,
+        args: Vec<ScalarFunctionArgs>,
+    ) -> Duration {
+        let start = std::time::Instant::now();
+        for args in args {
+            let output = attr_benchmark_invoke(callable, args);
+            drop(std::hint::black_box(output));
+        }
+        start.elapsed()
+    }
+
+    #[test]
+    fn attr_benchmark_reuses_symmetric_udfs_outside_invocation_counts() {
+        let (baseline_udf, baseline_constructor_allocations) =
+            allocations(AttrGetOwnedBaselineUdf::new);
+        let (candidate_udf, candidate_constructor_allocations) = allocations(AttrGetUdf::new);
+        assert_eq!(
+            candidate_constructor_allocations, baseline_constructor_allocations,
+            "both test UDF constructors must have the same signature allocation cost"
+        );
+        assert!(candidate_constructor_allocations > 0);
+
+        let udfs = AttrBenchmarkUdfs {
+            baseline: baseline_udf,
+            candidate: candidate_udf,
+        };
+        let condition = AttrBenchmarkCondition {
+            name: "constructor_control",
+            attributes: r#"{"target":"value"}"#.to_owned(),
+            key: "target",
+        };
+        for array_key in [false, true] {
+            let baseline_args = attr_benchmark_args(&condition, 3, 4, array_key);
+            let candidate_args = attr_benchmark_args(&condition, 3, 4, array_key);
+            let baseline_callable = udfs.callable(false);
+            let candidate_callable = udfs.callable(true);
+            let mut baseline_outputs = Vec::with_capacity(4);
+            let mut candidate_outputs = Vec::with_capacity(4);
+            let (_, baseline_allocations) = allocations(|| {
+                for args in baseline_args {
+                    baseline_outputs.push(attr_benchmark_invoke(baseline_callable, args));
+                }
+            });
+            let (_, candidate_allocations) = allocations(|| {
+                for args in candidate_args {
+                    candidate_outputs.push(attr_benchmark_invoke(candidate_callable, args));
+                }
+            });
+            assert_eq!(candidate_allocations, baseline_allocations);
+            for (baseline, candidate) in baseline_outputs.into_iter().zip(candidate_outputs) {
+                assert_attr_outputs_equal(baseline, candidate, 3);
+            }
+        }
+
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+            Some(r#"{"target":"owned"}"#),
+            None,
+            Some(r#"{"other":"missing"}"#),
+        ]));
+        let null_keys: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+            Some("target"),
+            None,
+            Some("target"),
+        ]));
+        let baseline = attr_benchmark_invoke(
+            udfs.callable(false),
+            attr_scalar_key_args(
+                ColumnarValue::Array(attrs.clone()),
+                ColumnarValue::Array(null_keys.clone()),
+                3,
+            ),
+        );
+        let candidate = attr_benchmark_invoke(
+            udfs.callable(true),
+            attr_scalar_key_args(
+                ColumnarValue::Array(attrs),
+                ColumnarValue::Array(null_keys),
+                3,
+            ),
+        );
+        assert_attr_outputs_equal(baseline, candidate.clone(), 3);
+        assert_eq!(
+            attr_scalar_key_values(candidate, 3),
+            vec![Some("owned".to_owned()), None, None]
+        );
+
+        let int_keys: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![r#"{"target":"value"}"#]));
+        let baseline_error = udfs
+            .callable(false)
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Array(attrs.clone()),
+                ColumnarValue::Array(int_keys.clone()),
+                1,
+            ))
+            .unwrap_err()
+            .to_string();
+        let candidate_error = udfs
+            .callable(true)
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Array(attrs),
+                ColumnarValue::Array(int_keys),
+                1,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(candidate_error, baseline_error);
+    }
+
+    #[test]
+    fn attr_get_arrow_benchmark_schedule_is_fixed_and_bounded() {
+        let conditions = attr_benchmark_conditions();
+        assert_eq!(conditions.len(), 27);
+        let rounds = ATTR_BENCHMARK_WARMUPS + ATTR_BENCHMARK_MEASURED_ROUNDS;
+        let samples = conditions.len() * ATTR_BENCHMARK_ROW_COUNTS.len() * rounds * 2;
+        assert_eq!(samples, 1458);
+        let timed_rows = samples * ATTR_BENCHMARK_ROWS_PER_SAMPLE;
+        assert_eq!(timed_rows, ATTR_BENCHMARK_TIMED_ROWS);
+
+        let parity_rows = conditions.len() * 2 * ATTR_BENCHMARK_ROW_COUNTS.iter().sum::<usize>();
+        let scalar_allocation_rows = parity_rows;
+        let array_allocation_rows = 2 * ATTR_BENCHMARK_ROW_COUNTS.iter().sum::<usize>();
+        let total_lookups =
+            timed_rows + parity_rows + scalar_allocation_rows + array_allocation_rows;
+        assert_eq!(total_lookups, ATTR_BENCHMARK_TOTAL_LOOKUPS);
+        assert!(total_lookups <= ATTR_BENCHMARK_TOTAL_LOOKUP_CEILING);
+        let scalar_allocation_records = conditions.len() * ATTR_BENCHMARK_ROW_COUNTS.len() * 2;
+        let array_allocation_records = ATTR_BENCHMARK_ROW_COUNTS.len() * 2;
+        assert_eq!(
+            scalar_allocation_records + array_allocation_records,
+            ATTR_BENCHMARK_ALLOCATION_RECORDS
+        );
+        for row_count in ATTR_BENCHMARK_ROW_COUNTS {
+            let invocations = attr_benchmark_invocations(row_count);
+            assert_eq!(invocations * row_count, ATTR_BENCHMARK_ROWS_PER_SAMPLE);
+        }
+    }
+
+    #[test]
+    #[ignore = "timing requires the reviewed isolated optimized envelope"]
+    fn attr_get_arrow_microbenchmark() {
+        let conditions = attr_benchmark_conditions();
+        let rounds = ATTR_BENCHMARK_WARMUPS + ATTR_BENCHMARK_MEASURED_ROUNDS;
+        let udfs = AttrBenchmarkUdfs::new();
+
+        for condition in &conditions {
+            for row_count in ATTR_BENCHMARK_ROW_COUNTS {
+                let baseline = attr_benchmark_invoke(
+                    udfs.callable(false),
+                    attr_benchmark_args(condition, row_count, 1, false)
+                        .pop()
+                        .unwrap(),
+                );
+                let candidate = attr_benchmark_invoke(
+                    udfs.callable(true),
+                    attr_benchmark_args(condition, row_count, 1, false)
+                        .pop()
+                        .unwrap(),
+                );
+                let checksum = attr_benchmark_checksum(&baseline, row_count);
+                assert_eq!(attr_benchmark_checksum(&candidate, row_count), checksum);
+                assert_attr_outputs_equal(baseline, candidate, row_count);
+
+                for candidate in [false, true] {
+                    let callable = udfs.callable(candidate);
+                    let mut args = attr_benchmark_args(condition, row_count, 1, false);
+                    let (output, count) =
+                        allocations(|| attr_benchmark_invoke(callable, args.pop().unwrap()));
+                    drop(std::hint::black_box(output));
+                    println!(
+                        "{{\"benchmark\":\"attr_get_arrow_allocations\",\"pid\":{},\"condition\":\"{}\",\"rowcount\":{},\"key_representation\":\"scalar\",\"implementation\":\"{}\",\"invocations\":1,\"rows\":{},\"allocations\":{},\"allocations_per_invocation\":{},\"allocations_per_row\":{}}}",
+                        std::process::id(),
+                        condition.name,
+                        row_count,
+                        if candidate { "candidate" } else { "baseline" },
+                        row_count,
+                        count,
+                        count,
+                        count as f64 / row_count as f64,
+                    );
+                }
+
+                if condition.name == "tiny_first" {
+                    for candidate in [false, true] {
+                        let callable = udfs.callable(candidate);
+                        let mut args = attr_benchmark_args(condition, row_count, 1, true);
+                        let (output, count) =
+                            allocations(|| attr_benchmark_invoke(callable, args.pop().unwrap()));
+                        drop(std::hint::black_box(output));
+                        println!(
+                            "{{\"benchmark\":\"attr_get_arrow_allocations\",\"pid\":{},\"condition\":\"{}\",\"rowcount\":{},\"key_representation\":\"array\",\"implementation\":\"{}\",\"invocations\":1,\"rows\":{},\"allocations\":{},\"allocations_per_invocation\":{},\"allocations_per_row\":{}}}",
+                            std::process::id(),
+                            condition.name,
+                            row_count,
+                            if candidate { "candidate" } else { "baseline" },
+                            row_count,
+                            count,
+                            count,
+                            count as f64 / row_count as f64,
+                        );
+                    }
+                }
+
+                let invocations = attr_benchmark_invocations(row_count);
+                for round in 0..rounds {
+                    let (phase, ordinal) = if round < ATTR_BENCHMARK_WARMUPS {
+                        ("warmup", round)
+                    } else {
+                        ("measured", round - ATTR_BENCHMARK_WARMUPS)
+                    };
+                    let implementations = if round.is_multiple_of(2) {
                         [false, true]
                     } else {
                         [true, false]
-                    } {
-                        // Preparing each owned argument outside the timer keeps
-                        // framework construction out while retaining the real
-                        // UDF's scalar-to-array expansion in the baseline.
-                        let args: Vec<_> = (0..operations)
-                            .map(|_| {
-                                attr_scalar_key_args(
-                                    ColumnarValue::Array(attrs.clone()),
-                                    key.clone(),
-                                    n,
-                                )
-                            })
-                            .collect();
-                        let start = std::time::Instant::now();
-                        let (_, count) = allocations(|| {
-                            for args in args {
-                                let out = if candidate {
-                                    attr_scalar_key_candidate(args)
-                                } else {
-                                    attr_scalar_key_baseline(args)
-                                };
-                                std::hint::black_box(out.unwrap());
-                            }
-                        });
-                        let elapsed = start.elapsed();
-                        if pair >= 2 {
-                            println!(
-                                "scalar_key_candidate shape={shape} rows={n} operations={operations} pair={} candidate={candidate} ns={} allocations={count}",
-                                pair - 2,
-                                elapsed.as_nanos()
-                            );
-                        }
+                    };
+                    for (order, candidate) in implementations.into_iter().enumerate() {
+                        let callable = udfs.callable(candidate);
+                        let args = attr_benchmark_args(condition, row_count, invocations, false);
+                        let elapsed = attr_benchmark_sample(callable, args);
+                        println!(
+                            "{{\"benchmark\":\"attr_get_arrow\",\"pid\":{},\"condition\":\"{}\",\"rowcount\":{},\"invocations\":{},\"rows\":{},\"phase\":\"{}\",\"ordinal\":{},\"order\":{},\"implementation\":\"{}\",\"elapsed\":{},\"elapsed_unit\":\"ns\",\"below_1ms\":{},\"checksum\":{}}}",
+                            std::process::id(),
+                            condition.name,
+                            row_count,
+                            invocations,
+                            invocations * row_count,
+                            phase,
+                            ordinal,
+                            order,
+                            if candidate { "candidate" } else { "baseline" },
+                            elapsed.as_nanos(),
+                            elapsed < Duration::from_millis(1),
+                            checksum,
+                        );
                     }
                 }
             }

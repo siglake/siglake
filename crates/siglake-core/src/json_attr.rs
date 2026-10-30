@@ -31,6 +31,101 @@ fn find_value_path<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     find_value_path(inner, tail)
 }
 
+/// A borrowed dotted key prepared once for repeated attribute lookups.
+///
+/// The first object level is scanned once for literal-key precedence and the
+/// first path head. Any retained head is resolved by the legacy path walker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreparedDottedJsonAttrKey<'a> {
+    key: &'a str,
+    head: &'a str,
+    tail: &'a str,
+}
+
+impl<'a> PreparedDottedJsonAttrKey<'a> {
+    /// Prepare a dotted key without allocating. A flat key returns `None`.
+    pub fn new(key: &'a str) -> Option<Self> {
+        let (head, tail) = key.split_once('.')?;
+        Some(Self { key, head, tail })
+    }
+
+    /// Look up this prepared dotted key while preserving legacy results.
+    pub fn lookup(&self, attributes: &str) -> Option<String> {
+        let raw = match find_dotted_top_level_value(attributes, self.key, self.head) {
+            DottedTopLevelValue::Literal(value) => value,
+            DottedTopLevelValue::Head(inner) => find_value_path(inner?, self.tail)?,
+        };
+        match serde_json::from_str::<serde_json::Value>(raw).ok()? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(value) => Some(value),
+            value => Some(value.to_string()),
+        }
+    }
+}
+
+enum DottedTopLevelValue<'a> {
+    Literal(&'a str),
+    Head(Option<&'a str>),
+}
+
+fn find_dotted_top_level_value<'a>(
+    json: &'a str,
+    literal: &str,
+    head: &str,
+) -> DottedTopLevelValue<'a> {
+    let b = json.as_bytes();
+    let mut i = skip_ws(b, 0);
+    if !matches!(b.get(i), Some(b'{')) {
+        return DottedTopLevelValue::Head(None);
+    }
+    i += 1;
+    let mut first_head = None;
+    loop {
+        i = skip_ws(b, i);
+        match b.get(i) {
+            Some(b'"') => {}
+            _ => return DottedTopLevelValue::Head(first_head),
+        }
+        let key_quote = i;
+        let Some((k_start, k_end, after_key)) = scan_string(b, i) else {
+            return DottedTopLevelValue::Head(first_head);
+        };
+        i = skip_ws(b, after_key);
+        if !matches!(b.get(i), Some(b':')) {
+            return DottedTopLevelValue::Head(first_head);
+        }
+        i = skip_ws(b, i + 1);
+        let v_start = i;
+        let Some(v_end) = scan_value_end(b, i) else {
+            return DottedTopLevelValue::Head(first_head);
+        };
+
+        let raw_key = &json[k_start..k_end];
+        if raw_key.as_bytes().contains(&b'\\') {
+            let decoded = serde_json::from_str::<String>(&json[key_quote..after_key]).ok();
+            if decoded.as_deref() == Some(literal) {
+                return DottedTopLevelValue::Literal(&json[v_start..v_end]);
+            }
+            if first_head.is_none() && decoded.as_deref() == Some(head) {
+                first_head = Some(&json[v_start..v_end]);
+            }
+        } else {
+            if raw_key == literal {
+                return DottedTopLevelValue::Literal(&json[v_start..v_end]);
+            }
+            if first_head.is_none() && raw_key == head {
+                first_head = Some(&json[v_start..v_end]);
+            }
+        }
+
+        i = skip_ws(b, v_end);
+        match b.get(i) {
+            Some(b',') => i += 1,
+            _ => return DottedTopLevelValue::Head(first_head),
+        }
+    }
+}
+
 /// Scan a top-level JSON object for `key` and return the raw slice of its value
 /// (`500`, `"prod"`, `[1,2]`, …) without parsing the rest. `None` if the input
 /// isn't an object, the key is absent, or it's malformed.
@@ -136,6 +231,98 @@ fn scan_value_end(b: &[u8], i: usize) -> Option<usize> {
                 j += 1;
             }
             (j > i).then_some(j)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{json_attr_lookup, PreparedDottedJsonAttrKey};
+
+    fn assert_prepared_parity(json: &str, key: &str) {
+        let prepared = PreparedDottedJsonAttrKey::new(key).expect("test key must be dotted");
+        assert_eq!(
+            prepared.lookup(json),
+            json_attr_lookup(json, key),
+            "json={json:?} key={key:?}"
+        );
+    }
+
+    #[test]
+    fn prepared_dotted_lookup_preserves_legacy_counterexamples() {
+        let cases = [
+            (r#"{"a":{"b":"nested"},"a.b":"literal"}"#, "a.b"),
+            (r#"{"a":{"b":"first"},"a":{"b":"second"}}"#, "a.b"),
+            (r#"{"a":{"b":"nested"},"a.b":null}"#, "a.b"),
+            (r#"{"a":{"b":"nested"},"a.b":tru}"#, "a.b"),
+            (r#"{"a":{"b":"nested"},"broken":"#, "a.b"),
+            (r#"{"broken":,"a":{"b":"nested"}}"#, "a.b"),
+            (r#"{"a":{"b":"nested"},"a.b":"unterminated}"#, "a.b"),
+            (r#"{"a":{"b":"nested"},"a\u002eb":"literal"}"#, "a.b"),
+            (r#"{"\u0061":{"b":"nested"}}"#, "a.b"),
+            (r#"{"":{"a":{"":{"b":"deep"}}}}"#, ".a..b"),
+            (r#"{"雪":{"λ":"unicode"}}"#, "雪.λ"),
+            (r#"{"bad\u":"x","a":{"b":"nested"}}"#, "a.b"),
+            (r#"{"a":{"":{"b":"empty"}}}"#, "a..b"),
+            (
+                r#"{"a":{"b.c":"inner-literal","b":{"c":"nested"}}}"#,
+                "a.b.c",
+            ),
+        ];
+        for (json, key) in cases {
+            assert_prepared_parity(json, key);
+        }
+
+        let prepared = PreparedDottedJsonAttrKey::new("a.b").unwrap();
+        assert_eq!(prepared.lookup(r#"{"a":{"b":"nested"},"a.b":tru}"#), None);
+        assert_eq!(
+            prepared.lookup(r#"{"a":{"b":"nested"},"a.b":"unterminated}"#),
+            Some("nested".to_owned())
+        );
+    }
+
+    fn json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|value| serde_json::Value::Number(value.into())),
+            any::<String>().prop_map(serde_json::Value::String),
+        ];
+        leaf.prop_recursive(4, 64, 8, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..8).prop_map(serde_json::Value::Array),
+                proptest::collection::btree_map(any::<String>(), inner, 0..8)
+                    .prop_map(|map| { serde_json::Value::Object(map.into_iter().collect()) }),
+            ]
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn prepared_dotted_lookup_matches_legacy_for_arbitrary_utf8(
+            json in any::<String>(),
+            head in any::<String>(),
+            tail in any::<String>(),
+        ) {
+            let key = format!("{head}.{tail}");
+            let prepared = PreparedDottedJsonAttrKey::new(&key).unwrap();
+            prop_assert_eq!(prepared.lookup(&json), json_attr_lookup(&json, &key));
+        }
+
+        #[test]
+        fn prepared_dotted_lookup_matches_legacy_for_valid_json_objects(
+            object in proptest::collection::btree_map(any::<String>(), json_value_strategy(), 0..16),
+            head in any::<String>(),
+            tail in any::<String>(),
+        ) {
+            let json = serde_json::to_string(&object).unwrap();
+            let key = format!("{head}.{tail}");
+            let prepared = PreparedDottedJsonAttrKey::new(&key).unwrap();
+            prop_assert_eq!(prepared.lookup(&json), json_attr_lookup(&json, &key));
         }
     }
 }
