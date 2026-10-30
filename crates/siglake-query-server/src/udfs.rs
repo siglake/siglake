@@ -1066,39 +1066,77 @@ mod tests {
 
     // Frozen owned-result production UDF for semantic and timing parity.
     // Keep this independent: baseline timing must not call the candidate UDF.
-    fn attr_scalar_key_baseline(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
-        if let ColumnarValue::Scalar(ScalarValue::Utf8(key)) = &args.args[1] {
-            let key = key.as_deref();
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct AttrGetOwnedBaselineUdf {
+        signature: Signature,
+    }
+
+    impl AttrGetOwnedBaselineUdf {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(
+                    vec![DataType::Utf8, DataType::Utf8],
+                    Volatility::Immutable,
+                ),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for AttrGetOwnedBaselineUdf {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn name(&self) -> &str {
+            ATTR_GET_FN
+        }
+
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+
+        fn return_type(&self, _arg_types: &[DataType]) -> DfResult<DataType> {
+            Ok(DataType::Utf8)
+        }
+
+        fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+            if let ColumnarValue::Scalar(ScalarValue::Utf8(key)) = &args.args[1] {
+                let key = key.as_deref();
+                let n = args.number_rows;
+                let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
+                let mut builder = StringBuilder::with_capacity(n, n * 16);
+                for i in 0..n {
+                    if attrs.is_null(i) || key.is_none() {
+                        builder.append_null();
+                        continue;
+                    }
+                    match attr_owned_baseline::json_attr_lookup(attrs.value(i), key.unwrap()) {
+                        Some(value) => builder.append_value(&value),
+                        None => builder.append_null(),
+                    }
+                }
+                return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+            }
             let n = args.number_rows;
             let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
+            let keys = arg_as_str_array(&args.args[1], n, "key")?;
             let mut builder = StringBuilder::with_capacity(n, n * 16);
             for i in 0..n {
-                if attrs.is_null(i) || key.is_none() {
+                if attrs.is_null(i) || keys.is_null(i) {
                     builder.append_null();
                     continue;
                 }
-                match attr_owned_baseline::json_attr_lookup(attrs.value(i), key.unwrap()) {
+                match attr_owned_baseline::json_attr_lookup(attrs.value(i), keys.value(i)) {
                     Some(value) => builder.append_value(&value),
                     None => builder.append_null(),
                 }
             }
-            return Ok(ColumnarValue::Array(Arc::new(builder.finish())));
+            Ok(ColumnarValue::Array(Arc::new(builder.finish())))
         }
-        let n = args.number_rows;
-        let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
-        let keys = arg_as_str_array(&args.args[1], n, "key")?;
-        let mut builder = StringBuilder::with_capacity(n, n * 16);
-        for i in 0..n {
-            if attrs.is_null(i) || keys.is_null(i) {
-                builder.append_null();
-                continue;
-            }
-            match attr_owned_baseline::json_attr_lookup(attrs.value(i), keys.value(i)) {
-                Some(v) => builder.append_value(&v),
-                None => builder.append_null(),
-            }
-        }
-        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+
+    fn attr_scalar_key_baseline(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
+        AttrGetOwnedBaselineUdf::new().invoke_with_args(args)
     }
 
     fn attr_scalar_key_candidate(args: ScalarFunctionArgs) -> DfResult<ColumnarValue> {
@@ -1599,12 +1637,33 @@ mod tests {
             .collect()
     }
 
-    fn attr_benchmark_invoke(candidate: bool, args: ScalarFunctionArgs) -> ColumnarValue {
-        if candidate {
-            attr_scalar_key_candidate(args).unwrap()
-        } else {
-            attr_scalar_key_baseline(args).unwrap()
+    struct AttrBenchmarkUdfs {
+        baseline: AttrGetOwnedBaselineUdf,
+        candidate: AttrGetUdf,
+    }
+
+    impl AttrBenchmarkUdfs {
+        fn new() -> Self {
+            Self {
+                baseline: AttrGetOwnedBaselineUdf::new(),
+                candidate: AttrGetUdf::new(),
+            }
         }
+
+        fn callable(&self, candidate: bool) -> &dyn ScalarUDFImpl {
+            if candidate {
+                &self.candidate
+            } else {
+                &self.baseline
+            }
+        }
+    }
+
+    fn attr_benchmark_invoke(
+        callable: &dyn ScalarUDFImpl,
+        args: ScalarFunctionArgs,
+    ) -> ColumnarValue {
+        callable.invoke_with_args(args).unwrap()
     }
 
     fn attr_benchmark_checksum(value: &ColumnarValue, row_count: usize) -> u64 {
@@ -1637,13 +1696,114 @@ mod tests {
         hash
     }
 
-    fn attr_benchmark_sample(candidate: bool, args: Vec<ScalarFunctionArgs>) -> Duration {
+    fn attr_benchmark_sample(
+        callable: &dyn ScalarUDFImpl,
+        args: Vec<ScalarFunctionArgs>,
+    ) -> Duration {
         let start = std::time::Instant::now();
         for args in args {
-            let output = attr_benchmark_invoke(candidate, args);
+            let output = attr_benchmark_invoke(callable, args);
             drop(std::hint::black_box(output));
         }
         start.elapsed()
+    }
+
+    #[test]
+    fn attr_benchmark_reuses_symmetric_udfs_outside_invocation_counts() {
+        let (baseline_udf, baseline_constructor_allocations) =
+            allocations(AttrGetOwnedBaselineUdf::new);
+        let (candidate_udf, candidate_constructor_allocations) = allocations(AttrGetUdf::new);
+        assert_eq!(
+            candidate_constructor_allocations, baseline_constructor_allocations,
+            "both test UDF constructors must have the same signature allocation cost"
+        );
+        assert!(candidate_constructor_allocations > 0);
+
+        let udfs = AttrBenchmarkUdfs {
+            baseline: baseline_udf,
+            candidate: candidate_udf,
+        };
+        let condition = AttrBenchmarkCondition {
+            name: "constructor_control",
+            attributes: r#"{"target":"value"}"#.to_owned(),
+            key: "target",
+        };
+        for array_key in [false, true] {
+            let baseline_args = attr_benchmark_args(&condition, 3, 4, array_key);
+            let candidate_args = attr_benchmark_args(&condition, 3, 4, array_key);
+            let baseline_callable = udfs.callable(false);
+            let candidate_callable = udfs.callable(true);
+            let mut baseline_outputs = Vec::with_capacity(4);
+            let mut candidate_outputs = Vec::with_capacity(4);
+            let (_, baseline_allocations) = allocations(|| {
+                for args in baseline_args {
+                    baseline_outputs.push(attr_benchmark_invoke(baseline_callable, args));
+                }
+            });
+            let (_, candidate_allocations) = allocations(|| {
+                for args in candidate_args {
+                    candidate_outputs.push(attr_benchmark_invoke(candidate_callable, args));
+                }
+            });
+            assert_eq!(candidate_allocations, baseline_allocations);
+            for (baseline, candidate) in baseline_outputs.into_iter().zip(candidate_outputs) {
+                assert_attr_outputs_equal(baseline, candidate, 3);
+            }
+        }
+
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+            Some(r#"{"target":"owned"}"#),
+            None,
+            Some(r#"{"other":"missing"}"#),
+        ]));
+        let null_keys: Arc<dyn Array> = Arc::new(StringArray::from(vec![
+            Some("target"),
+            None,
+            Some("target"),
+        ]));
+        let baseline = attr_benchmark_invoke(
+            udfs.callable(false),
+            attr_scalar_key_args(
+                ColumnarValue::Array(attrs.clone()),
+                ColumnarValue::Array(null_keys.clone()),
+                3,
+            ),
+        );
+        let candidate = attr_benchmark_invoke(
+            udfs.callable(true),
+            attr_scalar_key_args(
+                ColumnarValue::Array(attrs),
+                ColumnarValue::Array(null_keys),
+                3,
+            ),
+        );
+        assert_attr_outputs_equal(baseline, candidate.clone(), 3);
+        assert_eq!(
+            attr_scalar_key_values(candidate, 3),
+            vec![Some("owned".to_owned()), None, None]
+        );
+
+        let int_keys: Arc<dyn Array> = Arc::new(arrow_array::Int64Array::from(vec![1]));
+        let attrs: Arc<dyn Array> = Arc::new(StringArray::from(vec![r#"{"target":"value"}"#]));
+        let baseline_error = udfs
+            .callable(false)
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Array(attrs.clone()),
+                ColumnarValue::Array(int_keys.clone()),
+                1,
+            ))
+            .unwrap_err()
+            .to_string();
+        let candidate_error = udfs
+            .callable(true)
+            .invoke_with_args(attr_scalar_key_args(
+                ColumnarValue::Array(attrs),
+                ColumnarValue::Array(int_keys),
+                1,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(candidate_error, baseline_error);
     }
 
     #[test]
@@ -1674,17 +1834,18 @@ mod tests {
     fn attr_get_arrow_microbenchmark() {
         let conditions = attr_benchmark_conditions();
         let rounds = ATTR_BENCHMARK_WARMUPS + ATTR_BENCHMARK_MEASURED_ROUNDS;
+        let udfs = AttrBenchmarkUdfs::new();
 
         for condition in &conditions {
             for row_count in ATTR_BENCHMARK_ROW_COUNTS {
                 let baseline = attr_benchmark_invoke(
-                    false,
+                    udfs.callable(false),
                     attr_benchmark_args(condition, row_count, 1, false)
                         .pop()
                         .unwrap(),
                 );
                 let candidate = attr_benchmark_invoke(
-                    true,
+                    udfs.callable(true),
                     attr_benchmark_args(condition, row_count, 1, false)
                         .pop()
                         .unwrap(),
@@ -1694,9 +1855,10 @@ mod tests {
                 assert_attr_outputs_equal(baseline, candidate, row_count);
 
                 for candidate in [false, true] {
+                    let callable = udfs.callable(candidate);
                     let mut args = attr_benchmark_args(condition, row_count, 1, false);
                     let (output, count) =
-                        allocations(|| attr_benchmark_invoke(candidate, args.pop().unwrap()));
+                        allocations(|| attr_benchmark_invoke(callable, args.pop().unwrap()));
                     drop(std::hint::black_box(output));
                     println!(
                         "{{\"benchmark\":\"attr_get_arrow_allocations\",\"pid\":{},\"condition\":\"{}\",\"rowcount\":{},\"key_representation\":\"scalar\",\"implementation\":\"{}\",\"invocations\":1,\"rows\":{},\"allocations\":{},\"allocations_per_invocation\":{},\"allocations_per_row\":{}}}",
@@ -1713,9 +1875,10 @@ mod tests {
 
                 if condition.name == "tiny_first" {
                     for candidate in [false, true] {
+                        let callable = udfs.callable(candidate);
                         let mut args = attr_benchmark_args(condition, row_count, 1, true);
                         let (output, count) =
-                            allocations(|| attr_benchmark_invoke(candidate, args.pop().unwrap()));
+                            allocations(|| attr_benchmark_invoke(callable, args.pop().unwrap()));
                         drop(std::hint::black_box(output));
                         println!(
                             "{{\"benchmark\":\"attr_get_arrow_allocations\",\"pid\":{},\"condition\":\"{}\",\"rowcount\":{},\"key_representation\":\"array\",\"implementation\":\"{}\",\"invocations\":1,\"rows\":{},\"allocations\":{},\"allocations_per_invocation\":{},\"allocations_per_row\":{}}}",
@@ -1744,8 +1907,9 @@ mod tests {
                         [true, false]
                     };
                     for (order, candidate) in implementations.into_iter().enumerate() {
+                        let callable = udfs.callable(candidate);
                         let args = attr_benchmark_args(condition, row_count, invocations, false);
-                        let elapsed = attr_benchmark_sample(candidate, args);
+                        let elapsed = attr_benchmark_sample(callable, args);
                         println!(
                             "{{\"benchmark\":\"attr_get_arrow\",\"pid\":{},\"condition\":\"{}\",\"rowcount\":{},\"invocations\":{},\"rows\":{},\"phase\":\"{}\",\"ordinal\":{},\"order\":{},\"implementation\":\"{}\",\"elapsed\":{},\"elapsed_unit\":\"ns\",\"below_1ms\":{},\"checksum\":{}}}",
                             std::process::id(),
