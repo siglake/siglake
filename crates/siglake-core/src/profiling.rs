@@ -776,6 +776,7 @@ mod tests {
                 let _ = handle.await;
             }
         });
+        drop(runtime);
 
         let measured = intervals.next().expect("second interval");
 
