@@ -1808,8 +1808,17 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   Three consequences. A table whose wide aggregate WOULD have covered the
   column now pays the footer tier once per generation per column instead of one
   fold — one footer read per live file, or a raw-page decode for a column no
-  footer covers — and which of those two is cheaper has NOT been measured; on a
-  table with many live files the fold may well have been the cheaper of the two.
+  footer covers. #7790 measured that trade
+  (`docs/PREDICATE_COUNT_TIER_COST_2026-10-30.md`): the footer tier costs two
+  reads per live file and is flat in the delta backlog, the fold costs one LIST
+  plus one GET per outstanding delta and is flat in file count, and they cross
+  at roughly `outstanding_deltas = 2 × live_files`. On the wrong side of that
+  crossover the footer tier is slower — worst local measurement 106.62 ms
+  against 10.28 ms at 256 live files with no backlog, about 96 ms once per
+  generation per column — and that is accepted, because the footer tier's cost
+  is bounded by the same file list the query would scan while the fold's is
+  bounded by nothing readable before paying it. No gate: the delta count is
+  knowable only from the listing a gate would be deciding about.
   The deferral is per generation, so under live ingest every commit returns the
   shape to the footer tier until some other query folds that generation. And
   because only the positive polarity takes this lookup, a `!=` on the same

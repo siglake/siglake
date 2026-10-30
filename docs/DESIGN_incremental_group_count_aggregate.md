@@ -705,9 +705,30 @@ generation — and still decodes a warm wide memo. The footer tier it continues
 to reads one footer per live file of the pinned generation, with a raw-page
 decode for a column no footer covers. That is the same work the generic lookup
 performs after a fold refuses, over the same file list the query would
-otherwise scan, but it is real work. The request is not I/O-free, the path is
-not "all bounded", and on a table with many live files the fold this declines
-may have been the cheaper of the two. That comparison is unmeasured.
+otherwise scan, but it is real work. The request is not I/O-free and the path
+is not "all bounded".
+
+#7790 measured the comparison on the first touch of a generation
+(`docs/PREDICATE_COUNT_TIER_COST_2026-10-30.md`, reproduced by
+`predicate_count_tier_cost_measurement` in
+`crates/siglake-storage/src/iceberg.rs`). The footer tier is two reads per live
+file and flat in the delta backlog; the fold is one LIST plus one GET per
+outstanding delta plus the base, and flat in file count. They cross at about
+`outstanding_deltas = 2 × live_files`. On a table with many live files and a
+compactor keeping up the declined fold IS the cheaper of the two: 106.62 ms
+against 10.28 ms at 256 live files with no backlog, roughly 96 ms once per
+generation per column. On the shape this policy exists for, the bounded lookup
+wins by more: 5.21 ms against 196.22 ms at 8 live files with 8,192 outstanding
+deltas, against a production case that reached 43,042.
+
+The policy stays as written. Selectivity does not enter — both tiers build the
+whole group-count map and the predicate picks one key out of it, so the
+selective and broad-match cases cost the same and no selectivity estimate could
+drive a gate. Nor can the crossover: live file count is free, but outstanding
+delta count is readable only from the listing a gate would be deciding about,
+and a gate on file count alone would fold exactly the compactor-behind table
+that caused the incident. The footer tier's worst case is bounded by the file
+list the query would scan anyway; the fold's is bounded by nothing.
 
 The no-fold claims are tested against `delta_io_probe`, a `#[cfg(test)]` trap
 on `list_group_count_objects`, `read_group_count_delta` and
