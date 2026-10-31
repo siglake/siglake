@@ -84,6 +84,87 @@ class IsolationTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 v.candidate_config(*values)
 
+    def test_actual_parser_rejects_whitespace_candidate_intent_before_side_effects(self):
+        source = 'a' * 40
+        engine = f'ghcr.io/siglake/siglake:{source}'
+        operator = f'ghcr.io/siglake/siglake-operator:{source}'
+        malformed = (
+            (' ', '', ''),
+            ('\t', '', ''),
+            ('\n', '', ''),
+            (' ', '\t', '\n'),
+            (' ', '', '\t'),
+            (' ' + source, engine, operator),
+            (source + '\t', engine, operator),
+            (source, engine + ' ', operator),
+            (source, engine, '\n' + operator),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            for index, (candidate_source, candidate_engine, candidate_operator) in enumerate(
+                malformed
+            ):
+                out = Path(temp) / f'refused-{index}'
+                argv = [
+                    '--version', 'v0.4.0',
+                    '--profile', 'smoke',
+                    '--candidate-source', candidate_source,
+                    '--candidate-engine-image', candidate_engine,
+                    '--candidate-operator-image', candidate_operator,
+                    '--out', str(out),
+                ]
+                with (
+                    self.subTest(
+                        values=(candidate_source, candidate_engine, candidate_operator)
+                    ),
+                    patch.object(v, 'run_command') as command,
+                    patch.object(v, 'http') as request,
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    v.parse_arguments(argv)
+                command.assert_not_called()
+                request.assert_not_called()
+                self.assertFalse(out.exists())
+
+    def test_actual_parser_and_prepare_choose_only_the_exact_requested_source(self):
+        source = 'a' * 40
+        engine = f'ghcr.io/siglake/siglake:{source}'
+        operator = f'ghcr.io/siglake/siglake-operator:{source}'
+        selections = (
+            ([], None, 'v0.4.0^{commit}'),
+            ([
+                '--candidate-source', '',
+                '--candidate-engine-image', '',
+                '--candidate-operator-image', '',
+            ], None, 'v0.4.0^{commit}'),
+            ([
+                '--candidate-source', source,
+                '--candidate-engine-image', engine,
+                '--candidate-operator-image', operator,
+            ], {
+                'source_commit': source,
+                'images': {'engine': engine, 'operator': operator},
+            }, source + '^{commit}'),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            for index, (candidate_args, expected_candidate, expected_ref) in enumerate(selections):
+                argv = [
+                    '--version', 'v0.4.0',
+                    '--profile', 'smoke',
+                    '--out', str(Path(temp) / f'run-{index}'),
+                    *candidate_args,
+                ]
+                args = v.parse_arguments(argv)
+                self.assertEqual(args.candidate, expected_candidate)
+                run = v.Run(args)
+                with patch.object(
+                    v, 'run_command', side_effect=RuntimeError('prepare boundary')
+                ) as command, self.assertRaisesRegex(RuntimeError, 'prepare boundary'):
+                    run.prepare()
+                command.assert_called_once_with([
+                    'git', '-C', str(v.ROOT), 'rev-parse', expected_ref,
+                ])
+
     def test_candidate_platform_selection_refuses_foreign_or_ambiguous_types(self):
         digest = 'sha256:' + 'b' * 64
         valid = {

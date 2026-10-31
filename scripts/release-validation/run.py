@@ -194,16 +194,19 @@ def candidate_image_reference(value, role, source_commit):
 
 
 def candidate_config(version, profile, dependency_policy, source, engine_image, operator_image):
-    values = tuple(value.strip() if value else '' for value in (
-        source, engine_image, operator_image
-    ))
-    present = tuple(bool(value) for value in values)
-    if any(present) and not all(present):
+    values = (source, engine_image, operator_image)
+    if not any(values):
+        return None
+    if not all(values):
         raise ValueError(
             'candidate source, engine image and operator image must be supplied together'
         )
-    if not any(present):
-        return None
+    names = ('source', 'engine image', 'operator image')
+    for name, value in zip(names, values):
+        if not value.strip():
+            raise ValueError(f'candidate {name} must not be blank')
+        if value != value.strip():
+            raise ValueError(f'candidate {name} must not contain surrounding whitespace')
     source, engine_image, operator_image = values
     if version != CANDIDATE_VERSION:
         raise ValueError(f'candidate mode requires --version {CANDIDATE_VERSION}')
