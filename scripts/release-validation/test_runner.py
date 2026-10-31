@@ -33,19 +33,275 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             v.isolated_config(config, 'release')
 
-    def test_version_selection_keeps_historical_checks_and_adds_0_3_0(self):
-        self.assertEqual(v.SUPPORTED_VERSIONS, ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0'))
-        self.assertEqual(v.PROVENANCE_VERSIONS, {'v0.2.1', 'v0.3.0'})
-        self.assertEqual(v.QUERY_AUDIT_AGGREGATE_VERSIONS, {'v0.2.1', 'v0.3.0'})
-        for version in ('v0.2.1', 'v0.3.0'):
+    def test_version_selection_keeps_historical_checks_and_adds_0_4_0(self):
+        self.assertEqual(
+            v.SUPPORTED_VERSIONS,
+            ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0', 'v0.4.0'),
+        )
+        self.assertEqual(v.PROVENANCE_VERSIONS, {'v0.2.1', 'v0.3.0', 'v0.4.0'})
+        self.assertEqual(
+            v.QUERY_AUDIT_AGGREGATE_VERSIONS,
+            {'v0.2.1', 'v0.3.0', 'v0.4.0'},
+        )
+        for version in ('v0.2.1', 'v0.3.0', 'v0.4.0'):
             args = v.argument_parser().parse_args([
                 '--version', version, '--profile', 'smoke', '--out', '/unused'
             ])
             self.assertEqual(args.version, version)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             v.argument_parser().parse_args([
-                '--version', 'v0.4.0', '--profile', 'smoke', '--out', '/unused'
+                '--version', 'v0.5.0', '--profile', 'smoke', '--out', '/unused'
             ])
+
+    def test_candidate_inputs_are_exact_all_or_none_and_smoke_only(self):
+        source = 'a' * 40
+        engine = f'ghcr.io/siglake/siglake:{source}'
+        operator = f'ghcr.io/siglake/siglake-operator:{source}'
+        self.assertEqual(
+            v.candidate_config('v0.4.0', 'smoke', 'public', source, engine, operator),
+            {
+                'source_commit': source,
+                'images': {'engine': engine, 'operator': operator},
+            },
+        )
+        refusals = (
+            ('v0.4.0', 'smoke', 'public', source, '', ''),
+            ('v0.3.0', 'smoke', 'public', source, engine, operator),
+            ('v0.4.0', '24h', 'public', source, engine, operator),
+            ('v0.4.0', '72h', 'public', source, engine, operator),
+            ('v0.4.0', 'smoke', 'cached-diagnostic', source, engine, operator),
+            ('v0.4.0', 'smoke', 'public', source[:-1], engine, operator),
+            (
+                'v0.4.0', 'smoke', 'public', source,
+                f'ghcr.io/foreign/siglake:{source}', operator,
+            ),
+            (
+                'v0.4.0', 'smoke', 'public', source,
+                'ghcr.io/siglake/siglake:0.4.0', operator,
+            ),
+        )
+        for values in refusals:
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                v.candidate_config(*values)
+
+    def test_actual_parser_rejects_whitespace_candidate_intent_before_side_effects(self):
+        source = 'a' * 40
+        engine = f'ghcr.io/siglake/siglake:{source}'
+        operator = f'ghcr.io/siglake/siglake-operator:{source}'
+        malformed = (
+            (' ', '', ''),
+            ('\t', '', ''),
+            ('\n', '', ''),
+            (' ', '\t', '\n'),
+            (' ', '', '\t'),
+            (' ' + source, engine, operator),
+            (source + '\t', engine, operator),
+            (source, engine + ' ', operator),
+            (source, engine, '\n' + operator),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            for index, (candidate_source, candidate_engine, candidate_operator) in enumerate(
+                malformed
+            ):
+                out = Path(temp) / f'refused-{index}'
+                argv = [
+                    '--version', 'v0.4.0',
+                    '--profile', 'smoke',
+                    '--candidate-source', candidate_source,
+                    '--candidate-engine-image', candidate_engine,
+                    '--candidate-operator-image', candidate_operator,
+                    '--out', str(out),
+                ]
+                with (
+                    self.subTest(
+                        values=(candidate_source, candidate_engine, candidate_operator)
+                    ),
+                    patch.object(v, 'run_command') as command,
+                    patch.object(v, 'http') as request,
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    v.parse_arguments(argv)
+                command.assert_not_called()
+                request.assert_not_called()
+                self.assertFalse(out.exists())
+
+    def test_actual_parser_and_prepare_choose_only_the_exact_requested_source(self):
+        source = 'a' * 40
+        engine = f'ghcr.io/siglake/siglake:{source}'
+        operator = f'ghcr.io/siglake/siglake-operator:{source}'
+        selections = (
+            ([], None, 'v0.4.0^{commit}'),
+            ([
+                '--candidate-source', '',
+                '--candidate-engine-image', '',
+                '--candidate-operator-image', '',
+            ], None, 'v0.4.0^{commit}'),
+            ([
+                '--candidate-source', source,
+                '--candidate-engine-image', engine,
+                '--candidate-operator-image', operator,
+            ], {
+                'source_commit': source,
+                'images': {'engine': engine, 'operator': operator},
+            }, source + '^{commit}'),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            for index, (candidate_args, expected_candidate, expected_ref) in enumerate(selections):
+                argv = [
+                    '--version', 'v0.4.0',
+                    '--profile', 'smoke',
+                    '--out', str(Path(temp) / f'run-{index}'),
+                    *candidate_args,
+                ]
+                args = v.parse_arguments(argv)
+                self.assertEqual(args.candidate, expected_candidate)
+                run = v.Run(args)
+                with patch.object(
+                    v, 'run_command', side_effect=RuntimeError('prepare boundary')
+                ) as command, self.assertRaisesRegex(RuntimeError, 'prepare boundary'):
+                    run.prepare()
+                command.assert_called_once_with([
+                    'git', '-C', str(v.ROOT), 'rev-parse', expected_ref,
+                ])
+
+    def test_candidate_platform_selection_refuses_foreign_or_ambiguous_types(self):
+        digest = 'sha256:' + 'b' * 64
+        valid = {
+            'schemaVersion': 2,
+            'manifests': [{
+                'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+                'digest': digest,
+                'platform': {'os': 'linux', 'architecture': 'amd64'},
+            }],
+        }
+        self.assertEqual(v.platform_descriptor(valid, 'linux', 'amd64')['digest'], digest)
+        with self.assertRaisesRegex(ValueError, '0 manifests'):
+            v.platform_descriptor(valid, 'linux', 'arm64')
+        foreign = {'schemaVersion': 2, 'manifests': [dict(valid['manifests'][0])]}
+        foreign['manifests'][0]['mediaType'] = 'application/vnd.oci.artifact.manifest.v1+json'
+        with self.assertRaisesRegex(ValueError, 'not an OCI/Docker image manifest'):
+            v.platform_descriptor(foreign, 'linux', 'amd64')
+
+    def test_candidate_manifest_graph_requires_exact_source_label(self):
+        source = 'a' * 40
+        child_digest = 'sha256:' + 'b' * 64
+        config_digest = 'sha256:' + 'c' * 64
+        index = {
+            'schemaVersion': 2,
+            'mediaType': 'application/vnd.oci.image.index.v1+json',
+            'manifests': [{
+                'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+                'digest': child_digest,
+                'platform': {'os': 'linux', 'architecture': 'amd64'},
+            }],
+        }
+        manifest = {
+            'schemaVersion': 2,
+            'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+            'config': {
+                'mediaType': 'application/vnd.oci.image.config.v1+json',
+                'digest': config_digest,
+            },
+            'layers': [{
+                'mediaType': 'application/vnd.oci.image.layer.v1.tar+gzip',
+                'digest': 'sha256:' + 'd' * 64,
+            }],
+        }
+        config = {
+            'os': 'linux',
+            'architecture': 'amd64',
+            'config': {'Labels': {
+                'org.opencontainers.image.source': v.OCI_SOURCE,
+                'org.opencontainers.image.revision': source[:12],
+            }},
+        }
+        replies = [
+            (v.json.dumps(index).encode(), 'sha256:' + 'e' * 64, index['mediaType']),
+            (v.json.dumps(manifest).encode(), child_digest, manifest['mediaType']),
+            (v.json.dumps(config).encode(), config_digest, 'application/json'),
+        ]
+        with patch.object(v, 'http', return_value={'token': 'public'}), patch.object(
+            v, '_registry_bytes', side_effect=replies
+        ):
+            graph = v.resolve_candidate_manifest(
+                'siglake/siglake', source, 'linux', 'amd64', source
+            )
+        self.assertEqual(graph['image'], f'ghcr.io/siglake/siglake@{child_digest}')
+        self.assertEqual(graph['config_digest'], config_digest)
+        self.assertEqual(graph['source_revision'], source[:12])
+
+        config['config']['Labels']['org.opencontainers.image.source'] = 'https://example.invalid/x'
+        replies[-1] = (v.json.dumps(config).encode(), config_digest, 'application/json')
+        with patch.object(v, 'http', return_value={'token': 'public'}), patch.object(
+            v, '_registry_bytes', side_effect=replies
+        ), self.assertRaisesRegex(ValueError, 'foreign source'):
+            v.resolve_candidate_manifest(
+                'siglake/siglake', source, 'linux', 'amd64', source
+            )
+        config['config']['Labels'] = {
+            'org.opencontainers.image.source': v.OCI_SOURCE,
+            'org.opencontainers.image.revision': 'f' * 12,
+        }
+        replies[-1] = (v.json.dumps(config).encode(), config_digest, 'application/json')
+        with patch.object(v, 'http', return_value={'token': 'public'}), patch.object(
+            v, '_registry_bytes', side_effect=replies
+        ), self.assertRaisesRegex(ValueError, 'revision does not match'):
+            v.resolve_candidate_manifest(
+                'siglake/siglake', source, 'linux', 'amd64', source
+            )
+
+    def test_candidate_workflow_keeps_inputs_out_of_shell_source(self):
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / '.github/workflows/release-validation.yml'
+        ).read_text()
+        self.assertIn(
+            'version: [v0.1.0, v0.2.0, v0.2.1, v0.3.0, v0.4.0]',
+            workflow,
+        )
+        for name in (
+            'candidate_source',
+            'candidate_engine_image',
+            'candidate_operator_image',
+        ):
+            self.assertIn(f'{name}:', workflow)
+        run_blocks = []
+        lines = workflow.splitlines()
+        for index, line in enumerate(lines):
+            if line.strip() != 'run: |':
+                continue
+            indent = len(line) - len(line.lstrip())
+            block = []
+            for nested in lines[index + 1:]:
+                nested_indent = len(nested) - len(nested.lstrip())
+                if nested.strip() and nested_indent <= indent:
+                    break
+                block.append(nested)
+            run_blocks.append('\n'.join(block))
+        shell_source = '\n'.join(run_blocks)
+        self.assertNotIn('${{ inputs.candidate_', shell_source)
+        self.assertIn('--candidate-source "$CANDIDATE_SOURCE"', shell_source)
+
+    def test_optional_feature_defaults_are_absent_from_packaged_workloads(self):
+        root = Path(__file__).resolve().parents[2]
+        compactor = (
+            root / 'deploy/helm/siglake/templates/deployment-compactor.yaml'
+        ).read_text()
+        query = (
+            root / 'deploy/helm/siglake/templates/statefulset-query-server.yaml'
+        ).read_text()
+        operator = (root / 'crates/siglake-operator/src/render.rs').read_text()
+        for knob, template in (
+            ('SIGLAKE_AUTO_PROMOTE_MIN_PCT', compactor),
+            ('SIGLAKE_SEGMENTED_INDEX_WRITES', compactor),
+            ('SIGLAKE_SEGMENTED_INDEX_READS', query),
+        ):
+            self.assertNotIn(f'- name: {knob}', template)
+            self.assertNotIn(f'"{knob}"', operator)
+        self.assertIn('.Values.compactor.extraEnv', compactor)
+        self.assertIn('.Values.query.extraEnv', query)
+        self.assertIn('extra_env_flows_into_all_tiers', operator)
 
     def test_product_provenance_accepts_the_release_commit(self):
         source = '5f14976533d79de60d31a727091241108ad1162e'

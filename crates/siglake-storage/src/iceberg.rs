@@ -30122,6 +30122,7 @@ mod env_knob_resolver_tests {
     fn segmented_index_writes_default_off_and_only_literal_one_enables_them() {
         assert!(!segmented_index_writes_enabled_from(None));
         assert!(!segmented_index_writes_enabled_from(Some("0")));
+        assert!(!segmented_index_writes_enabled_from(Some("false")));
         assert!(!segmented_index_writes_enabled_from(Some("true")));
         assert!(!segmented_index_writes_enabled_from(Some("junk")));
         assert!(segmented_index_writes_enabled_from(Some("1")));

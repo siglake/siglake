@@ -2,22 +2,75 @@
 
 ## Unreleased
 
-- OTLP log ingest preserves severity, trace/span correlation, flags, observed
-  time, event name, dropped counts, schema URLs, instrumentation scope context
-  and resource values shadowed by record attributes under the additive
-  `otel` object in residual attributes. Existing flat attribute lookups and
-  event columns are unchanged.
+## 0.4.0
 
-- Lossy OTLP log AnyValues gain an additive `otel.any_values` sidecar that
-  distinguishes strings from bytes, missing values from empty values, retains
-  nested arrays and key-value lists, and records non-finite doubles. Equivalent
-  JSON and protobuf bytes use the same canonical hex in the sidecar; existing
-  flat attribute lookups are unchanged.
+- **Query correctness and bounded fallback:** empty records responses retain
+  their projected column names. Promoted physical identifiers are quoted, and
+  WAL-backed `attr_get` projections and bounded string predicates retain the
+  residual path so a rewrite cannot drop fresh rows. Nested dotted-key
+  equality now uses the same exact lookup semantics in projection and filter
+  evaluation. Positive equality and `IN` counts no longer perform an
+  unbounded cold wide-aggregate fold on the request path; they use the exact
+  per-file footer tier or the exact filtered scan fallback.
+
+- **Bounded query work:** clipped `LIMIT` scans admit work deterministically,
+  stop reader credit after the fetch is full and filter 1,024-row reader
+  batches before DataFusion's larger receiver can retain excess rows. Numeric
+  `ORDER BY ... LIMIT` can prune row groups from exact Parquet bounds and reuse
+  snapshot-keyed decoded footers within its metadata budget. These paths keep
+  exact residuals and refuse to the ordinary plan when their prerequisites are
+  absent.
+
+- **OTLP log fidelity:** ingest preserves severity, trace/span correlation,
+  flags, observed time, event name, dropped counts, schema URLs,
+  instrumentation scope context and resource values shadowed by record
+  attributes under the additive `otel` object. Lossy AnyValues gain an
+  additive `otel.any_values` sidecar that preserves type and presence,
+  including bytes, nested values and non-finite doubles. Existing flat
+  attribute lookups and event columns are unchanged.
+
+- **SQL response accounting:** records responses carry execution time and the
+  server-computed remainder beside the existing plan, WAL-buffer, collect and
+  render phases. `x-siglake-handler-micros` closes the request-handler boundary
+  and `x-siglake-result-cache` distinguishes a replay. Batch and cached results
+  keep the execution that produced them; streamed responses retain their
+  existing shape.
+
+- **Scalar dotted-key lookup:** scalar UTF-8 `attr_get` keys no longer
+  materialize one repeated key per row. Exact top-level and dotted fallback
+  semantics are unchanged. The matched committed-data API experiment covered
+  8 blocks and 480 measured responses; its paired medians describe only that
+  fixed workload. They do not establish general latency or hybrid-WAL
+  freshness.
+
+- **Aged query-audit repair:** automatic maintenance now includes
+  `query_audit` in snapshot expiry and bounded small-file compaction. The
+  original v0.3.0 72-hour attempt remains failed: its final exact marker count
+  timed out during an aged maintenance pass. A separate targeted 32-file
+  current-source fixture returned the exact marker count during and after its
+  maintenance rendezvous; it is source evidence, not a regraded soak or
+  released-image duration result.
+
+- **Optional features remain off:** automatic promotion resolves absent,
+  invalid and non-positive thresholds to off. Segmented-index writes require
+  `SIGLAKE_SEGMENTED_INDEX_WRITES=1`; reads require the separate
+  `SIGLAKE_SEGMENTED_INDEX_READS` opt-in. The Helm chart and operator add no
+  opt-in by default and expose their existing environment overrides. Neither
+  optional S3 promotion nor segmented-index field qualification is claimed for
+  this release.
+
+- **Hybrid-WAL scope:** a bounded 32-row source fixture reproduces the
+  documented committed-snapshot fallback when WAL filter workspace is
+  unsupported or refused, and finds no new answer defect in that contract.
+  The October 30 omitted-WARN incident remains unresolved because its emitted
+  SQL, snapshot and WAL generation were not retained. This release does not
+  relabel omitted fresh rows as a performance limitation.
 
 ## 0.3.0
 
-- Auto-promotion remains disabled by default. Remaining optional qualification is
-  deferred to 0.4.0: the latest matched young-table run measured freshness p95
+- Auto-promotion remains disabled by default. Its optional qualification was
+  not complete at release and remains unqualified in 0.4.0: the latest matched
+  young-table run measured freshness p95
   of 117.8402 s with promotion versus 21.1050 s without it (5.5835×, above the
   unchanged 1.25× limit). Eventual exact physical coverage passed, but the
   required attributed promotion log was missing and the original reader
@@ -42,7 +95,7 @@
 - Known performance limitation: the retained clipped-text keyword and last-25
   queries measured about 386 ms and 27 ms, exceeding the 10 ms / 25 ms goals.
   Exact results and policy checks passed; the remaining latency goals are tracked
-  for 0.4.0 and are not claimed as met by this release.
+  and remain unqualified in 0.4.0; this release does not claim them as met.
 
 - WAL drains release decoded input batches before sorting and encoding their
   combined append, and move single batches without a concatenation copy.

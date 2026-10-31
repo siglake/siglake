@@ -7980,7 +7980,14 @@ mod auto_promotion_knob_tests {
     /// positive percentage may turn it on.
     #[test]
     fn auto_promotion_is_off_unless_explicitly_asked_for() {
-        for absent in [None, Some(""), Some("  "), Some("nope"), Some("on")] {
+        for absent in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("false"),
+            Some("nope"),
+            Some("on"),
+        ] {
             assert_eq!(
                 auto_promote_min_fraction_from(absent),
                 0.0,
