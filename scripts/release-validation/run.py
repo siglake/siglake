@@ -22,9 +22,10 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 DURATIONS = {'smoke': 120, '24h': 86400, '72h': 259200}
-SUPPORTED_VERSIONS = ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0')
-PROVENANCE_VERSIONS = frozenset({'v0.2.1', 'v0.3.0'})
-QUERY_AUDIT_AGGREGATE_VERSIONS = frozenset({'v0.2.1', 'v0.3.0'})
+SUPPORTED_VERSIONS = ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0', 'v0.4.0')
+PROVENANCE_VERSIONS = frozenset({'v0.2.1', 'v0.3.0', 'v0.4.0'})
+QUERY_AUDIT_AGGREGATE_VERSIONS = frozenset({'v0.2.1', 'v0.3.0', 'v0.4.0'})
+CANDIDATE_VERSION = 'v0.4.0'
 PRODUCT_REPOSITORIES = {
     'engine': 'siglake/siglake',
     'operator': 'siglake/siglake-operator',
@@ -33,6 +34,21 @@ PRODUCT_BINARIES = {
     'engine': 'siglake',
     'operator': 'siglake-operator',
 }
+OCI_SOURCE = 'https://github.com/siglake/siglake'
+FULL_COMMIT = re.compile(r'[0-9a-f]{40}')
+OCI_INDEX_TYPES = frozenset({
+    'application/vnd.oci.image.index.v1+json',
+    'application/vnd.docker.distribution.manifest.list.v2+json',
+})
+OCI_MANIFEST_TYPES = frozenset({
+    'application/vnd.oci.image.manifest.v1+json',
+    'application/vnd.docker.distribution.manifest.v2+json',
+})
+OCI_CONFIG_TYPES = frozenset({
+    'application/vnd.oci.image.config.v1+json',
+    'application/vnd.docker.container.image.v1+json',
+})
+OCI_ACCEPT = ', '.join((*sorted(OCI_INDEX_TYPES), *sorted(OCI_MANIFEST_TYPES)))
 TOKEN = 'release-validation-fixture-token'  # disposable local fixture, not a credential
 SERVICES = ['postgres', 'minio', 'minio-init', 'ingester', 'compactor', 'query-server']
 LOG_TIMESTAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})')
@@ -166,6 +182,178 @@ def http(url, data=None, token=TOKEN, timeout=30):
         return json.loads(response.read() or '{}')
 
 
+def candidate_image_reference(value, role, source_commit):
+    """Require the public product repository and the full source SHA as its tag."""
+    expected = f'ghcr.io/{PRODUCT_REPOSITORIES[role]}:{source_commit}'
+    if value != expected:
+        raise ValueError(
+            f'candidate {role} image must be exactly {expected}; tags, digests and '
+            'foreign repositories cannot substitute for the source-named image'
+        )
+    return value
+
+
+def candidate_config(version, profile, dependency_policy, source, engine_image, operator_image):
+    values = tuple(value.strip() if value else '' for value in (
+        source, engine_image, operator_image
+    ))
+    present = tuple(bool(value) for value in values)
+    if any(present) and not all(present):
+        raise ValueError(
+            'candidate source, engine image and operator image must be supplied together'
+        )
+    if not any(present):
+        return None
+    source, engine_image, operator_image = values
+    if version != CANDIDATE_VERSION:
+        raise ValueError(f'candidate mode requires --version {CANDIDATE_VERSION}')
+    if profile != 'smoke':
+        raise ValueError('candidate mode is smoke-only; 24h and 72h are refused')
+    if dependency_policy != 'public':
+        raise ValueError('candidate mode requires anonymous public dependency resolution')
+    if FULL_COMMIT.fullmatch(source) is None:
+        raise ValueError('candidate source must be exactly 40 lowercase hexadecimal characters')
+    return {
+        'source_commit': source,
+        'images': {
+            'engine': candidate_image_reference(engine_image, 'engine', source),
+            'operator': candidate_image_reference(operator_image, 'operator', source),
+        },
+    }
+
+
+def normalize_platform(os_name, architecture):
+    architecture = {'x86_64': 'amd64', 'aarch64': 'arm64'}.get(
+        architecture, architecture
+    )
+    if not re.fullmatch(r'[a-z0-9_][a-z0-9_.-]*', os_name or ''):
+        raise ValueError(f'Docker reported an invalid operating system: {os_name!r}')
+    if not re.fullmatch(r'[a-z0-9_][a-z0-9_.-]*', architecture or ''):
+        raise ValueError(f'Docker reported an invalid architecture: {architecture!r}')
+    return os_name, architecture
+
+
+def platform_descriptor(index, os_name, architecture):
+    if index.get('schemaVersion') != 2:
+        raise ValueError('candidate image index does not use schemaVersion 2')
+    manifests = index.get('manifests')
+    if not isinstance(manifests, list):
+        raise ValueError('candidate image index has no manifest list')
+    matches = []
+    for descriptor in manifests:
+        if not isinstance(descriptor, dict):
+            raise ValueError('candidate image index contains a non-object descriptor')
+        platform = descriptor.get('platform') or {}
+        if platform.get('os') == os_name and platform.get('architecture') == architecture:
+            matches.append(descriptor)
+    if len(matches) != 1:
+        raise ValueError(
+            f'candidate image index has {len(matches)} manifests for {os_name}/{architecture}'
+        )
+    descriptor = matches[0]
+    if descriptor.get('mediaType') not in OCI_MANIFEST_TYPES:
+        raise ValueError('candidate platform descriptor is not an OCI/Docker image manifest')
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', descriptor.get('digest', '')):
+        raise ValueError('candidate platform descriptor has an invalid digest')
+    return descriptor
+
+
+def _registry_bytes(url, token, accept=None, expected_digest=None):
+    headers = {'Authorization': 'Bearer ' + token}
+    if accept is not None:
+        headers['Accept'] = accept
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as response:
+        content = response.read()
+        digest = 'sha256:' + hashlib.sha256(content).hexdigest()
+        recorded = response.headers.get('Docker-Content-Digest')
+        if recorded is not None and recorded != digest:
+            raise ValueError('registry digest does not match response bytes')
+        if expected_digest is not None and expected_digest != digest:
+            raise ValueError('registry response does not match its parent descriptor')
+        return content, digest, response.headers.get('Content-Type', '').split(';', 1)[0]
+
+
+def resolve_candidate_manifest(repo, reference, os_name, architecture, source_commit):
+    """Resolve one SHA-tagged public image to its exact platform manifest and config."""
+    token_url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:' + repo + ':pull'
+    token = http(token_url, token=None)['token']
+    base = 'https://ghcr.io/v2/' + repo
+    content, requested_digest, content_type = _registry_bytes(
+        base + '/manifests/' + reference, token, OCI_ACCEPT
+    )
+    document = json.loads(content)
+    media_type = document.get('mediaType', content_type)
+    index_digest = None
+    if media_type in OCI_INDEX_TYPES:
+        descriptor = platform_descriptor(document, os_name, architecture)
+        index_digest = requested_digest
+        content, manifest_digest, content_type = _registry_bytes(
+            base + '/manifests/' + descriptor['digest'],
+            token,
+            OCI_ACCEPT,
+            descriptor['digest'],
+        )
+        manifest = json.loads(content)
+        media_type = manifest.get('mediaType', content_type)
+    elif media_type in OCI_MANIFEST_TYPES:
+        manifest = document
+        manifest_digest = requested_digest
+    else:
+        raise ValueError(f'candidate registry object has unsupported media type {media_type!r}')
+    if media_type not in OCI_MANIFEST_TYPES or manifest.get('schemaVersion') != 2:
+        raise ValueError('candidate platform object is not a schemaVersion 2 image manifest')
+    config_descriptor = manifest.get('config')
+    if not isinstance(config_descriptor, dict) or not re.fullmatch(
+        r'sha256:[0-9a-f]{64}', config_descriptor.get('digest', '')
+    ):
+        raise ValueError('candidate image manifest has an invalid config descriptor')
+    if config_descriptor.get('mediaType') not in OCI_CONFIG_TYPES:
+        raise ValueError('candidate image manifest has a non-image config type')
+    layers = manifest.get('layers')
+    if not isinstance(layers, list) or not layers:
+        raise ValueError('candidate image manifest has no layers')
+    for layer in layers:
+        if not isinstance(layer, dict) or not re.fullmatch(
+            r'sha256:[0-9a-f]{64}', layer.get('digest', '')
+        ):
+            raise ValueError('candidate image manifest has an invalid layer descriptor')
+        if not layer.get('mediaType', '').startswith((
+            'application/vnd.oci.image.layer.',
+            'application/vnd.docker.image.rootfs.',
+        )):
+            raise ValueError('candidate image manifest has a non-image layer type')
+    config_bytes, config_digest, _ = _registry_bytes(
+        base + '/blobs/' + config_descriptor['digest'],
+        token,
+        expected_digest=config_descriptor['digest'],
+    )
+    config = json.loads(config_bytes)
+    actual_platform = normalize_platform(config.get('os'), config.get('architecture'))
+    if actual_platform != (os_name, architecture):
+        raise ValueError(
+            f'candidate config platform {actual_platform[0]}/{actual_platform[1]} does not '
+            f'match Docker platform {os_name}/{architecture}'
+        )
+    labels = (config.get('config') or {}).get('Labels') or {}
+    if labels.get('org.opencontainers.image.source') != OCI_SOURCE:
+        raise ValueError('candidate image config has a foreign source label')
+    source_revision = labels.get('org.opencontainers.image.revision', '')
+    if (
+        re.fullmatch(r'[0-9a-f]{7,40}', source_revision) is None
+        or not source_commit.startswith(source_revision)
+    ):
+        raise ValueError('candidate image config revision does not match candidate source')
+    return {
+        'requested': f'ghcr.io/{repo}:{reference}',
+        'image': f'ghcr.io/{repo}@{manifest_digest}',
+        'index_digest': index_digest,
+        'manifest_digest': manifest_digest,
+        'config_digest': config_digest,
+        'platform': f'{os_name}/{architecture}',
+        'source_revision': source_revision,
+    }
+
+
 def anonymous_manifest(repo, version):
     url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:' + repo + ':pull'
     token = http(url, token=None)['token']
@@ -244,6 +432,7 @@ def isolated_config(config, image):
 class Run:
     def __init__(self, args):
         self.args = args
+        self.candidate = getattr(args, 'candidate', None)
         self.project = 'llvalidate-' + uuid.uuid4().hex[:12]
         self.out = Path(args.out).resolve()
         self.out.mkdir(parents=True, exist_ok=False)
@@ -258,6 +447,8 @@ class Run:
                             project=self.project, status='running', cleanup='pending',
                             checks=[], limitations=['Single-node Compose; Kubernetes/operator, OIDC tenant isolation, multi-replica distribution, upgrades, retention/delete, schema evolution and expensive-query cancellation are separate required qualification tracks.',
                             'Bounded baseline load: 100 events per cycle, three simultaneous oracle queries; this is not saturation or a large-working-set performance benchmark.'])
+        if self.candidate is not None:
+            self.summary['qualification'] = 'candidate'
         self.expected = 0
         self.cycles = 0
         self.resource_samples = 0
@@ -280,12 +471,70 @@ class Run:
 
     def prepare(self):
         version = self.args.version
-        self.summary['source_commit'] = run_command(['git', '-C', str(ROOT), 'rev-parse', version + '^{commit}']).strip()
+        source_ref = self.candidate['source_commit'] if self.candidate else version
+        self.summary['source_commit'] = run_command(
+            ['git', '-C', str(ROOT), 'rev-parse', source_ref + '^{commit}']
+        ).strip()
+        if self.candidate and self.summary['source_commit'] != source_ref:
+            raise ValueError('candidate source did not resolve to the requested full commit')
+        self.summary['source_tree'] = run_command(
+            ['git', '-C', str(ROOT), 'rev-parse', source_ref + '^{tree}']
+        ).strip()
         self.summary['harness_commit'] = run_command(['git', '-C', str(ROOT), 'rev-parse', 'HEAD']).strip()
         self.summary['harness_sha256'] = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
         self.summary['harness_dirty'] = bool(run_command(['git', '-C', str(ROOT), 'status', '--porcelain']).strip())
         (self.out / 'harness.py').write_bytes(Path(__file__).read_bytes())
-        if version in PROVENANCE_VERSIONS:
+        if self.candidate:
+            platform = run_command(
+                ['docker', 'info', '--format', '{{.OSType}}/{{.Architecture}}'], self.env
+            ).strip()
+            fields = platform.split('/', 1)
+            if len(fields) != 2:
+                raise ValueError(f'Docker reported an invalid platform: {platform!r}')
+            os_name, architecture = normalize_platform(*fields)
+            self.summary['platform'] = f'{os_name}/{architecture}'
+            self.summary['requested_product_images'] = self.candidate['images']
+            resolved = {
+                role: resolve_candidate_manifest(
+                    repo,
+                    self.candidate['images'][role].rsplit(':', 1)[1],
+                    os_name,
+                    architecture,
+                    self.summary['source_commit'],
+                )
+                for role, repo in PRODUCT_REPOSITORIES.items()
+            }
+            # Both platform manifests are frozen before either product binary
+            # is pulled or executed.
+            self.summary['product_image_graph'] = resolved
+            self.summary['product_images'] = {
+                role: graph['image'] for role, graph in resolved.items()
+            }
+            self.summary['image'] = self.summary['product_images']['engine']
+            self.summary['product_provenance'] = {}
+            self.save()
+            for role, image in self.summary['product_images'].items():
+                run_command(['docker', 'pull', image], self.env, timeout=600)
+                inspected = json.loads(
+                    run_command(['docker', 'image', 'inspect', image], self.env)
+                )[0]
+                graph = resolved[role]
+                if inspected.get('Id') != graph['config_digest']:
+                    raise ValueError(f'candidate {role} pull has a foreign image config')
+                inspected_platform = normalize_platform(
+                    inspected.get('Os'), inspected.get('Architecture')
+                )
+                if inspected_platform != (os_name, architecture):
+                    raise ValueError(f'candidate {role} pull has a foreign platform')
+                output = run_command(
+                    ['docker', 'run', '--rm', '--network', 'none', '--pull', 'never', image, '--version'],
+                    self.env,
+                    timeout=60,
+                )
+                self.summary['product_provenance'][role] = product_provenance(
+                    output, version, self.summary['source_commit'], PRODUCT_BINARIES[role]
+                )
+        elif version in PROVENANCE_VERSIONS:
             self.summary['product_images'] = {
                 role: anonymous_manifest(repo, version)
                 for role, repo in PRODUCT_REPOSITORIES.items()
@@ -306,7 +555,8 @@ class Run:
             self.summary['image'] = anonymous_manifest(
                 PRODUCT_REPOSITORIES['engine'], version
             )
-        self.summary['platform'] = run_command(['docker', 'info', '--format', '{{.OSType}}/{{.Architecture}}'], self.env).strip()
+        if not self.candidate:
+            self.summary['platform'] = run_command(['docker', 'info', '--format', '{{.OSType}}/{{.Architecture}}'], self.env).strip()
         self.docker_root_dir = parse_docker_root_dir(
             run_command(['docker', 'info', '--format', '{{json .DockerRootDir}}'], self.env).strip()
         )
@@ -320,7 +570,9 @@ class Run:
         )
         if capacity_problem:
             raise StorageCapacityExhausted(capacity_problem)
-        template = run_command(['git', '-C', str(ROOT), 'show', version + ':deploy/docker-compose.yml'])
+        template = run_command(
+            ['git', '-C', str(ROOT), 'show', source_ref + ':deploy/docker-compose.yml']
+        )
         source = self.out / 'release-compose.yml'
         source.write_text(template)
         config = json.loads(run_command(['docker', 'compose', '-p', self.project, '-f', str(source), 'config', '--format', 'json'], self.env))
@@ -343,7 +595,13 @@ class Run:
         self.mutated = True
         self.cmd('up', '-d', '--no-build', '--wait', '--wait-timeout', '180', timeout=240)
         self.refresh_endpoints()
-        self.event('isolated_install', result='pass', dependency_policy=self.args.dependency_policy, image=self.summary['image'])
+        self.event(
+            'isolated_install',
+            result='pass',
+            qualification='candidate' if self.candidate else 'released',
+            dependency_policy=self.args.dependency_policy,
+            image=self.summary['image'],
+        )
 
     def refresh_endpoints(self):
         self.ingest = 'http://' + self.cmd('port', 'ingester', '8088').strip()
@@ -570,7 +828,9 @@ class Run:
                 'query audit row persistence across query-server restart',
                 'query audit inline aggregate coverage across query-server restart',
             ])
-        if self.args.version in PROVENANCE_VERSIONS:
+        if self.candidate:
+            checks.insert(1, 'candidate engine/operator provenance matches exact source and platform')
+        elif self.args.version in PROVENANCE_VERSIONS:
             checks.insert(1, 'engine/operator provenance matches release tag')
         self.summary.update(status='passed', workload_elapsed_seconds=time.monotonic()-self.start,
                             checks=checks, resource_samples=self.resource_samples)
@@ -624,19 +884,49 @@ class Run:
 
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--version', required=True, choices=SUPPORTED_VERSIONS)
+    parser.add_argument('--version', required=True, choices=('both', *SUPPORTED_VERSIONS))
     parser.add_argument('--profile', required=True, choices=DURATIONS)
     parser.add_argument('--dependency-policy', choices=['public', 'cached-diagnostic'], default='public', help='cached-diagnostic uses existing dependency images; NEVER qualifies anonymous clean install')
     parser.add_argument('--docker-reserve-gib', type=int, default=0, help='fail before setup or a resource sample when Docker backing storage falls below this reserve')
+    parser.add_argument('--candidate-source', default='', help='exact 40-character candidate source commit')
+    parser.add_argument('--candidate-engine-image', default='', help='public engine image tagged by the exact candidate source commit')
+    parser.add_argument('--candidate-operator-image', default='', help='public operator image tagged by the exact candidate source commit')
+    parser.add_argument('--validate-only', action='store_true', help='validate selection and candidate inputs without registry, product or Docker access')
     parser.add_argument('--out', required=True, help='new, durable results directory; must not already exist')
     return parser
 
 
-def main():
+def parse_arguments(argv=None):
     parser = argument_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.docker_reserve_gib < 0:
         parser.error('--docker-reserve-gib must be non-negative')
+    try:
+        args.candidate = candidate_config(
+            args.version,
+            args.profile,
+            args.dependency_policy,
+            args.candidate_source,
+            args.candidate_engine_image,
+            args.candidate_operator_image,
+        )
+    except ValueError as error:
+        parser.error(str(error))
+    if args.version == 'both' and not args.validate_only:
+        parser.error('--version both is a workflow selection, not a runnable product version')
+    return args
+
+
+def main():
+    args = parse_arguments()
+    if args.validate_only:
+        print(json.dumps({
+            'selection': args.version,
+            'profile': args.profile,
+            'qualification': 'candidate' if args.candidate else 'released',
+            'valid': True,
+        }))
+        return 0
     run = Run(args)
     def interrupted(signum, frame):
         raise KeyboardInterrupt(f'signal {signum}')

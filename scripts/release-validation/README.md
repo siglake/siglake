@@ -18,8 +18,8 @@ each dependency, and no swap. It is a single-host validation configuration, not
 a claim to test stock Helm defaults.
 
 ```sh
-python3 scripts/release-validation/run.py --version v0.3.0 --profile smoke \
-  --out "$HOME/siglake-validation/v0.3.0-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+python3 scripts/release-validation/run.py --version v0.4.0 --profile smoke \
+  --out "$HOME/siglake-validation/v0.4.0-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
 Use `sg docker -c '...'` if your current session lacks the Docker group. Supported
@@ -28,6 +28,31 @@ profiles are `smoke` (at least 120 seconds of workload plus setup/assertions),
 The 72h profile records an intermediate 24h checkpoint; it is not a separately
 cleaned-up 24h run. Setup and final restart/cleanup time are outside the duration.
 A directory must be new: a failure or retry never overwrites earlier evidence.
+
+## Run an exact pre-tag v0.4.0 candidate
+
+Candidate mode accepts only the smoke profile, anonymous public dependencies,
+one full lowercase source commit and the two public images named by that same
+commit. It resolves both image tags to the current Docker platform's immutable
+manifest and verifies their config source/revision labels before pulling or
+executing either binary. The candidate's Compose file is read from the exact
+source commit. No tag, branch or fallback checkout is used.
+
+```sh
+candidate_source=0123456789abcdef0123456789abcdef01234567
+python3 scripts/release-validation/run.py \
+  --version v0.4.0 --profile smoke \
+  --candidate-source "$candidate_source" \
+  --candidate-engine-image "ghcr.io/siglake/siglake:$candidate_source" \
+  --candidate-operator-image "ghcr.io/siglake/siglake-operator:$candidate_source" \
+  --out "$HOME/siglake-validation/v0.4.0-candidate-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The three candidate inputs are all-or-none. Candidate mode refuses `24h`,
+`72h`, cached dependencies, foreign repositories, version tags and digest-only
+substitutions before any registry or Docker action. It records `qualification:
+candidate`; this is smoke evidence and cannot create or qualify a release tag.
+Released-tag mode keeps its existing tag-derived source and image behavior.
 
 ### Repeat the v0.2.1 duration profiles after the October 4 failures
 
@@ -154,9 +179,13 @@ and volumes, and records remaining resources. Never use global `docker prune`.
 A cleanup failure makes the result fail. Evidence, harness snapshots and shared
 image layers remain for review; remove these deliberately after retention ends.
 
-The manual `Public release validation` GitHub workflow runs a two-version smoke
-matrix on hosted runners and duration profiles on a dedicated runner labeled
-`siglake-validation`. It uploads results even on failure and invokes recovery.
+The manual `Public release validation` GitHub workflow runs all supported
+released versions as a smoke matrix on hosted runners and duration profiles on
+a dedicated runner labeled `siglake-validation`. It uploads results even on
+failure and invokes recovery.
+A candidate request is one separate hosted smoke job checked out at its exact
+source commit; candidate fields with `both`, another version or a duration
+profile are rejected by preflight.
 A hard runner loss requires the recovery command above; an `always()` step cannot
 run on a host that is gone. Long profiles do not fit hosted runner time limits.
 

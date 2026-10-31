@@ -3436,6 +3436,7 @@ mod tests {
         assert!(!segmented_index_reads_from(Some("")));
         assert!(!segmented_index_reads_from(Some("sometimes")));
         assert!(!segmented_index_reads_from(Some("0")));
+        assert!(!segmented_index_reads_from(Some("false")));
         assert!(!segmented_index_reads_from(Some("   ")));
         assert!(segmented_index_reads_from(Some("  TrUe  ")));
         for enabled in ["1", "true", "yes", "on"] {
