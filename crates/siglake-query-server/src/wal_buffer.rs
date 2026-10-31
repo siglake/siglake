@@ -1919,15 +1919,35 @@ fn filter_batches_charged(
     if filters.is_empty() || batches.is_empty() {
         return Some(Ok(batches.to_vec()));
     }
-    let Some(workspace) = filters
-        .iter()
-        .try_fold(FilterWorkspace::default(), |workspace, filter| {
-            workspace.checked_add(bounded_filter_workspace(filter)?)
-        })
-    else {
+    let Some(bound) = filter_workspace_bound(batches, filters) else {
         metrics::counter!("siglake_query_wal_buffer_refused_filter_workspace_total").increment(1);
         return None;
     };
+    let reservation = memory.try_reserve(bound)?;
+    let filtered = match filter_batches(batches, filters, schema, state) {
+        Ok(filtered) => filtered,
+        Err(error) => return Some(Err(error)),
+    };
+    if !reservation.contains_actual(batches_payload_bytes(&filtered)) {
+        return Some(Err(DataFusionError::ResourcesExhausted(
+            "WAL filter output exceeded its admitted payload bound".to_string(),
+        )));
+    }
+    Some(
+        attach_reservation_to_batches(filtered, &reservation)
+            .map_err(|error| DataFusionError::External(error.into())),
+    )
+}
+
+/// Return the complete query-local allocation bound used by the filter
+/// pre-pass. Keeping the calculation separate lets the scan regression pin a
+/// reservation one byte below the boundary without allocating to exhaustion.
+fn filter_workspace_bound(batches: &[RecordBatch], filters: &[Expr]) -> Option<u64> {
+    let workspace = filters
+        .iter()
+        .try_fold(FilterWorkspace::default(), |workspace, filter| {
+            workspace.checked_add(bounded_filter_workspace(filter)?)
+        })?;
     let rows = batches.iter().fold(0u64, |rows, batch| {
         rows.saturating_add(batch.num_rows() as u64)
     });
@@ -1956,20 +1976,7 @@ fn filter_batches_charged(
         .checked_add(mask_bytes)?
         .checked_add(scalar_bytes)?
         .checked_add(attr_get_bytes)?;
-    let reservation = memory.try_reserve(bound)?;
-    let filtered = match filter_batches(batches, filters, schema, state) {
-        Ok(filtered) => filtered,
-        Err(error) => return Some(Err(error)),
-    };
-    if !reservation.contains_actual(batches_payload_bytes(&filtered)) {
-        return Some(Err(DataFusionError::ResourcesExhausted(
-            "WAL filter output exceeded its admitted payload bound".to_string(),
-        )));
-    }
-    Some(
-        attach_reservation_to_batches(filtered, &reservation)
-            .map_err(|error| DataFusionError::External(error.into())),
-    )
+    Some(bound)
 }
 
 /// A [`TableProvider`] that unions a base provider (the Iceberg `events`
@@ -3866,6 +3873,18 @@ mod buffer_prefilter_tests {
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::execution::FunctionRegistry;
     use datafusion::prelude::{col, lit, SessionContext};
+    use siglake_core::Event;
+    use siglake_wal::WalWriter;
+    use std::time::Duration;
+
+    fn loaded_buffer(outcome: BufferReadOutcome) -> Arc<DecodedBuffer> {
+        match outcome {
+            BufferReadOutcome::Loaded(decoded) => decoded,
+            BufferReadOutcome::Refused { compressed_bytes } => {
+                panic!("tiny fixture was refused after {compressed_bytes} compressed bytes")
+            }
+        }
+    }
 
     fn batch() -> (SchemaRef, RecordBatch) {
         let schema: SchemaRef = Arc::new(Schema::new(vec![
@@ -3992,5 +4011,363 @@ mod buffer_prefilter_tests {
         assert!(memory.used() > source_payload);
         drop(output);
         assert_eq!(memory.used(), 0);
+    }
+
+    #[derive(Clone)]
+    struct HybridWarnRow {
+        id: String,
+        timestamp_ns: i64,
+        severity: &'static str,
+        customer_segment: &'static str,
+        http_route: &'static str,
+        region: &'static str,
+        request_kind: &'static str,
+        customer_tier: &'static str,
+        deployment_ring: &'static str,
+        service_name: &'static str,
+    }
+
+    impl HybridWarnRow {
+        fn event(&self) -> Event {
+            let attribute_map = serde_json::json!({
+                "customer.segment": self.customer_segment,
+                "http.route": self.http_route,
+                "region": self.region,
+                "request.kind": self.request_kind,
+                "customer.tier": self.customer_tier,
+                "deployment.ring": self.deployment_ring,
+            });
+            let resource_map = serde_json::json!({"service.name": self.service_name});
+            Event {
+                timestamp: chrono::DateTime::from_timestamp_nanos(self.timestamp_ns),
+                host: "hybrid-host".into(),
+                source: "hybrid-fixture".into(),
+                sourcetype: "signoz.logs".into(),
+                index: "signoz-events".into(),
+                raw: self.id.clone(),
+                attributes: Some(
+                    serde_json::json!({
+                        "sl_signoz_v1": {
+                            "severity_text": self.severity,
+                            "attributes_string": attribute_map.to_string(),
+                            "resources_string": resource_map.to_string(),
+                        }
+                    })
+                    .to_string(),
+                ),
+            }
+        }
+
+        fn projected(&self) -> serde_json::Value {
+            serde_json::json!({
+                "record_id": self.id,
+                "timestamp": self.timestamp_ns,
+                "customer_segment": self.customer_segment,
+                "http_route": self.http_route,
+                "region": self.region,
+                "request_kind": self.request_kind,
+                "customer_tier": self.customer_tier,
+                "deployment_ring": self.deployment_ring,
+                "service_name": self.service_name,
+            })
+        }
+    }
+
+    fn hybrid_warn_rows(prefix: &str, timestamp_start: i64) -> Vec<HybridWarnRow> {
+        (0..16)
+            .map(|i| HybridWarnRow {
+                id: format!("{prefix}-{i:02}"),
+                timestamp_ns: timestamp_start + i,
+                severity: if i % 2 == 0 { "WARN" } else { "INFO" },
+                customer_segment: if i % 4 == 0 { "business" } else { "enterprise" },
+                http_route: if i % 2 == 0 {
+                    "/v1/checkout"
+                } else {
+                    "/v1/session"
+                },
+                region: if i % 3 == 0 { "eu-west-1" } else { "us-east-1" },
+                request_kind: if i % 2 == 0 { "write" } else { "retry" },
+                customer_tier: if i % 2 == 0 { "gold" } else { "free" },
+                deployment_ring: if i % 3 == 0 { "canary" } else { "stable" },
+                service_name: if i % 2 == 0 { "checkout" } else { "payments" },
+            })
+            .collect()
+    }
+
+    fn expected_hybrid_rows(rows: &[HybridWarnRow], warn_only: bool) -> serde_json::Value {
+        let mut selected = rows
+            .iter()
+            .filter(|row| !warn_only || row.severity == "WARN")
+            .cloned()
+            .collect::<Vec<_>>();
+        selected.sort_by(|left, right| {
+            left.customer_segment
+                .cmp(right.customer_segment)
+                .then_with(|| right.timestamp_ns.cmp(&left.timestamp_ns))
+        });
+        serde_json::Value::Array(selected.iter().map(HybridWarnRow::projected).collect())
+    }
+
+    fn fixture_file_totals(root: &Path) -> (usize, u64, usize) {
+        fn visit(path: &Path, files: &mut usize, bytes: &mut u64, segments: &mut usize) {
+            for entry in std::fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let metadata = entry.metadata().unwrap();
+                if metadata.is_dir() {
+                    visit(&entry.path(), files, bytes, segments);
+                } else if metadata.is_file() {
+                    *files += 1;
+                    *bytes = bytes.saturating_add(metadata.len());
+                    if entry.path().extension().is_some_and(|ext| ext == "arrow") {
+                        *segments += 1;
+                    }
+                }
+            }
+        }
+        let (mut files, mut bytes, mut segments) = (0, 0, 0);
+        visit(root, &mut files, &mut bytes, &mut segments);
+        (files, bytes, segments)
+    }
+
+    fn plan_contains(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
+        plan.name() == name
+            || plan
+                .children()
+                .iter()
+                .any(|child| plan_contains(child, name))
+    }
+
+    async fn run_hybrid_query(
+        provider: Arc<dyn TableProvider>,
+        query: &str,
+        expected: &serde_json::Value,
+        expect_union: bool,
+    ) {
+        let future = async {
+            let ctx = SessionContext::new();
+            crate::udfs::register_udfs(&ctx);
+            ctx.register_table("events", provider).unwrap();
+            let frame = ctx.sql(query).await.unwrap();
+            let plan = frame.create_physical_plan().await.unwrap();
+            assert_eq!(
+                plan_contains(&plan, "UnionExec"),
+                expect_union,
+                "physical plan must identify whether the WAL generation was admitted"
+            );
+            let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+                .await
+                .unwrap();
+            let response = crate::format::batches_to_records(&batches, None).unwrap();
+            assert_eq!(&response.rows, expected);
+        };
+        tokio::time::timeout(Duration::from_secs(30), future)
+            .await
+            .expect("hybrid WARN fixture case exceeded 30 seconds");
+    }
+
+    /// #7923: exercise the complete `UnionEventsProvider::scan` path with the
+    /// retained SigNoz WARN predicate, selected attributes and ordering. The
+    /// same 16 committed + 16 WAL rows back every control. A one-byte-short
+    /// filter workspace proves the documented committed-snapshot fallback
+    /// without exhausting process memory; an allocating expression proves the
+    /// distinct unsupported-workspace branch.
+    #[tokio::test]
+    async fn hybrid_warn_scan_distinguishes_visible_union_and_committed_fallbacks() {
+        const CASES: usize = 5;
+        const ADEQUATE_BUDGET: u64 = 16 * MIB;
+        const LOGICAL_PAYLOAD_CAP: u64 = 128 * 1024;
+        const WAL_BYTES_CAP: u64 = MIB;
+        const FIXTURE_DISK_CAP: u64 = 4 * MIB;
+        const BASE_NS: i64 = 1_793_223_199_000_000_000;
+        const { assert!(CASES <= 8) };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal = tmp.path().join("wal");
+        let committed = hybrid_warn_rows("committed", BASE_NS);
+        let buffered = hybrid_warn_rows("wal", BASE_NS + 20_000_000_000);
+        assert_eq!(committed.len() + buffered.len(), 32);
+
+        let committed_batch = siglake_core::events_to_record_batch(
+            &committed
+                .iter()
+                .map(HybridWarnRow::event)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let buffered_events = buffered
+            .iter()
+            .map(HybridWarnRow::event)
+            .collect::<Vec<_>>();
+        let buffered_batch = siglake_core::events_to_record_batch(&buffered_events).unwrap();
+        let logical_payload = batches_payload_bytes(std::slice::from_ref(&committed_batch))
+            .saturating_add(batches_payload_bytes(std::slice::from_ref(&buffered_batch)));
+        assert!(
+            logical_payload <= LOGICAL_PAYLOAD_CAP,
+            "logical fixture payload={logical_payload}"
+        );
+        let base: Arc<dyn TableProvider> = Arc::new(
+            MemTable::try_new(
+                siglake_core::events_schema(),
+                vec![vec![committed_batch.clone()]],
+            )
+            .unwrap(),
+        );
+        let mut writer =
+            WalWriter::with_thresholds(&wal, "hybrid-warn", 10_000, Duration::from_secs(60))
+                .unwrap();
+        writer.append_events(&buffered_events).unwrap();
+        writer.seal().unwrap().expect("one sealed fixture segment");
+
+        let (_, fixture_bytes, wal_segments) = fixture_file_totals(tmp.path());
+        assert_eq!(wal_segments, 1);
+        assert!(wal_segments <= 8);
+        assert!(
+            fixture_bytes <= WAL_BYTES_CAP,
+            "fixture WAL bytes={fixture_bytes}"
+        );
+        assert!(fixture_bytes <= FIXTURE_DISK_CAP);
+
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(ADEQUATE_BUDGET));
+        let decoded = loaded_buffer(
+            cache
+                .get_or_load_for_query(
+                    &wal,
+                    &siglake_core::events_schema(),
+                    &HashSet::new(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            decoded
+                .batches()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            16
+        );
+        assert!(
+            decoded.payload_bytes() <= batches_payload_bytes(&[buffered_batch]),
+            "decoded WAL payload must fit the pre-scan fixture bound"
+        );
+        let generation_charge = cache.memory.used();
+        assert!(generation_charge > 0 && generation_charge < ADEQUATE_BUDGET);
+
+        let expression_context = SessionContext::new();
+        crate::udfs::register_udfs(&expression_context);
+        let severity = expression_context
+            .state()
+            .udf("attr_get")
+            .unwrap()
+            .call(vec![col("attributes"), lit("sl_signoz_v1.severity_text")]);
+        let severity_filter = severity.clone().eq(lit("WARN"));
+        let filter_bound =
+            filter_workspace_bound(decoded.batches(), std::slice::from_ref(&severity_filter))
+                .expect("literal-key severity filter has bounded workspace");
+        assert!(filter_bound > 1);
+        let unsupported = expression_context
+            .state()
+            .udf("upper")
+            .unwrap()
+            .call(vec![severity])
+            .eq(lit("WARN"));
+        assert!(
+            bounded_filter_workspace(&unsupported).is_none(),
+            "UPPER must remain distinct from a memory refusal"
+        );
+        drop(decoded);
+
+        let projection = "SELECT raw AS record_id, timestamp_ns AS timestamp, \
+            attr_get(attr_get(attributes, 'sl_signoz_v1.attributes_string'), 'customer.segment') AS customer_segment, \
+            attr_get(attr_get(attributes, 'sl_signoz_v1.attributes_string'), 'http.route') AS http_route, \
+            attr_get(attr_get(attributes, 'sl_signoz_v1.attributes_string'), 'region') AS region, \
+            attr_get(attr_get(attributes, 'sl_signoz_v1.attributes_string'), 'request.kind') AS request_kind, \
+            attr_get(attr_get(attributes, 'sl_signoz_v1.attributes_string'), 'customer.tier') AS customer_tier, \
+            attr_get(attr_get(attributes, 'sl_signoz_v1.attributes_string'), 'deployment.ring') AS deployment_ring, \
+            attr_get(attr_get(attributes, 'sl_signoz_v1.resources_string'), 'service.name') AS service_name \
+            FROM events";
+        let scope = format!(
+            "sourcetype = 'signoz.logs' AND \"index\" = 'signoz-events' \
+             AND timestamp_ns >= {BASE_NS} AND timestamp_ns < {}",
+            BASE_NS + 40_000_000_000
+        );
+        let order = "ORDER BY customer_segment ASC, timestamp DESC LIMIT 100";
+        let warn_query = format!(
+            "{projection} WHERE {scope} \
+             AND attr_get(attributes, 'sl_signoz_v1.severity_text') = 'WARN' {order}"
+        );
+        let unsupported_query = format!(
+            "{projection} WHERE {scope} \
+             AND upper(attr_get(attributes, 'sl_signoz_v1.severity_text')) = 'WARN' {order}"
+        );
+        let no_filter_query = format!("{projection} {order}");
+
+        let mut all = committed.clone();
+        all.extend(buffered.clone());
+        let visible_warn = expected_hybrid_rows(&all, true);
+        let visible_all = expected_hybrid_rows(&all, false);
+        let committed_warn = expected_hybrid_rows(&committed, true);
+
+        let union_provider = || {
+            Arc::new(
+                UnionEventsProvider::try_new_with_cache(
+                    Arc::clone(&base),
+                    Arc::clone(&cache),
+                    &wal,
+                    &HashSet::new(),
+                )
+                .unwrap(),
+            ) as Arc<dyn TableProvider>
+        };
+
+        run_hybrid_query(union_provider(), &warn_query, &visible_warn, true).await;
+        run_hybrid_query(union_provider(), &no_filter_query, &visible_all, true).await;
+
+        // Freeze the forced-refusal budget before running that case. The WAL
+        // generation is already cached and charged; leave one byte less than
+        // the smallest applicable filter workspace and occupy the rest.
+        let refusal_headroom = filter_bound - 1;
+        let blocker_bytes = ADEQUATE_BUDGET
+            .checked_sub(generation_charge)
+            .and_then(|free| free.checked_sub(refusal_headroom))
+            .expect("16 MiB fixture budget accommodates the generation and boundary");
+        let blocker = cache
+            .memory
+            .try_reserve(blocker_bytes)
+            .expect("deterministic pressure reservation");
+        assert_eq!(
+            ADEQUATE_BUDGET - cache.memory.used(),
+            refusal_headroom,
+            "filter refusal must be one byte below its workspace bound"
+        );
+        let cache_stats_before = cache.stats();
+        run_hybrid_query(union_provider(), &warn_query, &committed_warn, false).await;
+        assert_eq!(
+            cache.stats().0,
+            cache_stats_before.0 + 1,
+            "the refusal case must hit the loaded WAL generation"
+        );
+        assert_eq!(cache.memory.used(), generation_charge + blocker_bytes);
+        drop(blocker);
+        assert_eq!(cache.memory.used(), generation_charge);
+
+        run_hybrid_query(union_provider(), &unsupported_query, &committed_warn, false).await;
+        run_hybrid_query(Arc::clone(&base), &warn_query, &committed_warn, false).await;
+
+        eprintln!(
+            "hybrid WARN fixture: cases={CASES} rows=32 payload={logical_payload} \
+             disk={fixture_bytes} generation_charge={generation_charge} \
+             filter_bound={filter_bound} refusal_headroom={refusal_headroom} \
+             blocker={blocker_bytes} final_charge={}",
+            cache.memory.used()
+        );
+        cache.evict(&wal);
+        assert_eq!(
+            cache.memory.used(),
+            0,
+            "all fixture charges must be released"
+        );
     }
 }
