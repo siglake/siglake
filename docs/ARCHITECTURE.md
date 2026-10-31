@@ -607,6 +607,12 @@ request can admit the WAL or the drain commits it. The
 IPC body size is a pre-decode charge, not an Arrow-heap or RSS estimate;
 retained Arrow ownership is measured after decode, and its reservation stays
 with cache readers and execution streams after replacement or cancellation.
+Each request selects its snapshot and WAL generation independently. A count in
+one request does not pin either state for a later filtered request. Filter
+workspace refusal has the same committed-snapshot result for an unsupported
+expression and a memory reservation refusal; the bounded reproduction and its
+observability limits are recorded in
+[`HYBRID_WAL_WARN_FRESHNESS_2026-10-31.md`](HYBRID_WAL_WARN_FRESHNESS_2026-10-31.md).
 The measured figure is **~5.8 s ingest→queryable** for a lone marker on a
 bench node (seal-age dominated; sustained streams seal by size); that
 measurement is on `events`, and the index path has not been measured
