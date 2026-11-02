@@ -2262,6 +2262,25 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   still needs either a project-published build with an AGPL-3.0 redistribution
   policy or a qualified replacement S3 implementation. Tracked as #6118 and
   #6252.
+- **Five committed-only fallback positions have no test.**
+  `siglake_query_wal_committed_fallback_total` covers nine stage/reason
+  pairs; `load`/`actual_payload_bound`, `sort`/`actual_payload_bound` and
+  `sort`/`ownership_attach` cannot be reached from any fixture, because the
+  bounds they guard are set well above what a correct decode, sort or
+  `ArrayData` rebuild can produce. The same applies to the ownership-attach
+  failure paths at the load and filter stages. Their emission sites are
+  reviewed source, not tested behavior. Reaching them needs `#[cfg(test)]`
+  fault-injection seams in three hot paths, which is a source-shape
+  decision left for review. The reachable six pairs and every non-fallback
+  path are tested;
+  [`DESIGN_wal_committed_only_attribution.md`](DESIGN_wal_committed_only_attribution.md)
+  has the per-case record.
+- **A committed-only fallback count cannot be attributed to one query.**
+  The counter is global, so a delta over a window says what refused, not
+  whose request refused. The `outcome=committed_only` tracing event's
+  parent span is the only per-request attribution, and it requires trace
+  collection to be on. One query that scans several tables can also produce
+  several decisions, so increments are not query counts.
 
 Raw-carrier rolling-writer limitation: old writers may append, but concurrent
 promotion declarations from binaries that only know v1/v2 are unsupported once
