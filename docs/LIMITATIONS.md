@@ -2262,6 +2262,32 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   still needs either a project-published build with an AGPL-3.0 redistribution
   policy or a qualified replacement S3 implementation. Tracked as #6118 and
   #6252.
+- **Five requested WAL attribution positions were not exercised.**
+  `siglake_query_wal_committed_fallback_total` covers nine stage/reason
+  pairs. Six pairs were exercised through real scans over the bounded valid
+  fixture. Cases 3 (`load`/`actual_payload_bound`), 8
+  (`sort`/`actual_payload_bound`), 9 (`sort`/`ownership_attach`), 18 (load
+  ownership-attach error) and 20 (filter ownership-attach error) were not
+  exercised. The current bounds and ownership structure motivate this limit,
+  but the review did not prove universal unreachability; these sites have
+  source review rather than observed execution. Case 19 passed an ordinary
+  filtered union, not its actual-bound error. Case 24 is a helper-level
+  unsupported-workspace check; it did not construct arithmetic overflow or
+  drive a real scan. The coordinator permits review of the additive mapping
+  with those rare paths explicit. No test-only hot-path seams or user decision
+  are required. Task #7992 is a separate coverage follow-up, not a prerequisite
+  or runtime admission;
+  [`DESIGN_wal_committed_only_attribution.md`](DESIGN_wal_committed_only_attribution.md)
+  has the per-case record.
+- **A committed-only fallback count cannot be attributed to one query.**
+  The metric is a cumulative global counter. The pilot reads a scoped delta,
+  which says what refused rather than whose request refused. The
+  `outcome=committed_only` tracing event's supplied parent context is the
+  per-request attribution mechanism, and it requires trace collection to be
+  on. Source tests cover that association across the async scan boundary;
+  native HTTP `traceparent` and OpenTelemetry capture remain unqualified. One
+  query that scans several tables can produce several decisions, so increments
+  are not query counts.
 
 Raw-carrier rolling-writer limitation: old writers may append, but concurrent
 promotion declarations from binaries that only know v1/v2 are unsupported once
