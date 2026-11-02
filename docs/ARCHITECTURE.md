@@ -595,14 +595,18 @@ intermediate. Distributed WAL partials apply the narrower scalar restriction
 to every executed aggregate, filter, projection, sort, and pushed scan
 predicate. Filter and ordered-union copies take per-query reservations, so
 simultaneous cache hits are additive.
-Every scan that answers from the committed snapshot alone names the bound
-that refused: `siglake_query_wal_committed_fallback_total{stage, reason}`
-over a closed inventory of nine pairs, with a matching
-`outcome=committed_only` tracing event under the request span. Query
-errors, an unfiltered union after a failed filter pre-pass, an unsorted
-union, an empty buffer and a zero-match filter are not committed-only
-refusals and carry no label. The counter is a scoped delta and does not
-attribute a decision to one concurrent query; the event's span does. See
+Each of the three resource-refusal scan returns that selects the committed
+snapshot names the bound that refused:
+`siglake_query_wal_committed_fallback_total{stage, reason}` over a closed
+inventory of nine pairs, with a matching `outcome=committed_only` tracing
+event under the supplied request span. Query errors, an unfiltered union after
+a failed filter pre-pass, and an unsorted union carry no label. An empty buffer
+and a zero-match filter also return the committed base plan, but they are
+ordinary fast paths and carry no fallback label. The counter is cumulative;
+the pilot reads a scoped delta, which cannot attribute a decision to one
+concurrent query. The event's supplied parent context is the attribution
+mechanism. Source tests cover that context across the async scan boundary;
+native HTTP `traceparent` and OpenTelemetry export remain unqualified. See
 [`DESIGN_wal_committed_only_attribution.md`](DESIGN_wal_committed_only_attribution.md).
 Reservations are attached to the Arrow buffers they cover and remain charged
 when a caller retains a batch after the plan, stream, or cache generation is

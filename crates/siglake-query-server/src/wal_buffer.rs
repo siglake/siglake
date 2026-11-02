@@ -4509,15 +4509,15 @@ mod buffer_prefilter_tests {
     // ---------------------------------------------------------------------
     // #7927: committed-only fallback attribution.
     //
-    // Every case below drives the REAL `UnionEventsProvider::scan` over the
-    // same immutable 32-row fixture (16 committed + 16 WAL, one sealed
-    // segment) and reads the decisions `scan` emitted during that scan only.
-    // The frozen test-to-case mapping is in
+    // The scan cases below use the same immutable 32-row fixture shape
+    // (16 committed + 16 WAL, one sealed segment) and read only the decisions
+    // emitted within their scope. Case 24 is a helper-level check. The frozen
+    // test-to-case mapping and explicitly unexercised subpaths are in
     // `docs/DESIGN_wal_committed_only_attribution.md`.
     // ---------------------------------------------------------------------
 
-    /// Fixture shared by every attribution case. Built once per case so each
-    /// case is isolated; the ROW CONTENT is the same 32 rows every time.
+    /// Fixture shared by the attribution scan cases. Built once per case so
+    /// each case is isolated; the ROW CONTENT is the same 32 rows every time.
     struct FallbackFixture {
         _tmp: tempfile::TempDir,
         wal: PathBuf,
@@ -5288,12 +5288,12 @@ mod buffer_prefilter_tests {
             &HashSet::new(),
         )
         .unwrap();
-        // The filter actual-bound ERROR is unreachable from any fixture: the
-        // workspace bound starts from the full input payload
-        // (`filter_workspace_bound`), and a filtered subset can never exceed
-        // the batches it was filtered from. Pin that invariant and the
-        // ordinary filtered union it produces, and keep the error path's
-        // distinguishing counter at zero so the two cannot be confused.
+        // This bounded valid fixture does not exercise the filter actual-bound
+        // ERROR. The workspace bound starts from the full input payload
+        // (`filter_workspace_bound`), while this filtered subset is smaller
+        // than the batches it was filtered from. Observe the ordinary filtered
+        // union and keep the error path's distinguishing counter at zero; this
+        // result is not evidence that the missing subpath executed.
         let filter = col("raw").eq(lit("wal-00"));
         let (outcome, snapshot) = scoped(|| async {
             let ctx = session();
@@ -5535,12 +5535,11 @@ mod buffer_prefilter_tests {
         assert_eq!(cache.memory.used(), 0);
     }
 
-    /// Case 24: both producers of `filter`/`workspace_unbounded` reach the
-    /// SAME reason through the same single `else` arm. The unsupported half
-    /// is driven through the real scan in case 5; what is provable here is
-    /// that `filter_batches_charged` never invents a second classification
-    /// for a `filter_workspace_bound` of `None`, and never reports it as an
-    /// out-of-memory condition.
+    /// Case 24 is a helper-level unsupported-workspace check. Case 5 drives
+    /// that reason through the real scan. This test does not construct the
+    /// arithmetic-overflow producer or claim that it executed; it checks that
+    /// the shared `None` arm reports `WorkspaceUnbounded`, never an invented
+    /// out-of-memory classification.
     #[test]
     fn case_24_unbounded_workspace_has_one_truthful_reason() {
         let ctx = session();
