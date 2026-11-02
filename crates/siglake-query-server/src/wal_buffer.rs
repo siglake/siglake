@@ -4505,4 +4505,1077 @@ mod buffer_prefilter_tests {
             "all fixture charges must be released"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // #7927: committed-only fallback attribution.
+    //
+    // Every case below drives the REAL `UnionEventsProvider::scan` over the
+    // same immutable 32-row fixture (16 committed + 16 WAL, one sealed
+    // segment) and reads the decisions `scan` emitted during that scan only.
+    // The frozen test-to-case mapping is in
+    // `docs/DESIGN_wal_committed_only_attribution.md`.
+    // ---------------------------------------------------------------------
+
+    /// Fixture shared by every attribution case. Built once per case so each
+    /// case is isolated; the ROW CONTENT is the same 32 rows every time.
+    struct FallbackFixture {
+        _tmp: tempfile::TempDir,
+        wal: PathBuf,
+        committed: Vec<HybridWarnRow>,
+        committed_batch: RecordBatch,
+    }
+
+    impl FallbackFixture {
+        fn build() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let wal = tmp.path().join("wal");
+            let committed = hybrid_warn_rows("committed", FALLBACK_BASE_NS);
+            let buffered = hybrid_warn_rows("wal", FALLBACK_BASE_NS + 20_000_000_000);
+            assert_eq!(committed.len() + buffered.len(), 32);
+            let committed_batch = siglake_core::events_to_record_batch(
+                &committed
+                    .iter()
+                    .map(HybridWarnRow::event)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let buffered_events = buffered
+                .iter()
+                .map(HybridWarnRow::event)
+                .collect::<Vec<_>>();
+            let mut writer =
+                WalWriter::with_thresholds(&wal, "fallback-probe", 10_000, Duration::from_secs(60))
+                    .unwrap();
+            writer.append_events(&buffered_events).unwrap();
+            writer.seal().unwrap().expect("one sealed fixture segment");
+            let (_, fixture_bytes, segments) = fixture_file_totals(tmp.path());
+            assert_eq!(segments, 1);
+            assert!(fixture_bytes <= MIB, "fixture bytes={fixture_bytes}");
+            Self {
+                _tmp: tmp,
+                wal,
+                committed,
+                committed_batch,
+            }
+        }
+
+        /// Base provider with no advertised ordering: `scan` never reaches the
+        /// sort stage.
+        fn base(&self) -> Arc<dyn TableProvider> {
+            Arc::new(
+                MemTable::try_new(
+                    siglake_core::events_schema(),
+                    vec![vec![self.committed_batch.clone()]],
+                )
+                .unwrap(),
+            )
+        }
+
+        /// Base provider advertising the event-time ordering, which is what
+        /// makes `scan` take the charged-sort branch at all.
+        fn ordered_base(&self) -> Arc<dyn TableProvider> {
+            let sort = datafusion::logical_expr::SortExpr::new(col("timestamp_ns"), true, false);
+            Arc::new(
+                MemTable::try_new(
+                    siglake_core::events_schema(),
+                    vec![vec![self.committed_batch.clone()]],
+                )
+                .unwrap()
+                .with_sort_order(vec![vec![sort]]),
+            )
+        }
+
+        /// Base provider whose advertised ordering is an EXPRESSION, so
+        /// `sort_batches_like` cannot reproduce it and returns `Unsupported`.
+        fn expression_ordered_base(&self) -> Arc<dyn TableProvider> {
+            let sort = datafusion::logical_expr::SortExpr::new(
+                datafusion::prelude::cast(col("timestamp_ns"), DataType::Float64),
+                true,
+                false,
+            );
+            Arc::new(
+                MemTable::try_new(
+                    siglake_core::events_schema(),
+                    vec![vec![self.committed_batch.clone()]],
+                )
+                .unwrap()
+                .with_sort_order(vec![vec![sort]]),
+            )
+        }
+
+        fn committed_ids(&self) -> Vec<String> {
+            let mut ids = self
+                .committed
+                .iter()
+                .map(|row| row.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        }
+
+        fn all_ids(&self) -> Vec<String> {
+            let mut ids = self.committed_ids();
+            ids.extend((0..16).map(|i| format!("wal-{i:02}")));
+            ids.sort();
+            ids
+        }
+    }
+
+    const FALLBACK_BASE_NS: i64 = 1_793_223_199_000_000_000;
+    const FALLBACK_COUNTER: &str = "siglake_query_wal_committed_fallback_total";
+    /// Every label pair the implementation is allowed to emit, in table order.
+    const ALLOWED_DECISIONS: [(&str, &str); 9] = [
+        ("load", "compressed_limit"),
+        ("load", "memory_reservation"),
+        ("load", "actual_payload_bound"),
+        ("load", "transform_unbounded"),
+        ("filter", "workspace_unbounded"),
+        ("filter", "memory_reservation"),
+        ("sort", "memory_reservation"),
+        ("sort", "actual_payload_bound"),
+        ("sort", "ownership_attach"),
+    ];
+
+    /// What one scan produced: the `raw` ids the plan actually returned, and
+    /// whether the WAL generation was unioned in.
+    struct ScanOutcome {
+        ids: Vec<String>,
+        unioned: bool,
+    }
+
+    async fn run_scan(
+        provider: &UnionEventsProvider,
+        ctx: &SessionContext,
+        filters: &[Expr],
+    ) -> DFResult<ScanOutcome> {
+        let state = ctx.state();
+        let plan = provider.scan(&state, None, filters, None).await?;
+        let unioned = plan_contains(&plan, "UnionExec");
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await?;
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let column = batch
+                .column_by_name("raw")
+                .expect("events schema always carries raw")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("raw is Utf8");
+            for row in 0..column.len() {
+                ids.push(column.value(row).to_string());
+            }
+        }
+        ids.sort();
+        Ok(ScanOutcome { ids, unioned })
+    }
+
+    type Snapshot = Vec<(
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        metrics_util::debugging::DebugValue,
+    )>;
+
+    /// The committed-only decisions in one snapshot, one entry per increment.
+    ///
+    /// The label inventory is enforced here rather than in a separate test:
+    /// an unknown label KEY or an unknown (stage, reason) pair fails every
+    /// case at once. This is also the only place any case reads the counter,
+    /// so every number below is a scoped delta over a freshly installed
+    /// recorder — never a process-absolute total.
+    fn decisions_in(snapshot: &Snapshot) -> Vec<(String, String)> {
+        use metrics_util::debugging::DebugValue;
+        let mut out = Vec::new();
+        for (key, _, _, value) in snapshot {
+            if key.key().name() != FALLBACK_COUNTER {
+                continue;
+            }
+            let DebugValue::Counter(count) = value else {
+                panic!("{FALLBACK_COUNTER} must be a counter");
+            };
+            let (mut stage, mut reason) = (None, None);
+            for label in key.key().labels() {
+                match label.key() {
+                    "stage" => stage = Some(label.value().to_string()),
+                    "reason" => reason = Some(label.value().to_string()),
+                    other => panic!(
+                        "{FALLBACK_COUNTER} carries only static stage/reason labels, saw {other}"
+                    ),
+                }
+            }
+            let pair = (
+                stage.expect("stage label is always present"),
+                reason.expect("reason label is always present"),
+            );
+            assert!(
+                ALLOWED_DECISIONS
+                    .iter()
+                    .any(|(s, r)| *s == pair.0 && *r == pair.1),
+                "{pair:?} is outside the frozen label inventory"
+            );
+            for _ in 0..*count {
+                out.push(pair.clone());
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn counter_in(snapshot: &Snapshot, name: &str) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        snapshot
+            .iter()
+            .filter(|(key, _, _, _)| key.key().name() == name)
+            .map(|(_, _, _, value)| match value {
+                DebugValue::Counter(count) => *count,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Run `body` to completion on a current-thread runtime with a local
+    /// metrics recorder installed, and return its result together with the
+    /// snapshot taken immediately afterwards.
+    ///
+    /// Current-thread is required, not incidental: `with_local_recorder` is
+    /// thread-local, and the decision is emitted by `scan` on the runtime
+    /// thread (never on the `spawn_blocking` thread, which is exactly what
+    /// makes it attributable).
+    fn scoped<F, Fut, T>(body: F) -> (T, Snapshot)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let out = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(30), body())
+                    .await
+                    .expect("one attribution case exceeded 30 seconds")
+            })
+        });
+        (out, snapshotter.snapshot().into_vec())
+    }
+
+    fn session() -> SessionContext {
+        let ctx = SessionContext::new();
+        crate::udfs::register_udfs(&ctx);
+        ctx
+    }
+
+    fn severity_filter(ctx: &SessionContext, value: &str) -> Expr {
+        ctx.state()
+            .udf("attr_get")
+            .unwrap()
+            .call(vec![col("attributes"), lit("sl_signoz_v1.severity_text")])
+            .eq(lit(value))
+    }
+
+    fn unsupported_workspace_filter(ctx: &SessionContext) -> Expr {
+        let severity = ctx
+            .state()
+            .udf("attr_get")
+            .unwrap()
+            .call(vec![col("attributes"), lit("sl_signoz_v1.severity_text")]);
+        ctx.state()
+            .udf("upper")
+            .unwrap()
+            .call(vec![severity])
+            .eq(lit("WARN"))
+    }
+
+    /// Cases 1-2, 4: the load-stage reasons that a real fixture can reach.
+    /// Case 3 (`load`/`actual_payload_bound`) is NOT here — see the coverage
+    /// limitation in the design note.
+    #[test]
+    fn case_01_load_compressed_limit_selects_committed_only() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_inner(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        let ((outcome, used), snapshot) = scoped(|| async {
+            let ctx = session();
+            let outcome = run_scan(&provider, &ctx, &[]).await.unwrap();
+            (outcome, cache.memory.used())
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(!outcome.unioned);
+        assert_eq!(
+            decisions_in(&snapshot),
+            vec![("load".into(), "compressed_limit".into())]
+        );
+        assert_eq!(used, 0, "a refused generation holds no reservation");
+    }
+
+    #[test]
+    fn case_02_load_memory_reservation_selects_committed_only() {
+        let fixture = FallbackFixture::build();
+        // One byte of budget admits the zero-byte empty-listing reservation and
+        // nothing else, so the decode reservation is the thing that refuses.
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(1));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ((outcome, used), snapshot) = scoped(|| async {
+            let ctx = session();
+            let outcome = run_scan(&provider, &ctx, &[]).await.unwrap();
+            (outcome, cache.memory.used())
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(!outcome.unioned);
+        assert_eq!(
+            decisions_in(&snapshot),
+            vec![("load".into(), "memory_reservation".into())]
+        );
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn case_04_load_transform_unbounded_selects_committed_only() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        // A carrier can only bound its transformation over EMPTY attributes;
+        // the fixture rows carry SigNoz attributes, so the bound is unavailable.
+        let carrier = siglake_core::index_config::IndexConfig {
+            index_id: "fallback-probe".into(),
+            ..siglake_core::index_config::IndexConfig::builtin_events()
+        };
+        let provider = UnionEventsProvider::try_new_for_index_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+            carrier,
+            None,
+        )
+        .unwrap();
+        let ((outcome, used), snapshot) = scoped(|| async {
+            let ctx = session();
+            let outcome = run_scan(&provider, &ctx, &[]).await.unwrap();
+            (outcome, cache.memory.used())
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(!outcome.unioned);
+        assert_eq!(
+            decisions_in(&snapshot),
+            vec![("load".into(), "transform_unbounded".into())]
+        );
+        assert_eq!(used, 0, "the refused decode reservation is released");
+    }
+
+    #[test]
+    fn case_05_filter_workspace_unbounded_selects_committed_only() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ((outcome, used), snapshot) = scoped(|| async {
+            let ctx = session();
+            let filter = unsupported_workspace_filter(&ctx);
+            let outcome = run_scan(&provider, &ctx, &[filter]).await.unwrap();
+            (outcome, cache.memory.used())
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(!outcome.unioned);
+        assert_eq!(
+            decisions_in(&snapshot),
+            vec![("filter".into(), "workspace_unbounded".into())]
+        );
+        assert!(used > 0, "the cached generation keeps its own charge");
+        cache.evict(&fixture.wal);
+        assert_eq!(cache.memory.used(), 0, "no filter workspace was retained");
+    }
+
+    #[test]
+    fn case_06_filter_memory_reservation_selects_committed_only() {
+        const BUDGET: u64 = 16 * MIB;
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(BUDGET));
+        let ctx = session();
+        let filter = severity_filter(&ctx, "WARN");
+
+        // Warm the generation, then leave exactly one byte less than the
+        // filter workspace needs. Nothing allocates to exhaustion.
+        let decoded = loaded_buffer(
+            cache
+                .get_or_load_for_query(
+                    &fixture.wal,
+                    &siglake_core::events_schema(),
+                    &HashSet::new(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let bound = filter_workspace_bound(decoded.batches(), std::slice::from_ref(&filter))
+            .expect("literal-key severity filter has a bounded workspace");
+        drop(decoded);
+        let generation_charge = cache.memory.used();
+        let blocker = cache
+            .memory
+            .try_reserve(BUDGET - generation_charge - (bound - 1))
+            .expect("deterministic pressure reservation");
+        assert_eq!(BUDGET - cache.memory.used(), bound - 1);
+
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ((outcome, used), snapshot) = scoped(|| async {
+            let outcome = run_scan(&provider, &ctx, &[filter]).await.unwrap();
+            (outcome, cache.memory.used())
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(!outcome.unioned);
+        assert_eq!(
+            decisions_in(&snapshot),
+            vec![("filter".into(), "memory_reservation".into())]
+        );
+        assert_eq!(
+            used,
+            generation_charge + blocker.bytes,
+            "a refused workspace reserves nothing"
+        );
+        drop(blocker);
+        cache.evict(&fixture.wal);
+        assert_eq!(cache.memory.used(), 0);
+    }
+
+    #[test]
+    fn case_07_sort_memory_reservation_selects_committed_only() {
+        const BUDGET: u64 = 16 * MIB;
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(BUDGET));
+        let decoded = loaded_buffer(
+            cache
+                .get_or_load_for_query(
+                    &fixture.wal,
+                    &siglake_core::events_schema(),
+                    &HashSet::new(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        drop(decoded);
+        let generation_charge = cache.memory.used();
+        // No filters, so the filter stage reserves nothing and the charged
+        // sort is the only thing left that can ask for memory.
+        let blocker = cache
+            .memory
+            .try_reserve(BUDGET - generation_charge)
+            .expect("deterministic pressure reservation");
+
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.ordered_base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ((outcome, used), snapshot) = scoped(|| async {
+            let ctx = session();
+            let outcome = run_scan(&provider, &ctx, &[]).await.unwrap();
+            (outcome, cache.memory.used())
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(!outcome.unioned);
+        assert_eq!(
+            decisions_in(&snapshot),
+            vec![("sort".into(), "memory_reservation".into())]
+        );
+        assert_eq!(used, generation_charge + blocker.bytes);
+        drop(blocker);
+        cache.evict(&fixture.wal);
+        assert_eq!(cache.memory.used(), 0);
+    }
+
+    #[test]
+    fn case_10_healthy_visible_union_records_no_decision() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.ordered_base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let (outcome, snapshot) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[]).await.unwrap()
+        });
+        assert_eq!(outcome.ids, fixture.all_ids());
+        assert!(outcome.unioned);
+        assert!(decisions_in(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn case_11_empty_wal_records_no_decision() {
+        let fixture = FallbackFixture::build();
+        let empty = tempfile::tempdir().unwrap();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            empty.path(),
+            &HashSet::new(),
+        )
+        .unwrap();
+        let (outcome, snapshot) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[]).await.unwrap()
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(
+            !outcome.unioned,
+            "an empty buffer is a fast path, not a union"
+        );
+        assert!(
+            decisions_in(&snapshot).is_empty(),
+            "an empty WAL is not a resource fallback"
+        );
+    }
+
+    #[test]
+    fn case_12_filtered_zero_match_records_no_decision() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let (outcome, snapshot) = scoped(|| async {
+            let ctx = session();
+            let filter = severity_filter(&ctx, "NO-SUCH-SEVERITY");
+            run_scan(&provider, &ctx, &[filter]).await.unwrap()
+        });
+        assert_eq!(outcome.ids, fixture.committed_ids());
+        assert!(!outcome.unioned);
+        assert_eq!(
+            counter_in(&snapshot, "siglake_query_wal_buffer_skipped_no_match_total"),
+            1,
+            "zero matching rows stays the existing skip, under its existing name"
+        );
+        assert!(
+            decisions_in(&snapshot).is_empty(),
+            "zero matching rows is not a resource fallback"
+        );
+    }
+
+    #[test]
+    fn case_13_filter_evaluation_error_unions_unfiltered_without_a_decision() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        // Bounded workspace, unresolvable column: the failure happens inside
+        // the evaluation, after the workspace was admitted.
+        let filter = col("no_such_column").eq(lit("x"));
+        assert!(bounded_filter_workspace(&filter).is_some());
+        let (outcome, snapshot) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[filter]).await.unwrap()
+        });
+        assert_eq!(outcome.ids, fixture.all_ids());
+        assert!(outcome.unioned, "an unevaluable filter unions unfiltered");
+        assert_eq!(
+            counter_in(
+                &snapshot,
+                "siglake_query_wal_buffer_refused_actual_bytes_total"
+            ),
+            0,
+            "this is an evaluation failure, not an exceeded actual bound"
+        );
+        assert!(decisions_in(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn case_14_unsupported_charged_sort_unions_unsorted_without_a_decision() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.expression_ordered_base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let (outcome, snapshot) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[]).await.unwrap()
+        });
+        assert_eq!(outcome.ids, fixture.all_ids());
+        assert!(
+            outcome.unioned,
+            "an unreproducible ordering unions unsorted, it does not refuse"
+        );
+        assert!(decisions_in(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn case_15_cancelled_scan_releases_its_charge_without_a_decision() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.ordered_base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let (pending, snapshot) = scoped(|| async {
+            let ctx = session();
+            let state = ctx.state();
+            let no_filters: Vec<Expr> = Vec::new();
+            // Poll once -- the load is in flight on the blocking pool -- then
+            // let the future go out of scope, which is what a client
+            // disconnect does.
+            let pending = {
+                let scan = provider.scan(&state, None, &no_filters, None);
+                futures::pin_mut!(scan);
+                futures::poll!(&mut scan).is_pending()
+            };
+            // Let the orphaned blocking task finish and drop its buffer.
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+            pending
+        });
+        assert!(
+            pending,
+            "the load await is the cancellation point under test"
+        );
+        assert!(
+            decisions_in(&snapshot).is_empty(),
+            "a cancelled scan reached no refusal boundary"
+        );
+        cache.evict(&fixture.wal);
+        assert_eq!(
+            cache.memory.used(),
+            0,
+            "a cancelled scan leaks no reservation"
+        );
+    }
+
+    #[test]
+    fn case_16_listing_failure_is_a_query_error_without_a_decision() {
+        let fixture = FallbackFixture::build();
+        // Take read permission away from the sealed directory the listing
+        // walks. `wal/` itself must stay traversable, or the walk skips the
+        // subdirectory instead of failing on it.
+        let wal = fixture.wal.clone();
+        let sealed = wal.join(SEALED_DIR);
+        let restore = std::fs::metadata(&sealed).unwrap().permissions();
+        std::fs::set_permissions(&sealed, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        struct Restore(PathBuf, std::fs::Permissions);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        let _restore = Restore(sealed.clone(), restore);
+        if std::fs::read_dir(&sealed).is_ok() {
+            eprintln!(
+                "case 16 NOT EXERCISED: this process can read a 0o000 directory (running as root)"
+            );
+            return;
+        }
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let (result, snapshot) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[])
+                .await
+                .err()
+                .map(|e| e.to_string())
+        });
+        assert!(
+            result.is_some(),
+            "an unavailable listing stays a query error, it is not answered committed-only"
+        );
+        assert!(decisions_in(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn case_17_decode_failure_is_a_query_error_without_a_decision() {
+        let fixture = FallbackFixture::build();
+        let sealed = std::fs::read_dir(fixture.wal.join(SEALED_DIR))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "arrow"))
+            .expect("the fixture sealed exactly one segment");
+        let mut bytes = std::fs::read(&sealed).unwrap();
+        let tail = bytes.len() - 32;
+        for byte in &mut bytes[tail..] {
+            *byte ^= 0xff;
+        }
+        std::fs::write(&sealed, &bytes).unwrap();
+
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ((result, used), snapshot) = scoped(|| async {
+            let ctx = session();
+            let result = run_scan(&provider, &ctx, &[])
+                .await
+                .err()
+                .map(|e| e.to_string());
+            (result, cache.memory.used())
+        });
+        assert!(
+            result.is_some(),
+            "a corrupt generation stays a query error; serving it committed-only would be silent loss"
+        );
+        assert!(decisions_in(&snapshot).is_empty());
+        assert_eq!(used, 0, "the failed decode released its reservation");
+    }
+
+    #[test]
+    fn case_19_filter_actual_bound_unions_unfiltered_without_a_decision() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        // The filter actual-bound ERROR is unreachable from any fixture: the
+        // workspace bound starts from the full input payload
+        // (`filter_workspace_bound`), and a filtered subset can never exceed
+        // the batches it was filtered from. Pin that invariant and the
+        // ordinary filtered union it produces, and keep the error path's
+        // distinguishing counter at zero so the two cannot be confused.
+        let filter = col("raw").eq(lit("wal-00"));
+        let (outcome, snapshot) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[filter]).await.unwrap()
+        });
+        let mut expected = fixture.committed_ids();
+        expected.push("wal-00".into());
+        expected.sort();
+        assert_eq!(outcome.ids, expected);
+        assert!(outcome.unioned);
+        assert_eq!(
+            counter_in(
+                &snapshot,
+                "siglake_query_wal_buffer_refused_actual_bytes_total"
+            ),
+            0,
+            "a filtered subset cannot exceed a bound that starts at the input payload"
+        );
+        assert!(decisions_in(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn case_21_decision_event_stays_under_the_supplied_parent_span() {
+        use std::collections::BTreeMap;
+        use std::sync::Mutex;
+        use tracing::Instrument;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        /// One captured event: its parent span's name and its fields.
+        type Event = (Option<String>, BTreeMap<String, String>);
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<Event>>>);
+
+        struct Fields<'a>(&'a mut BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for Captured
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let Some(span) = ctx.event_span(event) else {
+                    return;
+                };
+                // Only this case's uniquely named parent span. The subscriber
+                // is global (see below), so every other test's events reach
+                // this layer too and must be ignored.
+                if span.name() != PARENT_SPAN {
+                    return;
+                }
+                let mut fields = BTreeMap::new();
+                event.record(&mut Fields(&mut fields));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((Some(span.name().to_string()), fields));
+            }
+        }
+
+        // A SCOPED subscriber loses this race: the other cases emit the same
+        // callsite from other test threads, and the global interest/level
+        // state that `tracing` keys off is not per-thread. Install once,
+        // globally, and make the parent span name the discriminator.
+        static CAPTURED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+        const PARENT_SPAN: &str = "test.request.span.7927";
+        let captured = CAPTURED
+            .get_or_init(|| {
+                let captured = Captured::default();
+                let subscriber = tracing_subscriber::registry().with(captured.clone());
+                tracing::subscriber::set_global_default(subscriber)
+                    .expect("no other test in this crate installs a global subscriber");
+                captured
+            })
+            .clone();
+
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(1));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(
+            async {
+                let ctx = session();
+                run_scan(&provider, &ctx, &[]).await.unwrap()
+            }
+            // The shape `otel_http_trace` installs: the scan runs INSIDE the
+            // request span and must still be under it after the
+            // spawn_blocking await.
+            .instrument(tracing::info_span!(PARENT_SPAN, otel.kind = "server")),
+        );
+        assert_eq!(outcome.ids, fixture.committed_ids());
+
+        let events = captured.0.lock().unwrap().clone();
+        let decisions = events
+            .iter()
+            .filter(|(_, fields)| {
+                fields.get("outcome").map(String::as_str) == Some("committed_only")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 1, "one scan, one decision event");
+        let (span, fields) = decisions[0];
+        assert_eq!(
+            span.as_deref(),
+            Some(PARENT_SPAN),
+            "the decision event must be attributed to the supplied request span, \
+             not to the blocking loader's context"
+        );
+        assert_eq!(fields.get("stage").map(String::as_str), Some("load"));
+        assert_eq!(
+            fields.get("reason").map(String::as_str),
+            Some("memory_reservation")
+        );
+        let names = fields.keys().map(String::as_str).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["message", "outcome", "reason", "stage"],
+            "the event carries no SQL, tenant, index, path or query id"
+        );
+    }
+
+    /// Case 22's second half: two scans under ONE recorder, read as a scoped
+    /// delta. `decisions_in` enforces the label inventory for every case.
+    #[test]
+    fn case_22_counter_is_a_scoped_delta_over_the_finite_inventory() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(1));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let ((), first) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[]).await.unwrap();
+        });
+        assert_eq!(
+            decisions_in(&first),
+            vec![("load".into(), "memory_reservation".into())]
+        );
+        // A fresh recorder starts at zero: the readable quantity is the delta
+        // over a scope, never a process-absolute total.
+        let ((), second) = scoped(|| async {
+            let ctx = session();
+            run_scan(&provider, &ctx, &[]).await.unwrap();
+            run_scan(&provider, &ctx, &[]).await.unwrap();
+        });
+        assert_eq!(decisions_in(&second).len(), 2, "two scans, two decisions");
+    }
+
+    #[test]
+    fn case_23_lease_clone_holds_the_charge_until_the_last_owner_drops() {
+        let fixture = FallbackFixture::build();
+        let cache = Arc::new(BufferDeltaCache::with_memory_limit(16 * MIB));
+        let provider = UnionEventsProvider::try_new_with_cache(
+            fixture.ordered_base(),
+            Arc::clone(&cache),
+            &fixture.wal,
+            &HashSet::new(),
+        )
+        .unwrap();
+        // Warm the generation first so its charge is a known constant.
+        drop(loaded_buffer(
+            cache
+                .get_or_load_for_query(
+                    &fixture.wal,
+                    &siglake_core::events_schema(),
+                    &HashSet::new(),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+        ));
+        let generation_charge = cache.memory.used();
+
+        let ((rows, held, after_drop), snapshot) = scoped(|| async {
+            let ctx = session();
+            let state = ctx.state();
+            let no_filters: Vec<Expr> = Vec::new();
+            let plan = provider
+                .scan(&state, None, &no_filters, None)
+                .await
+                .unwrap();
+            // The sorted lease is an ADDITIONAL charge the plan's leased
+            // arrays own, on top of the cached generation.
+            let held = cache.memory.used();
+            let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
+                .await
+                .unwrap();
+            let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+            drop(batches);
+            // A shallow clone of the owner keeps the charge: only the LAST
+            // owner's drop releases it.
+            let clone = Arc::clone(&plan);
+            drop(plan);
+            assert_eq!(
+                cache.memory.used(),
+                held,
+                "a surviving shallow clone keeps the charge"
+            );
+            drop(clone);
+            (rows, held, cache.memory.used())
+        });
+        assert_eq!(rows, 32);
+        assert!(
+            held > generation_charge,
+            "the sorted lease is charged on top of the generation \
+             (held={held}, generation={generation_charge})"
+        );
+        assert_eq!(
+            after_drop, generation_charge,
+            "the last owner's drop releases exactly the lease"
+        );
+        assert!(decisions_in(&snapshot).is_empty());
+        cache.evict(&fixture.wal);
+        assert_eq!(cache.memory.used(), 0);
+    }
+
+    /// Case 24: both producers of `filter`/`workspace_unbounded` reach the
+    /// SAME reason through the same single `else` arm. The unsupported half
+    /// is driven through the real scan in case 5; what is provable here is
+    /// that `filter_batches_charged` never invents a second classification
+    /// for a `filter_workspace_bound` of `None`, and never reports it as an
+    /// out-of-memory condition.
+    #[test]
+    fn case_24_unbounded_workspace_has_one_truthful_reason() {
+        let ctx = session();
+        let batch = siglake_core::events_to_record_batch(
+            &hybrid_warn_rows("wal", FALLBACK_BASE_NS)
+                .iter()
+                .map(HybridWarnRow::event)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let memory = BufferMemoryBudget::new(16 * MIB);
+        let unsupported = unsupported_workspace_filter(&ctx);
+        assert!(filter_workspace_bound(
+            std::slice::from_ref(&batch),
+            std::slice::from_ref(&unsupported)
+        )
+        .is_none());
+        assert_eq!(
+            filter_batches_charged(
+                &memory,
+                std::slice::from_ref(&batch),
+                std::slice::from_ref(&unsupported),
+                &schema,
+                &ctx.state(),
+            )
+            .unwrap_err(),
+            FallbackReason::WorkspaceUnbounded,
+        );
+        // The adjacent reason is reserved for a REFUSED reservation, and an
+        // unbounded workspace never gets that far: the budget here is ample.
+        assert_eq!(memory.used(), 0);
+        assert_ne!(
+            FallbackReason::WorkspaceUnbounded,
+            FallbackReason::MemoryReservation
+        );
+    }
 }
