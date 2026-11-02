@@ -1004,6 +1004,97 @@ pub(crate) fn decoded_buffer_with_limit_for_test(
     })
 }
 
+/// The scan stage that selected the committed-only base plan.
+///
+/// Private and closed: the emitted label set is exactly these three strings,
+/// so no tenant, index, path, SQL text or query id can ever reach the metric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackStage {
+    Load,
+    Filter,
+    Sort,
+}
+
+impl FallbackStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::Filter => "filter",
+            Self::Sort => "sort",
+        }
+    }
+}
+
+/// Why a decision site refused, carried from that site to the `scan` branch
+/// that acts on it. Closed for the same reason as [`FallbackStage`].
+///
+/// These name the EXISTING bound that was hit, nothing more. A listing, sizing
+/// or decode failure is a query error and never becomes a reason; an
+/// unsupported sort expression and a zero-match filter are ordinary paths and
+/// never become a reason either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackReason {
+    /// Cached or selected generation exceeds the compressed budget.
+    CompressedLimit,
+    /// A decode, expansion, workspace or sort reservation was refused.
+    MemoryReservation,
+    /// The actual decoded, filtered or sorted payload exceeded its admitted
+    /// bound.
+    ActualPayloadBound,
+    /// `transformation_expansion_bound` could not bound the transformation.
+    TransformUnbounded,
+    /// `filter_workspace_bound` returned `None`. Deliberately ONE reason for
+    /// both an unsupported expression and an arithmetic-unrepresentable bound:
+    /// the truthful statement is that the workspace is unbounded, and the
+    /// answer contract is identical in both cases.
+    WorkspaceUnbounded,
+    /// Attaching the reservation to the sorted arrays failed, so the sorted
+    /// output cannot be charged to its owner.
+    OwnershipAttach,
+}
+
+impl FallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::CompressedLimit => "compressed_limit",
+            Self::MemoryReservation => "memory_reservation",
+            Self::ActualPayloadBound => "actual_payload_bound",
+            Self::TransformUnbounded => "transform_unbounded",
+            Self::WorkspaceUnbounded => "workspace_unbounded",
+            Self::OwnershipAttach => "ownership_attach",
+        }
+    }
+}
+
+/// Record one committed-only scan decision.
+///
+/// Call this ONLY from a `UnionEventsProvider::scan` branch that is about to
+/// return the committed base plan, and only from `scan` itself: the load
+/// decision is taken on a `spawn_blocking` thread that carries none of the
+/// request's span context, so emitting there would attribute the event to
+/// nothing. Emitting after the load await keeps it under the `http.server`
+/// span the request middleware drives across awaits.
+///
+/// The counter is global. A delta over a scoped window is the readable
+/// quantity; an absolute value is a process total, and under concurrency a
+/// delta still cannot attribute a decision to one query — the tracing event's
+/// span is what does that. One query may scan more than once, so increments
+/// are decisions, not queries.
+fn record_committed_fallback(stage: FallbackStage, reason: FallbackReason) {
+    metrics::counter!(
+        "siglake_query_wal_committed_fallback_total",
+        "stage" => stage.as_str(),
+        "reason" => reason.as_str(),
+    )
+    .increment(1);
+    tracing::info!(
+        outcome = "committed_only",
+        stage = stage.as_str(),
+        reason = reason.as_str(),
+        "wal-buffer scan served the committed-only base plan"
+    );
+}
+
 #[derive(Debug)]
 pub(crate) enum BufferReadOutcome {
     Loaded(Arc<DecodedBuffer>),
@@ -1011,6 +1102,9 @@ pub(crate) enum BufferReadOutcome {
     /// partially served, cached, or treated as proof of an empty buffer.
     Refused {
         compressed_bytes: u64,
+        /// Which existing bound refused. Reported by `scan`; the other
+        /// callers keep their own existing handling.
+        reason: FallbackReason,
     },
 }
 
@@ -1155,6 +1249,7 @@ impl BufferDeltaCache {
             if compressed_max.is_some_and(|max| max > 0 && cached.compressed_bytes() > max) {
                 return Ok(BufferReadOutcome::Refused {
                     compressed_bytes: cached.compressed_bytes(),
+                    reason: FallbackReason::CompressedLimit,
                 });
             }
             return Ok(BufferReadOutcome::Loaded(cached));
@@ -1181,6 +1276,7 @@ impl BufferDeltaCache {
                     {
                         return Ok(BufferReadOutcome::Refused {
                             compressed_bytes: cached.compressed_bytes(),
+                            reason: FallbackReason::CompressedLimit,
                         });
                     }
                     return Ok(BufferReadOutcome::Loaded(cached));
@@ -1212,10 +1308,16 @@ impl BufferDeltaCache {
         let compressed_bytes = selected.compressed_bytes;
         if !selected.admitted {
             metrics::counter!("siglake_query_wal_buffer_refused_bytes_total").increment(1);
-            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            return Ok(BufferReadOutcome::Refused {
+                compressed_bytes,
+                reason: FallbackReason::CompressedLimit,
+            });
         }
         let Some(decode_reservation) = self.memory.try_reserve(selected.decode_charge_bytes) else {
-            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            return Ok(BufferReadOutcome::Refused {
+                compressed_bytes,
+                reason: FallbackReason::MemoryReservation,
+            });
         };
         let raw_batches = match read_selected_buffer_batches(&selected) {
             Ok(batches) => batches,
@@ -1228,16 +1330,25 @@ impl BufferDeltaCache {
         };
         let raw_payload = decoded_payload_bytes(&raw_batches);
         if !decode_reservation.contains_actual(raw_payload) {
-            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            return Ok(BufferReadOutcome::Refused {
+                compressed_bytes,
+                reason: FallbackReason::ActualPayloadBound,
+            });
         }
         let Some(expansion_bound) =
             transformation_expansion_bound(&raw_batches, target_schema, carrier)
         else {
             metrics::counter!("siglake_query_wal_buffer_refused_layout_total").increment(1);
-            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            return Ok(BufferReadOutcome::Refused {
+                compressed_bytes,
+                reason: FallbackReason::TransformUnbounded,
+            });
         };
         let Some(expansion_reservation) = self.memory.try_reserve(expansion_bound) else {
-            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            return Ok(BufferReadOutcome::Refused {
+                compressed_bytes,
+                reason: FallbackReason::MemoryReservation,
+            });
         };
         let batches = match transform_selected_buffer_batches(raw_batches, target_schema, carrier) {
             Ok(batches) => batches,
@@ -1250,7 +1361,10 @@ impl BufferDeltaCache {
         };
         let transformed_payload = decoded_payload_bytes(&batches);
         if transformed_payload > raw_payload.saturating_add(expansion_bound) {
-            return Ok(BufferReadOutcome::Refused { compressed_bytes });
+            return Ok(BufferReadOutcome::Refused {
+                compressed_bytes,
+                reason: FallbackReason::ActualPayloadBound,
+            });
         }
         let batches = match attach_reservation_to_batches(batches, &decode_reservation)
             .and_then(|batches| attach_reservation_to_batches(batches, &expansion_reservation))
@@ -1909,34 +2023,38 @@ fn bounded_filter_workspace(expr: &Expr) -> Option<FilterWorkspace> {
 /// inputs; the extra term covers one value bitmap per predicate plus the
 /// combined mask. The returned arrays own the reservation through their final
 /// shallow clone.
+///
+/// `Err(reason)` is the committed-only fallback and nothing else: an
+/// evaluation failure, an exceeded actual bound and a failed ownership
+/// attachment all stay inside `Ok(Err(..))`, which `scan` unions unfiltered.
 fn filter_batches_charged(
     memory: &Arc<BufferMemoryBudget>,
     batches: &[RecordBatch],
     filters: &[Expr],
     schema: &SchemaRef,
     state: &dyn Session,
-) -> Option<DFResult<Vec<RecordBatch>>> {
+) -> Result<DFResult<Vec<RecordBatch>>, FallbackReason> {
     if filters.is_empty() || batches.is_empty() {
-        return Some(Ok(batches.to_vec()));
+        return Ok(Ok(batches.to_vec()));
     }
     let Some(bound) = filter_workspace_bound(batches, filters) else {
         metrics::counter!("siglake_query_wal_buffer_refused_filter_workspace_total").increment(1);
-        return None;
+        return Err(FallbackReason::WorkspaceUnbounded);
     };
-    let reservation = memory.try_reserve(bound)?;
+    let Some(reservation) = memory.try_reserve(bound) else {
+        return Err(FallbackReason::MemoryReservation);
+    };
     let filtered = match filter_batches(batches, filters, schema, state) {
         Ok(filtered) => filtered,
-        Err(error) => return Some(Err(error)),
+        Err(error) => return Ok(Err(error)),
     };
     if !reservation.contains_actual(batches_payload_bytes(&filtered)) {
-        return Some(Err(DataFusionError::ResourcesExhausted(
+        return Ok(Err(DataFusionError::ResourcesExhausted(
             "WAL filter output exceeded its admitted payload bound".to_string(),
         )));
     }
-    Some(
-        attach_reservation_to_batches(filtered, &reservation)
-            .map_err(|error| DataFusionError::External(error.into())),
-    )
+    Ok(attach_reservation_to_batches(filtered, &reservation)
+        .map_err(|error| DataFusionError::External(error.into())))
 }
 
 /// Return the complete query-local allocation bound used by the filter
@@ -2179,7 +2297,7 @@ fn sort_batches_like(
 enum ChargedSort {
     Sorted((Vec<RecordBatch>, arrow_schema::SortOptions, String)),
     Unsupported,
-    Refused,
+    Refused(FallbackReason),
 }
 
 /// Sort under a per-query reservation. `concat_batches` can duplicate the
@@ -2199,19 +2317,19 @@ fn sort_batches_like_charged(
         .saturating_mul(2)
         .saturating_add(rows.saturating_mul(8));
     let Some(reservation) = memory.try_reserve(bound) else {
-        return ChargedSort::Refused;
+        return ChargedSort::Refused(FallbackReason::MemoryReservation);
     };
     let Some((sorted, options, field)) = sort_batches_like(batches, ordering, schema) else {
         return ChargedSort::Unsupported;
     };
     if !reservation.contains_actual(batches_payload_bytes(&sorted)) {
-        return ChargedSort::Refused;
+        return ChargedSort::Refused(FallbackReason::ActualPayloadBound);
     }
     match attach_reservation_to_batches(sorted, &reservation) {
         Ok(sorted) => ChargedSort::Sorted((sorted, options, field)),
         Err(error) => {
             tracing::warn!(error = %error, "refusing WAL sort output whose ownership cannot be charged");
-            ChargedSort::Refused
+            ChargedSort::Refused(FallbackReason::OwnershipAttach)
         }
     }
 }
@@ -2403,9 +2521,15 @@ impl TableProvider for UnionEventsProvider {
         .await
         .map_err(|error| DataFusionError::External(error.into()))?
         .map_err(|error| DataFusionError::External(error.into()))?;
+        // Emit HERE, not in the blocking loader: this is the point at which the
+        // committed-only plan is actually chosen, and it is back under the
+        // request span that the loader's thread does not carry.
         let decoded = match outcome {
             BufferReadOutcome::Loaded(decoded) => decoded,
-            BufferReadOutcome::Refused { .. } => return Ok(base_plan),
+            BufferReadOutcome::Refused { reason, .. } => {
+                record_committed_fallback(FallbackStage::Load, reason);
+                return Ok(base_plan);
+            }
         };
         if decoded.batches().is_empty() {
             return Ok(base_plan);
@@ -2432,14 +2556,18 @@ impl TableProvider for UnionEventsProvider {
             &self.schema,
             state,
         ) {
-            Some(Ok(filtered)) => filtered,
+            Ok(Ok(filtered)) => filtered,
             // Never let a filter we cannot evaluate change the ANSWER: fall back
-            // to unioning everything, which is correct but slow.
-            Some(Err(e)) => {
+            // to unioning everything, which is correct but slow. This is NOT a
+            // committed-only fallback and must not be labelled as one.
+            Ok(Err(e)) => {
                 tracing::debug!(error = %e, "wal-buffer: filter pre-pass failed; unioning unfiltered");
                 decoded.cloned_batches()
             }
-            None => return Ok(base_plan),
+            Err(reason) => {
+                record_committed_fallback(FallbackStage::Filter, reason);
+                return Ok(base_plan);
+            }
         };
         if batches.iter().all(|b| b.num_rows() == 0) {
             metrics::counter!("siglake_query_wal_buffer_skipped_no_match_total").increment(1);
@@ -2495,7 +2623,10 @@ impl TableProvider for UnionEventsProvider {
                     MemTable::try_new(self.schema.clone(), vec![batches])?,
                     false,
                 ),
-                ChargedSort::Refused => return Ok(base_plan),
+                ChargedSort::Refused(reason) => {
+                    record_committed_fallback(FallbackStage::Sort, reason);
+                    return Ok(base_plan);
+                }
             },
             None => (
                 MemTable::try_new(self.schema.clone(), vec![batches])?,
@@ -2567,7 +2698,9 @@ mod tests {
     fn loaded(outcome: BufferReadOutcome) -> Arc<DecodedBuffer> {
         match outcome {
             BufferReadOutcome::Loaded(decoded) => decoded,
-            BufferReadOutcome::Refused { compressed_bytes } => {
+            BufferReadOutcome::Refused {
+                compressed_bytes, ..
+            } => {
                 panic!("tiny fixture was refused after {compressed_bytes} compressed bytes")
             }
         }
@@ -3181,7 +3314,7 @@ mod tests {
             &schema,
             &state
         )
-        .is_none());
+        .is_err());
         assert_eq!(low.used(), 0);
         let memory = BufferMemoryBudget::new(MIB);
         let output = filter_batches_charged(&memory, &[batch], &filters, &schema, &state)
@@ -3297,7 +3430,7 @@ mod tests {
                 &schema,
                 &state,
             )
-            .is_none());
+            .is_err());
             assert_eq!(memory.used(), 0);
         }
     }
@@ -3880,7 +4013,9 @@ mod buffer_prefilter_tests {
     fn loaded_buffer(outcome: BufferReadOutcome) -> Arc<DecodedBuffer> {
         match outcome {
             BufferReadOutcome::Loaded(decoded) => decoded,
-            BufferReadOutcome::Refused { compressed_bytes } => {
+            BufferReadOutcome::Refused {
+                compressed_bytes, ..
+            } => {
                 panic!("tiny fixture was refused after {compressed_bytes} compressed bytes")
             }
         }
@@ -4000,7 +4135,7 @@ mod buffer_prefilter_tests {
             &schema,
             &ctx.state(),
         )
-        .is_none());
+        .is_err());
         assert_eq!(low.used(), 0);
 
         let memory = BufferMemoryBudget::new(1024 * 1024);

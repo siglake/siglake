@@ -10797,7 +10797,9 @@ async fn load_buffer_delta_with_max_and_bindings(
         .map_err(ApiError::internal)?;
         let loaded = match outcome {
             crate::wal_buffer::BufferReadOutcome::Loaded(loaded) => loaded,
-            crate::wal_buffer::BufferReadOutcome::Refused { compressed_bytes } => {
+            crate::wal_buffer::BufferReadOutcome::Refused {
+                compressed_bytes, ..
+            } => {
                 counts.insert(
                     name,
                     CountBufferObservation {
