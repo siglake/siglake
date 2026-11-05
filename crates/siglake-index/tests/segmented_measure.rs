@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use siglake_index::segmented::{
     Lookup, SegmentedReader, SegmentedWriter, SliceSource, DEFAULT_TARGET_BLOCK_BYTES,
 };
-use siglake_index::{IndexBuilder, InvertedIndex};
+use siglake_index::{FlatIndex, IndexBuilder, InvertedIndex};
 
 /// The measurement corpus's text, row by row, without materializing it: the
 /// same shape as `puffin_rebuild.rs`'s `ab_shaped_event` (`bench_shaped_event`
@@ -257,6 +257,13 @@ fn report_segmented_vs_whole_file() {
     let v1_parse = parse.elapsed();
     assert_eq!(reparsed.n_rows(), whole.n_rows());
 
+    // The resident flat layout of the same index: what a parsed-index cache
+    // would charge if it held `FlatIndex` instead of the map-and-vectors form.
+    let v2 = whole.flat();
+    let v2_round_trip = FlatIndex::from_bytes_v2(&v2.to_bytes_v2())
+        .expect("v2 layout round-trips");
+    assert_eq!(v2_round_trip, v2);
+
     let open = Instant::now();
     let reader = SegmentedReader::open(SliceSource::shared(std::sync::Arc::clone(&seg_bytes)))
         .expect("segmented opens");
@@ -265,12 +272,13 @@ fn report_segmented_vs_whole_file() {
 
     println!(
         "\n## one file ({} rows, {} terms, {} row groups)\n\n\
-         | format | build | serialized | parse/open | resident |\n\
-         |---|---:|---:|---:|---:|\n\
-         | whole-file v1 | {:?} | {} | {:?} | {} |\n\
-         | seg2 | {:?} | {} | {:?} | {} |\n\
-         \nserialized ratio {:.2}x · resident ratio {:.0}x smaller · \
-         dictionary {} · postings {} · directory {}",
+         | format | build | serialized | parse/open | resident | resident B/row |\n\
+         |---|---:|---:|---:|---:|---:|\n\
+         | whole-file v1 (map) | {:?} | {} | {:?} | {} | {:.1} |\n\
+         | whole-file v2 (flat) | — | {} | — | {} | {:.1} |\n\
+         | seg2 | {:?} | {} | {:?} | {} | {:.1} |\n\
+         \nserialized ratio {:.2}x · v1→v2 resident {:.1}x · v1→seg2 resident {:.0}x · \
+         seg2 dictionary {} · postings {} · directory {}",
         whole.n_rows(),
         whole.n_terms(),
         reader.n_groups(),
@@ -278,11 +286,17 @@ fn report_segmented_vs_whole_file() {
         mib(v1_bytes.len() as u64),
         v1_parse,
         mib(whole.heap_size_bytes() as u64),
+        whole.heap_size_bytes() as f64 / rows_per_file as f64,
+        mib(v2_round_trip.to_bytes_v2().len() as u64),
+        mib(v2.heap_size_bytes() as u64),
+        v2.heap_size_bytes() as f64 / rows_per_file as f64,
         seg_build,
         mib(seg_bytes.len() as u64),
         seg_open,
         mib(reader.resident_bytes() as u64),
+        reader.resident_bytes() as f64 / rows_per_file as f64,
         seg_bytes.len() as f64 / v1_bytes.len() as f64,
+        whole.heap_size_bytes() as f64 / v2.heap_size_bytes() as f64,
         whole.heap_size_bytes() as f64 / reader.resident_bytes() as f64,
         mib(reader.dictionary_bytes()),
         mib(reader.postings_bytes()),
@@ -491,8 +505,9 @@ fn report_segmented_vs_whole_file() {
         );
     }
     println!(
-        "\nv1 resident working set for {files} files: {} · seg2: {}",
+        "\nv1 resident working set for {files} files: {} · v2 (flat): {} · seg2: {}",
         mib((whole.heap_size_bytes() * files) as u64),
+        mib((v2.heap_size_bytes() * files) as u64),
         mib((reader.resident_bytes() * files) as u64),
     );
 }

@@ -29,8 +29,11 @@ pub mod spill;
 
 /// Magic prefixing a serialized index blob.
 const INDEX_MAGIC: &[u8; 4] = b"KIDX";
-/// Serialization version.
+/// Serialization version of the stored blob (footer KV / Puffin sidecar).
 const INDEX_VERSION: u8 = 1;
+/// Serialization version of the resident (parsed) layout — the in-memory
+/// form a v1 decode re-parses into, never a stored form.
+const INDEX_VERSION_2: u8 = 2;
 
 /// Parquet `key_value_metadata` key under which a data file carries its
 /// hex-encoded inverted-index blob (set at write time, read at query time —
@@ -91,6 +94,243 @@ pub struct InvertedIndex {
     postings: BTreeMap<String, Vec<u32>>,
     /// Number of rows indexed (the ordinal space is `0..n_rows`).
     n_rows: u32,
+}
+
+/// One dictionary entry: where a term lives in the two shared buffers. All
+/// three fields are `u32`, not `usize`, because each is bounded by the total
+/// size of the buffer it indexes — and a `Vec` resident in memory cannot
+/// exceed 4 GiB, the point at which a `u32` offset wraps. `term_len` is
+/// `u32`, not `u16`, because the `Raw` tokenizer makes the entire line a
+/// single token, so a term can be longer than 65535 bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TermSpan {
+    /// Byte offset of this term in [`FlatIndex::term_bytes`].
+    pub bytes_start: u32,
+    /// Byte length of this term in [`FlatIndex::term_bytes`].
+    pub term_len: u32,
+    /// Offset of this term's first posting in [`FlatIndex::postings`].
+    pub postings_start: u32,
+}
+
+/// The resident (parsed) layout: one term byte array plus one [`TermSpan`]
+/// per term, and all postings in a single `u32` buffer. Term `i`'s postings
+/// are `postings[start..next_start]` (bounded by the next term's span, or the
+/// buffer's end), and the term bytes are
+/// `term_bytes[bytes_start..bytes_start + term_len]`.
+///
+/// Compared with the map-and-vectors form this drops the per-entry
+/// `String` + `Vec<u32>` headers (48 bytes per term on 64-bit), the
+/// `BTreeMap` node slack and the per-`Vec` capacity slack, and keeps the
+/// dictionary term-sorted by construction. What it buys is a smaller cache
+/// charge for the same answer set: `heap_size_bytes` on the map form is the
+/// number the parsed-index budgets were sized from, and it overstates this
+/// layout by the per-entry headers and the slack.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlatIndex {
+    /// One span per term, in term order.
+    pub terms: Vec<TermSpan>,
+    /// Every posting ordinal, in term order, ascending within a term.
+    pub postings: Vec<u32>,
+    /// The dictionary's term bytes, concatenated in term order.
+    pub term_bytes: Vec<u8>,
+    /// Number of rows indexed (the ordinal space is `0..n_rows`).
+    pub n_rows: u32,
+}
+
+impl FlatIndex {
+    /// Build from the map-and-vectors form. The term order is preserved
+    /// (it is the `BTreeMap` order), so `terms()` over the result yields
+    /// exactly what `InvertedIndex::terms` yields. The buffers are sized
+    /// exactly — the layout's charge is its capacity, and a builder that
+    /// grew them would bill the cache for headroom nobody reads.
+    pub fn from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Self {
+        let n_terms = map.len();
+        let term_bytes_total: usize = map.keys().map(String::len).sum::<usize>();
+        let postings_total: usize = map.values().map(Vec::len).sum::<usize>();
+        let mut term_bytes = Vec::with_capacity(term_bytes_total);
+        let mut postings = Vec::with_capacity(postings_total);
+        let mut terms = Vec::with_capacity(n_terms);
+        for (term, rows) in map {
+            let bytes_start = term_bytes.len();
+            let postings_start = postings.len();
+            term_bytes.extend_from_slice(term.as_bytes());
+            postings.extend_from_slice(rows);
+            terms.push(TermSpan {
+                bytes_start: bytes_start as u32,
+                term_len: term.len() as u32,
+                postings_start: postings_start as u32,
+            });
+        }
+        Self {
+            terms,
+            postings,
+            term_bytes,
+            n_rows,
+        }
+    }
+
+    /// Exact resident heap of this layout: the three vectors' capacities plus
+    /// the span tuples. No allowance to add — unlike the map form's floor,
+    /// this is what the allocator actually holds.
+    pub fn heap_size_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.terms.capacity() * std::mem::size_of::<TermSpan>()
+            + self.postings.capacity() * std::mem::size_of::<u32>()
+            + self.term_bytes.capacity()
+    }
+
+    /// The dictionary in term order, each term with its ascending
+    /// postings — the same view `InvertedIndex::terms` exposes.
+    pub fn terms(&self) -> impl ExactSizeIterator<Item = (&str, &[u32])> + '_ {
+        self.terms.iter().enumerate().map(
+            |(i, span)| {
+                let term = std::str::from_utf8(
+                    &self.term_bytes[span.bytes_start as usize..span.bytes_start as usize
+                        + span.term_len as usize],
+                )
+                .expect("a FlatIndex built here holds valid UTF-8 terms");
+                let end = if i + 1 < self.terms.len() {
+                    self.terms[i + 1].postings_start as usize
+                } else {
+                    self.postings.len()
+                };
+                (term, &self.postings[span.postings_start as usize..end])
+            },
+        )
+    }
+
+    /// Serialize to the resident layout's own on-wire form: the magic prefix
+    /// with version [`INDEX_VERSION_2`], then per term its span, the term
+    /// bytes and its delta-encoded postings. [`from_bytes_v2`] parses it.
+    /// Nothing in the repository stores this form today — it exists so the
+    /// layout has a round-trip to test and a shape to adopt, if the stored
+    /// form ever needs to carry the resident form verbatim.
+    pub fn to_bytes_v2(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, self.n_rows as u64);
+        write_varint(&mut out, self.terms.len() as u64);
+        for span in &self.terms {
+            write_varint(&mut out, span.bytes_start as u64);
+            write_varint(&mut out, span.term_len as u64);
+            write_varint(&mut out, span.postings_start as u64);
+        }
+        out.extend_from_slice(&self.term_bytes);
+        for (i, span) in self.terms.iter().enumerate() {
+            let end = if i + 1 < self.terms.len() {
+                self.terms[i + 1].postings_start as usize
+            } else {
+                self.postings.len()
+            };
+            let rows = &self.postings[span.postings_start as usize..end];
+            write_varint(&mut out, rows.len() as u64);
+            let mut prev = 0u32;
+            for &r in rows {
+                write_varint(&mut out, (r - prev) as u64);
+                prev = r;
+            }
+        }
+        out
+    }
+
+    /// Parse a blob produced by [`to_bytes_v2`]. Returns `None` on a bad
+    /// magic/version or a truncated/garbled body — the same structural
+    /// invariants [`InvertedIndex::from_bytes`] checks: contiguous term
+    /// spans, strictly ascending UTF-8 terms, and postings strictly
+    /// ascending and inside `0..n_rows`.
+    pub fn from_bytes_v2(bytes: &[u8]) -> Option<Self> {
+        let mut c = Cursor::new(bytes);
+        if c.take(4)? != INDEX_MAGIC {
+            return None;
+        }
+        if c.u8()? != INDEX_VERSION_2 {
+            return None;
+        }
+        let n_rows: u32 = c.varint()?.try_into().ok()?;
+        let n_terms: usize = c.varint()?.try_into().ok()?;
+        // A span is three varints, each at least one byte.
+        if n_terms > c.remaining() / 3 {
+            return None;
+        }
+        let mut terms = Vec::with_capacity(n_terms);
+        let mut prev_span_end: Option<u32> = None; // end of the previous term's bytes
+        for _ in 0..n_terms {
+            let bytes_start = c.varint()?.try_into().ok()?;
+            let term_len = c.varint()?.try_into().ok()?;
+            let postings_start = c.varint()?.try_into().ok()?;
+            // The term byte spans are contiguous, in order, and strictly
+            // ascending — the serialized form of the map's term order.
+            if let Some(last_end) = prev_span_end {
+                if bytes_start != last_end {
+                    return None;
+                }
+            }
+            prev_span_end = Some(bytes_start + term_len);
+            terms.push(TermSpan {
+                bytes_start,
+                term_len,
+                postings_start,
+            });
+        }
+        let total_term_bytes = prev_span_end.unwrap_or(0) as usize;
+        let term_bytes = c.take(total_term_bytes)?.to_vec();
+        for span in &terms {
+            std::str::from_utf8(
+                &term_bytes[span.bytes_start as usize..span.bytes_start as usize
+                    + span.term_len as usize],
+            )
+            .ok()?;
+        }
+        let mut postings = Vec::new();
+        let mut prev_end = 0u32;
+        for (i, span) in terms.iter().enumerate() {
+            // Posting spans are contiguous, in term order.
+            if span.postings_start != prev_end {
+                return None;
+            }
+            let plen: usize = c.varint()?.try_into().ok()?;
+            // Each delta costs at least one byte; a term is stored only
+            // when some row has it.
+            if plen == 0 || plen > c.remaining() {
+                return None;
+            }
+            let mut prev = 0u32;
+            for nth in 0..plen {
+                let delta: u32 = c.varint()?.try_into().ok()?;
+                if nth > 0 && delta == 0 {
+                    return None;
+                }
+                prev = prev.checked_add(delta)?;
+                if prev >= n_rows {
+                    return None;
+                }
+                postings.push(prev);
+            }
+            prev_end = span.postings_start + plen as u32;
+            // Strictly ascending terms: compare against the previous
+            // span's bytes.
+            if i > 0 {
+                let last = &terms[i - 1];
+                if &term_bytes[last.bytes_start as usize..last.bytes_start as usize
+                    + last.term_len as usize]
+                    >= &term_bytes[span.bytes_start as usize..span.bytes_start as usize
+                        + span.term_len as usize]
+                {
+                    return None;
+                }
+            }
+        }
+        if c.remaining() != 0 {
+            return None;
+        }
+        Some(Self {
+            terms,
+            postings,
+            term_bytes,
+            n_rows,
+        })
+    }
 }
 
 /// Accumulates rows into an [`InvertedIndex`]. Feed each row's `raw` text in
@@ -190,6 +430,38 @@ impl InvertedIndex {
                     ENTRY_OVERHEAD + term.len() + rows.len() * std::mem::size_of::<u32>()
                 })
                 .sum::<usize>()
+    }
+
+    /// The resident layout of this index: term-sorted spans over one postings
+    /// buffer. `heap_size_bytes` on the result is the exact resident charge
+    /// of this form, which the parsed-index budgets should use once they
+    /// hold it.
+    pub fn flat(&self) -> FlatIndex {
+        FlatIndex::from_map(&self.postings, self.n_rows)
+    }
+
+    /// Parse a resident-layout index back into the map form, so the two forms
+    /// stay interchangeable.
+    pub fn from_flat(flat: &FlatIndex) -> Option<Self> {
+        let mut postings = BTreeMap::new();
+        for (i, span) in flat.terms.iter().enumerate() {
+            let term = std::str::from_utf8(
+                &flat.term_bytes[span.bytes_start as usize..span.bytes_start as usize
+                    + span.term_len as usize],
+            )
+            .ok()?
+            .to_string();
+            let end = if i + 1 < flat.terms.len() {
+                flat.terms[i + 1].postings_start as usize
+            } else {
+                flat.postings.len()
+            };
+            postings.insert(term, flat.postings[span.postings_start as usize..end].to_vec());
+        }
+        Some(Self {
+            postings,
+            n_rows: flat.n_rows,
+        })
     }
 
     /// The dictionary in term order, each term with its ascending postings. The
@@ -930,6 +1202,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn flat_layout_matches_the_map_form() {
+        let i = idx();
+        let flat = i.flat();
+        // Same dictionary, same postings, term order.
+        let flat_terms: Vec<(&str, Vec<u32>)> =
+            flat.terms().map(|(t, rows)| (t, rows.to_vec())).collect();
+        let map_terms: Vec<(&str, Vec<u32>)> = i
+            .terms()
+            .map(|(t, rows)| (t, rows.to_vec()))
+            .collect();
+        assert_eq!(flat_terms, map_terms);
+        assert_eq!(flat.n_rows, i.n_rows());
+        // The buffers are sized exactly: the charge is the capacity, and a
+        // builder that grew them would bill the cache for headroom.
+        assert_eq!(flat.term_bytes.capacity(), flat.term_bytes.len());
+        assert_eq!(flat.postings.capacity(), flat.postings.len());
+        assert_eq!(flat.terms.capacity(), flat.terms.len());
+        // The map form's charge overstates the flat form's by the per-entry
+        // headers and the BTreeMap/Vec slack.
+        assert!(
+            flat.heap_size_bytes() < i.heap_size_bytes(),
+            "flat {} must charge under the map form {}",
+            flat.heap_size_bytes(),
+            i.heap_size_bytes()
+        );
+        // And the flat charge is exact: three vectors' capacities + span structs.
+        let exact = std::mem::size_of::<FlatIndex>()
+            + flat.terms.capacity() * std::mem::size_of::<TermSpan>()
+            + flat.postings.capacity() * std::mem::size_of::<u32>()
+            + flat.term_bytes.capacity();
+        assert_eq!(flat.heap_size_bytes(), exact);
+        // A span is 12 bytes: three u32s, no padding.
+        assert_eq!(std::mem::size_of::<TermSpan>(), 12);
+        // Back to the map form, and it round-trips.
+        assert_eq!(InvertedIndex::from_flat(&flat), Some(i.clone()));
+    }
+
+    #[test]
+    fn flat_v2_round_trips_and_is_version_separated() {
+        let i = idx();
+        let flat = i.flat();
+        let bytes = flat.to_bytes_v2();
+        let back = FlatIndex::from_bytes_v2(&bytes).expect("v2 blob round-trips");
+        assert_eq!(back, flat);
+        assert_eq!(InvertedIndex::from_flat(&back), Some(i.clone()));
+        // The two versions refuse each other's blobs: the stored form is v1,
+        // the resident form v2, and a reader must not parse one as the other.
+        assert!(InvertedIndex::from_bytes(&bytes).is_none(), "v2 blob is not v1");
+        assert!(FlatIndex::from_bytes_v2(&i.to_bytes()).is_none(), "v1 blob is not v2");
+    }
+
+    #[test]
+    fn flat_v2_refuses_hostile_spans() {
+        // A span that skips term bytes: the contiguity check must catch it.
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, 3); // n_rows
+        write_varint(&mut out, 2); // n_terms
+        write_varint(&mut out, 0); // term 0 bytes_start
+        write_varint(&mut out, 2); // term 0 len
+        write_varint(&mut out, 0); // term 0 postings_start
+        write_varint(&mut out, 5); // term 1 bytes_start — should be 2
+        write_varint(&mut out, 2);
+        write_varint(&mut out, 1);
+        out.extend_from_slice(b"abxy");
+        write_varint(&mut out, 1); // term 0: one posting
+        out.push(0);
+        write_varint(&mut out, 1); // term 1: one posting
+        out.push(1);
+        assert!(FlatIndex::from_bytes_v2(&out).is_none());
     }
 
     #[test]
