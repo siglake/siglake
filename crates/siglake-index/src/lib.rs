@@ -18,6 +18,27 @@
 //! Scope (first slice): the core structure, build, query (single term + AND of
 //! terms), and a compact self-describing serialization. Wiring into the write
 //! path and the query-time RowSelection are later slices.
+//!
+//! ## Two forms
+//!
+//! The index has two in-memory forms. [`InvertedIndex`] is the original
+//! map-and-vectors form (`BTreeMap<String, Vec<u32>>`); it is what the v1
+//! stored blob decodes to, and is kept as-is so historical files read
+//! unchanged. [`FlatIndex`] is the flat form — one term byte array, one
+//! postings buffer, one [`TermSpan`] per term — which the same answer set
+//! charges far less resident memory (no per-term `String`/`Vec` headers, no
+//! map/vector slack). It is the intended canonical resident form:
+//!
+//! - **from scratch** — [`FlatIndex::from_rows`] / [`FlatIndexBuilder`] build
+//!   it directly, with no intermediate map;
+//! - **from a v1 file** — [`InvertedIndex::flat`] converts a decoded
+//!   [`InvertedIndex`];
+//! - **on the wire** — [`FlatIndex::to_bytes_v2`] /
+//!   [`FlatIndex::from_bytes_v2`] round-trip the v2 blob (the write path
+//!   flipping to emit v2 is the maintainer's integration, not this change).
+//!
+//! Both forms answer identically: `postings`, `matching_rows_all`, and
+//! `rows_containing` are implemented on each.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -29,10 +50,15 @@ pub mod spill;
 
 /// Magic prefixing a serialized index blob.
 const INDEX_MAGIC: &[u8; 4] = b"KIDX";
-/// Serialization version of the stored blob (footer KV / Puffin sidecar).
+/// Serialization version of the stored blob (footer KV / Puffin sidecar). This
+/// is what the write path emits today; readers must keep parsing it for
+/// historical files.
 const INDEX_VERSION: u8 = 1;
-/// Serialization version of the resident (parsed) layout — the in-memory
-/// form a v1 decode re-parses into, never a stored form.
+/// Serialization version of the flat (resident) layout — the intended
+/// canonical form. In this POC it is the in-memory form a v1 decode re-parses
+/// into, and it round-trips through [`FlatIndex::to_bytes_v2`] /
+/// [`FlatIndex::from_bytes_v2`]; the write path flipping to emit it is the
+/// maintainer's integration, not part of this change.
 const INDEX_VERSION_2: u8 = 2;
 
 /// Parquet `key_value_metadata` key under which a data file carries its
@@ -169,6 +195,35 @@ impl FlatIndex {
         }
     }
 
+    /// Build directly from an iterator of rows' `raw` text, in physical order.
+    /// The from-scratch path to the flat layout — no intermediate
+    /// [`InvertedIndex`] — mirroring [`InvertedIndex::from_rows`].
+    pub fn from_rows<'a, I: IntoIterator<Item = &'a str>>(rows: I) -> Self {
+        Self::from_rows_with_tokenizer(rows, Tokenizer::Default)
+    }
+
+    /// [`from_rows`](Self::from_rows) with an explicit tokenizer.
+    pub fn from_rows_with_tokenizer<'a, I: IntoIterator<Item = &'a str>>(
+        rows: I,
+        tokenizer: Tokenizer,
+    ) -> Self {
+        let mut b = FlatIndexBuilder::with_tokenizer(tokenizer);
+        for raw in rows {
+            b.push_row(raw);
+        }
+        b.build()
+    }
+
+    /// Number of rows indexed (the ordinal space is `0..n_rows()`).
+    pub fn n_rows(&self) -> u32 {
+        self.n_rows
+    }
+
+    /// Number of distinct indexed terms.
+    pub fn n_terms(&self) -> usize {
+        self.terms.len()
+    }
+
     /// Exact resident heap of this layout: the three vectors' capacities plus
     /// the span tuples. No allowance to add — unlike the map form's floor,
     /// this is what the allocator actually holds.
@@ -275,12 +330,12 @@ impl FlatIndex {
         Some(acc)
     }
 
-    /// Serialize to the resident layout's own on-wire form: the magic prefix
-    /// with version [`INDEX_VERSION_2`], then per term its span, the term
-    /// bytes and its delta-encoded postings. [`from_bytes_v2`] parses it.
-    /// Nothing in the repository stores this form today — it exists so the
-    /// layout has a round-trip to test and a shape to adopt, if the stored
-    /// form ever needs to carry the resident form verbatim.
+    /// Serialize to the v2 wire form: the magic prefix with version
+    /// [`INDEX_VERSION_2`], then per term its span, the term bytes and its
+    /// delta-encoded postings. [`from_bytes_v2`] parses it. This is the
+    /// canonical blob the layout is meant to be stored as; in this POC nothing
+    /// writes it yet (the write path emits v1), so it exists to give the layout
+    /// a round-trip to test and a ready shape for the write-path flip.
     pub fn to_bytes_v2(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(INDEX_MAGIC);
@@ -388,9 +443,9 @@ impl FlatIndex {
             // span's bytes.
             if i > 0 {
                 let last = &terms[i - 1];
-                if &term_bytes[last.bytes_start as usize..last.bytes_start as usize
+                if term_bytes[last.bytes_start as usize..last.bytes_start as usize
                     + last.term_len as usize]
-                    >= &term_bytes[span.bytes_start as usize..span.bytes_start as usize
+                    >= term_bytes[span.bytes_start as usize..span.bytes_start as usize
                         + span.term_len as usize]
                 {
                     return None;
@@ -407,6 +462,17 @@ impl FlatIndex {
             n_rows,
         })
     }
+}
+
+/// The distinct, sorted tokens of a row's `raw` text, normalized exactly as
+/// the blooms normalize them. Shared by both builders so the map form and the
+/// flat form index a row identically — a skew between them would be an index
+/// that answers differently depending only on which layout built it.
+fn row_tokens(tokenizer: &Tokenizer, raw: &str) -> Vec<String> {
+    let mut seen = tokenizer.tokenize(raw);
+    seen.sort();
+    seen.dedup();
+    seen
 }
 
 /// Accumulates rows into an [`InvertedIndex`]. Feed each row's `raw` text in
@@ -443,11 +509,7 @@ impl IndexBuilder {
     /// order (0-based), so callers must push rows in the file's physical order.
     pub fn push_row(&mut self, raw: &str) {
         let ordinal = self.n_rows;
-        // Distinct tokens only — a term appears once per row in the postings.
-        let mut seen: Vec<String> = self.tokenizer.tokenize(raw);
-        seen.sort();
-        seen.dedup();
-        for token in seen {
+        for token in row_tokens(&self.tokenizer, raw) {
             self.postings.entry(token).or_default().push(ordinal);
         }
         self.n_rows += 1;
@@ -460,6 +522,64 @@ impl IndexBuilder {
             postings: self.postings,
             n_rows: self.n_rows,
         }
+    }
+}
+
+/// Accumulates rows into a [`FlatIndex`] directly, without building an
+/// [`InvertedIndex`] first. This is the from-scratch path to the flat layout:
+/// a writer that wants the canonical v2 form does not pay for an intermediate
+/// map-and-vectors index to throw away.
+///
+/// Internally it accumulates per-term postings (a `Vec<u32>` per term) so
+/// ordinals stay ascending, then [`build`](Self::build) flattens them into the
+/// single postings buffer and sizes it exactly. The per-term vectors are the
+/// only transient allocation; the result carries no growth headroom.
+pub struct FlatIndexBuilder {
+    /// term → ascending row ordinals, in the order terms were first seen.
+    /// Sorted by term at build time.
+    postings: BTreeMap<String, Vec<u32>>,
+    n_rows: u32,
+    tokenizer: Tokenizer,
+}
+
+impl Default for FlatIndexBuilder {
+    fn default() -> Self {
+        Self {
+            postings: BTreeMap::new(),
+            n_rows: 0,
+            tokenizer: Tokenizer::Default,
+        }
+    }
+}
+
+impl FlatIndexBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_tokenizer(tokenizer: Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            ..Self::default()
+        }
+    }
+
+    /// Index the next row's `raw` text. The row ordinal is assigned in call
+    /// order (0-based), so callers must push rows in the file's physical
+    /// order. Identical to [`IndexBuilder::push_row`].
+    pub fn push_row(&mut self, raw: &str) {
+        let ordinal = self.n_rows;
+        for token in row_tokens(&self.tokenizer, raw) {
+            self.postings.entry(token).or_default().push(ordinal);
+        }
+        self.n_rows += 1;
+    }
+
+    /// Finalize into the flat layout. Flattens the per-term postings into one
+    /// buffer and sizes it exactly, so the result's `heap_size_bytes` is the
+    /// true resident charge with no growth headroom.
+    pub fn build(self) -> FlatIndex {
+        FlatIndex::from_map(&self.postings, self.n_rows)
     }
 }
 
@@ -508,10 +628,14 @@ impl InvertedIndex {
                 .sum::<usize>()
     }
 
-    /// The resident layout of this index: term-sorted spans over one postings
-    /// buffer. `heap_size_bytes` on the result is the exact resident charge
-    /// of this form, which the parsed-index budgets should use once they
-    /// hold it.
+    /// The flat layout of this index: term-sorted spans over one postings
+    /// buffer. This is the v1→v2 conversion — the path that loads a
+    /// historical v1 file into the canonical form. A writer that already has
+    /// the rows should use [`FlatIndex::from_rows`] / [`FlatIndexBuilder`]
+    /// instead, which builds the flat layout directly without materializing an
+    /// [`InvertedIndex`]. `heap_size_bytes` on the result is the exact
+    /// resident charge, which the parsed-index budgets should use once they
+    /// hold the flat form.
     pub fn flat(&self) -> FlatIndex {
         FlatIndex::from_map(&self.postings, self.n_rows)
     }
@@ -1339,6 +1463,33 @@ mod tests {
     }
 
     #[test]
+    fn flat_from_rows_matches_the_v1_to_v2_path() {
+        // The from-scratch path and the v1→v2 path must produce the identical
+        // flat layout for the same rows: same spans, same postings, same bytes,
+        // same charge.
+        let rows: Vec<String> = (0..500)
+            .map(|r| format!("service-{} status {} row-{r:04}", r % 7, 200 + r % 3))
+            .collect();
+        let via_map = InvertedIndex::from_rows(rows.iter().map(String::as_str)).flat();
+        let direct = FlatIndex::from_rows(rows.iter().map(String::as_str));
+        assert_eq!(direct, via_map, "from-scratch and v1→v2 must agree");
+        assert_eq!(
+            direct.to_bytes_v2(),
+            via_map.to_bytes_v2(),
+            "the two paths must serialize identically"
+        );
+        assert_eq!(direct.heap_size_bytes(), via_map.heap_size_bytes());
+        // And it answers like the map form it stands in for.
+        let i = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        for term in ["service-3", "status", "row-0042", "absent"] {
+            assert_eq!(
+                direct.postings(term).map(<[u32]>::to_vec),
+                i.postings(term).map(<[u32]>::to_vec)
+            );
+        }
+    }
+
+    #[test]
     fn flat_v2_round_trips_and_is_version_separated() {
         let i = idx();
         let flat = i.flat();
@@ -1350,6 +1501,21 @@ mod tests {
         // the resident form v2, and a reader must not parse one as the other.
         assert!(InvertedIndex::from_bytes(&bytes).is_none(), "v2 blob is not v1");
         assert!(FlatIndex::from_bytes_v2(&i.to_bytes()).is_none(), "v1 blob is not v2");
+    }
+
+    #[test]
+    fn flat_empty_index_round_trips() {
+        // The 0-term edge: no spans, no term bytes, no postings. The v2
+        // decoder's contiguity checks must accept the empty body.
+        let flat = FlatIndex::from_rows(std::iter::empty::<&str>());
+        assert_eq!(flat.n_rows(), 0);
+        assert_eq!(flat.n_terms(), 0);
+        let back = FlatIndex::from_bytes_v2(&flat.to_bytes_v2()).expect("round-trips");
+        assert_eq!(back, flat);
+        assert_eq!(
+            InvertedIndex::from_flat(&back),
+            Some(InvertedIndex::from_rows(std::iter::empty::<&str>()))
+        );
     }
 
     #[test]
