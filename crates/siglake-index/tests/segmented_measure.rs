@@ -259,7 +259,11 @@ fn report_segmented_vs_whole_file() {
 
     // The resident flat layout of the same index: what a parsed-index cache
     // would charge if it held `FlatIndex` instead of the map-and-vectors form.
+    // `flat()` is the one-time per-file conversion a cache-load would run, so
+    // it is timed — it must stay small against the decode it follows.
+    let to_flat = Instant::now();
     let v2 = whole.flat();
+    let v2_build = to_flat.elapsed();
     let v2_round_trip = FlatIndex::from_bytes_v2(&v2.to_bytes_v2())
         .expect("v2 layout round-trips");
     assert_eq!(v2_round_trip, v2);
@@ -272,10 +276,10 @@ fn report_segmented_vs_whole_file() {
 
     println!(
         "\n## one file ({} rows, {} terms, {} row groups)\n\n\
-         | format | build | serialized | parse/open | resident | resident B/row |\n\
+         | format | build / convert | serialized | parse/open | resident | resident B/row |\n\
          |---|---:|---:|---:|---:|---:|\n\
          | whole-file v1 (map) | {:?} | {} | {:?} | {} | {:.1} |\n\
-         | whole-file v2 (flat) | — | {} | — | {} | {:.1} |\n\
+         | whole-file v2 (flat) | {:?} | {} | — | {} | {:.1} |\n\
          | seg2 | {:?} | {} | {:?} | {} | {:.1} |\n\
          \nserialized ratio {:.2}x · v1→v2 resident {:.1}x · v1→seg2 resident {:.0}x · \
          seg2 dictionary {} · postings {} · directory {}",
@@ -287,6 +291,7 @@ fn report_segmented_vs_whole_file() {
         v1_parse,
         mib(whole.heap_size_bytes() as u64),
         whole.heap_size_bytes() as f64 / rows_per_file as f64,
+        v2_build,
         mib(v2_round_trip.to_bytes_v2().len() as u64),
         mib(v2.heap_size_bytes() as u64),
         v2.heap_size_bytes() as f64 / rows_per_file as f64,
@@ -378,6 +383,62 @@ fn report_segmented_vs_whole_file() {
             reader.source().reads() / runs as u64,
             mib(fetched),
             100.0 * fetched as f64 / seg_bytes.len() as f64,
+        );
+    }
+
+    // ---- v1 map form vs v2 flat layout, same lookups, warm --------------
+    // The reader's text path does `postings` / `rows_containing` on the parsed
+    // index. Slice 2 swaps the cached value from the map form to the flat
+    // form; this is the per-lookup cost that swap trades. The flat form must
+    // not be meaningfully slower on the hot point-lookup shapes, and it pays
+    // the whole-dictionary sweep on the substring shape, as the map form does.
+    println!(
+        "\n## v1 (map) vs v2 (flat) lookups, one file, warm\n\n\
+         | shape | v1 warm | v2 warm | v2 ÷ v1 |\n\
+         |---|---:|---:|---:|"
+    );
+    for shape in SHAPES {
+        let mut v1_samples = Vec::with_capacity(runs);
+        let mut v2_samples = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let timed = Instant::now();
+            let got1 = if shape.substring {
+                whole.rows_containing(shape.term).unwrap()
+            } else {
+                whole.postings(shape.term).unwrap_or(&[]).to_vec()
+            };
+            v1_samples.push(timed.elapsed());
+            std::hint::black_box(got1);
+
+            let timed = Instant::now();
+            let got2 = if shape.substring {
+                v2.rows_containing(shape.term).unwrap()
+            } else {
+                v2.postings(shape.term).unwrap_or(&[]).to_vec()
+            };
+            v2_samples.push(timed.elapsed());
+            std::hint::black_box(got2);
+        }
+        // The two forms must answer the same rows.
+        let a = if shape.substring {
+            whole.rows_containing(shape.term).unwrap()
+        } else {
+            whole.postings(shape.term).unwrap_or(&[]).to_vec()
+        };
+        let b = if shape.substring {
+            v2.rows_containing(shape.term).unwrap()
+        } else {
+            v2.postings(shape.term).unwrap_or(&[]).to_vec()
+        };
+        assert_eq!(b, a, "{}: v2 flat differs from v1 map", shape.name);
+        let v1_med = median(v1_samples);
+        let v2_med = median(v2_samples);
+        println!(
+            "| {} | {:?} | {:?} | {:.2} |",
+            shape.name,
+            v1_med,
+            v2_med,
+            v2_med.as_nanos() as f64 / v1_med.as_nanos() as f64,
         );
     }
 
