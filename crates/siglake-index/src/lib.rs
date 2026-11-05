@@ -199,6 +199,82 @@ impl FlatIndex {
         )
     }
 
+    /// The term bytes for dictionary entry `i`.
+    fn term_bytes_at(&self, i: usize) -> &[u8] {
+        let span = &self.terms[i];
+        &self.term_bytes[span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize]
+    }
+
+    /// Binary search the term-sorted dictionary for `query` (already
+    /// normalized bytes). The dictionary is byte-ordered, so this is the same
+    /// order `InvertedIndex`'s `BTreeMap` imposes.
+    fn term_index(&self, query: &[u8]) -> Option<usize> {
+        let mut lo = 0usize;
+        let mut hi = self.terms.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.term_bytes_at(mid).cmp(query) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    /// Ascending row ordinals containing `term` (normalized as the blooms do),
+    /// or `None` when the term is absent / not indexable. Mirrors
+    /// [`InvertedIndex::postings`].
+    pub fn postings(&self, term: &str) -> Option<&[u32]> {
+        let norm = normalize_query_term(term)?;
+        let i = self.term_index(norm.as_bytes())?;
+        let span = &self.terms[i];
+        let end = if i + 1 < self.terms.len() {
+            self.terms[i + 1].postings_start as usize
+        } else {
+            self.postings.len()
+        };
+        Some(&self.postings[span.postings_start as usize..end])
+    }
+
+    /// Row ordinals matching **all** `terms` (AND) — the intersection of their
+    /// postings, ascending. Mirrors [`InvertedIndex::matching_rows_all`].
+    pub fn matching_rows_all(&self, terms: &[&str]) -> Vec<u32> {
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let mut lists: Vec<&[u32]> = Vec::with_capacity(terms.len());
+        for t in terms {
+            match self.postings(t) {
+                Some(p) => lists.push(p),
+                None => return Vec::new(),
+            }
+        }
+        lists.sort_by_key(|l| l.len());
+        let mut acc: Vec<u32> = lists[0].to_vec();
+        for list in &lists[1..] {
+            acc = intersect_sorted(&acc, list);
+            if acc.is_empty() {
+                break;
+            }
+        }
+        acc
+    }
+
+    /// Row ordinals matching `raw LIKE '%substr%'`, mirroring
+    /// [`InvertedIndex::rows_containing`]: the union of postings over every
+    /// dictionary term containing the normalized substring.
+    pub fn rows_containing(&self, substr: &str) -> Option<Vec<u32>> {
+        let norm = normalize_query_term(substr)?;
+        let mut acc: Vec<u32> = Vec::new();
+        for (term, rows) in self.terms() {
+            if term.contains(&norm) {
+                acc = union_sorted(&acc, rows);
+            }
+        }
+        Some(acc)
+    }
+
     /// Serialize to the resident layout's own on-wire form: the magic prefix
     /// with version [`INDEX_VERSION_2`], then per term its span, the term
     /// bytes and its delta-encoded postings. [`from_bytes_v2`] parses it.
@@ -1217,6 +1293,26 @@ mod tests {
             .collect();
         assert_eq!(flat_terms, map_terms);
         assert_eq!(flat.n_rows, i.n_rows());
+        // The query API answers the same as the map form, term by term and
+        // across the AND / substring shapes.
+        for term in ["error", "database", "login", "timeout", "connecting", "absent", "ERROR"] {
+            assert_eq!(
+                flat.postings(term).map(<[u32]>::to_vec),
+                i.postings(term).map(<[u32]>::to_vec),
+                "postings({term})"
+            );
+        }
+        assert_eq!(
+            flat.matching_rows_all(&["database", "error"]),
+            i.matching_rows_all(&["database", "error"])
+        );
+        assert_eq!(
+            flat.matching_rows_all(&["error", "kafka"]),
+            i.matching_rows_all(&["error", "kafka"])
+        );
+        assert_eq!(flat.rows_containing("data"), i.rows_containing("data"));
+        assert_eq!(flat.rows_containing("xyz"), i.rows_containing("xyz"));
+        assert_eq!(flat.rows_containing("ab"), i.rows_containing("ab"));
         // The buffers are sized exactly: the charge is the capacity, and a
         // builder that grew them would bill the cache for headroom.
         assert_eq!(flat.term_bytes.capacity(), flat.term_bytes.len());
