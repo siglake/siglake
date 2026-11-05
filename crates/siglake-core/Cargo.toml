@@ -40,6 +40,7 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 axum = { workspace = true }
 chrono = { workspace = true }
+memchr = "=2.8.2"
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 serde = { workspace = true }

@@ -187,11 +187,14 @@ fn scan_string(b: &[u8], i: usize) -> Option<(usize, usize, usize)> {
     let start = i + 1;
     let mut j = start;
     while j < b.len() {
-        match b[j] {
-            b'\\' => j += 2, // skip the escaped char
-            b'"' => return Some((start, j, j + 1)),
-            _ => j += 1,
+        // JSON strings often dominate the bytes skipped during an attribute
+        // lookup. Search ordinary bytes in bulk, preserving the original
+        // one-byte escape rule (including malformed/truncated strings).
+        j += memchr::memchr2(b'"', b'\\', &b[j..])?;
+        if b[j] == b'"' {
+            return Some((start, j, j + 1));
         }
+        j += 2; // skip the escape and exactly one following byte
     }
     None
 }
@@ -283,6 +286,42 @@ mod tests {
         );
     }
 
+    // Independent copy of the pre-optimization scanner: comparing two public
+    // lookup paths would miss a shared scanner regression.
+    fn scalar_scan_string(b: &[u8], i: usize) -> Option<(usize, usize, usize)> {
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() {
+            match b[j] {
+                b'\\' => j += 2,
+                b'"' => return Some((start, j, j + 1)),
+                _ => j += 1,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn string_scan_preserves_escape_and_truncation_edges() {
+        for bytes in [
+            b"\"\"".as_slice(),
+            b"\"unterminated",
+            b"\"trailing\\",
+            b"\"escaped\\\"quote\"tail",
+            b"\"even\\\\\"tail",
+            b"\"odd\\\\\\\"tail",
+            "\"雪λ\\u0022\"tail".as_bytes(),
+        ] {
+            assert_eq!(super::scan_string(bytes, 0), scalar_scan_string(bytes, 0));
+        }
+        let mut long = vec![b'x'; 8192];
+        long[0] = b'"';
+        long[4095] = b'\\';
+        long[4096] = b'"'; // escaped across a typical vector/page boundary
+        long[8191] = b'"';
+        assert_eq!(super::scan_string(&long, 0), Some((1, 8191, 8192)));
+    }
+
     fn json_value_strategy() -> impl Strategy<Value = serde_json::Value> {
         let leaf = prop_oneof![
             Just(serde_json::Value::Null),
@@ -301,6 +340,18 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
+
+        #[test]
+        fn string_scan_matches_scalar_for_arbitrary_bytes(
+            prefix in proptest::collection::vec(any::<u8>(), 0..64),
+            suffix in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let start = prefix.len();
+            let mut bytes = prefix;
+            bytes.push(b'"');
+            bytes.extend(suffix);
+            prop_assert_eq!(super::scan_string(&bytes, start), scalar_scan_string(&bytes, start));
+        }
 
         #[test]
         fn prepared_dotted_lookup_matches_legacy_for_arbitrary_utf8(

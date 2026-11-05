@@ -6403,6 +6403,7 @@ dependencies = [
  "flate2",
  "jsonwebtoken",
  "libc",
+ "memchr",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
