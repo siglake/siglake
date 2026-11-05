@@ -237,27 +237,26 @@ impl FlatIndex {
     /// The dictionary in term order, each term with its ascending
     /// postings — the same view `InvertedIndex::terms` exposes.
     pub fn terms(&self) -> impl ExactSizeIterator<Item = (&str, &[u32])> + '_ {
-        self.terms.iter().enumerate().map(
-            |(i, span)| {
-                let term = std::str::from_utf8(
-                    &self.term_bytes[span.bytes_start as usize..span.bytes_start as usize
-                        + span.term_len as usize],
-                )
-                .expect("a FlatIndex built here holds valid UTF-8 terms");
-                let end = if i + 1 < self.terms.len() {
-                    self.terms[i + 1].postings_start as usize
-                } else {
-                    self.postings.len()
-                };
-                (term, &self.postings[span.postings_start as usize..end])
-            },
-        )
+        self.terms.iter().enumerate().map(|(i, span)| {
+            let term = std::str::from_utf8(
+                &self.term_bytes
+                    [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize],
+            )
+            .expect("a FlatIndex built here holds valid UTF-8 terms");
+            let end = if i + 1 < self.terms.len() {
+                self.terms[i + 1].postings_start as usize
+            } else {
+                self.postings.len()
+            };
+            (term, &self.postings[span.postings_start as usize..end])
+        })
     }
 
     /// The term bytes for dictionary entry `i`.
     fn term_bytes_at(&self, i: usize) -> &[u8] {
         let span = &self.terms[i];
-        &self.term_bytes[span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize]
+        &self.term_bytes
+            [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize]
     }
 
     /// Binary search the term-sorted dictionary for `query` (already
@@ -408,8 +407,8 @@ impl FlatIndex {
         let term_bytes = c.take(total_term_bytes)?.to_vec();
         for span in &terms {
             std::str::from_utf8(
-                &term_bytes[span.bytes_start as usize..span.bytes_start as usize
-                    + span.term_len as usize],
+                &term_bytes
+                    [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize],
             )
             .ok()?;
         }
@@ -443,10 +442,10 @@ impl FlatIndex {
             // span's bytes.
             if i > 0 {
                 let last = &terms[i - 1];
-                if term_bytes[last.bytes_start as usize..last.bytes_start as usize
-                    + last.term_len as usize]
-                    >= term_bytes[span.bytes_start as usize..span.bytes_start as usize
-                        + span.term_len as usize]
+                if term_bytes
+                    [last.bytes_start as usize..last.bytes_start as usize + last.term_len as usize]
+                    >= term_bytes[span.bytes_start as usize
+                        ..span.bytes_start as usize + span.term_len as usize]
                 {
                     return None;
                 }
@@ -646,8 +645,8 @@ impl InvertedIndex {
         let mut postings = BTreeMap::new();
         for (i, span) in flat.terms.iter().enumerate() {
             let term = std::str::from_utf8(
-                &flat.term_bytes[span.bytes_start as usize..span.bytes_start as usize
-                    + span.term_len as usize],
+                &flat.term_bytes
+                    [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize],
             )
             .ok()?
             .to_string();
@@ -656,7 +655,10 @@ impl InvertedIndex {
             } else {
                 flat.postings.len()
             };
-            postings.insert(term, flat.postings[span.postings_start as usize..end].to_vec());
+            postings.insert(
+                term,
+                flat.postings[span.postings_start as usize..end].to_vec(),
+            );
         }
         Some(Self {
             postings,
@@ -1411,15 +1413,21 @@ mod tests {
         // Same dictionary, same postings, term order.
         let flat_terms: Vec<(&str, Vec<u32>)> =
             flat.terms().map(|(t, rows)| (t, rows.to_vec())).collect();
-        let map_terms: Vec<(&str, Vec<u32>)> = i
-            .terms()
-            .map(|(t, rows)| (t, rows.to_vec()))
-            .collect();
+        let map_terms: Vec<(&str, Vec<u32>)> =
+            i.terms().map(|(t, rows)| (t, rows.to_vec())).collect();
         assert_eq!(flat_terms, map_terms);
         assert_eq!(flat.n_rows, i.n_rows());
         // The query API answers the same as the map form, term by term and
         // across the AND / substring shapes.
-        for term in ["error", "database", "login", "timeout", "connecting", "absent", "ERROR"] {
+        for term in [
+            "error",
+            "database",
+            "login",
+            "timeout",
+            "connecting",
+            "absent",
+            "ERROR",
+        ] {
             assert_eq!(
                 flat.postings(term).map(<[u32]>::to_vec),
                 i.postings(term).map(<[u32]>::to_vec),
@@ -1499,8 +1507,14 @@ mod tests {
         assert_eq!(InvertedIndex::from_flat(&back), Some(i.clone()));
         // The two versions refuse each other's blobs: the stored form is v1,
         // the resident form v2, and a reader must not parse one as the other.
-        assert!(InvertedIndex::from_bytes(&bytes).is_none(), "v2 blob is not v1");
-        assert!(FlatIndex::from_bytes_v2(&i.to_bytes()).is_none(), "v1 blob is not v2");
+        assert!(
+            InvertedIndex::from_bytes(&bytes).is_none(),
+            "v2 blob is not v1"
+        );
+        assert!(
+            FlatIndex::from_bytes_v2(&i.to_bytes()).is_none(),
+            "v1 blob is not v2"
+        );
     }
 
     #[test]
