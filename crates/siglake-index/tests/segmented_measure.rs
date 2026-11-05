@@ -264,8 +264,7 @@ fn report_segmented_vs_whole_file() {
     let to_flat = Instant::now();
     let v2 = whole.flat();
     let v2_build = to_flat.elapsed();
-    let v2_round_trip = FlatIndex::from_bytes_v2(&v2.to_bytes_v2())
-        .expect("v2 layout round-trips");
+    let v2_round_trip = FlatIndex::from_bytes_v2(&v2.to_bytes_v2()).expect("v2 layout round-trips");
     assert_eq!(v2_round_trip, v2);
 
     let open = Instant::now();
