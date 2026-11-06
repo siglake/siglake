@@ -24,7 +24,7 @@
 //!   report_segmented_vs_whole_file -- --ignored --nocapture
 //! ```
 //!
-//! Sized by `SIGLAKE_SEG_{ROWS_PER_FILE,GROUP_ROWS,FILES,RUNS,RARE_EVERY,PARSED_BYTES,BLOCK_BYTES}`.
+//! Sized by `SIGLAKE_SEG_{ROWS_PER_FILE,GROUP_ROWS,FILES,RUNS,RARE_EVERY,PARSED_BYTES,BLOCK_BYTES,ISO_RUNS}`.
 
 use std::time::{Duration, Instant};
 
@@ -469,6 +469,127 @@ fn report_segmented_vs_whole_file() {
             v1_med,
             v2_med,
             v2_med.as_nanos() as f64 / v1_med.as_nanos() as f64,
+        );
+    }
+
+    // ---- isolated steady state: v1 alone, then v2 alone, no interleaving --
+    // The alternating section above measures each form in the other's dirty
+    // cache: a 526 MiB BTreeMap walk evicts v2's small hot set (36 KiB anchor
+    // table + 32 KB term window) before every v2 sample, so v2 never reaches
+    // the L3-resident steady state the jump table is designed for. This
+    // section runs each form's point shapes back-to-back, so the median lands
+    // in that form's own steady state. Point shapes only: the substring sweep
+    // walks the whole 72 MiB dictionary and is never L3-resident, so the jump
+    // table is irrelevant to it (already measured at 0.62x above).
+    let iso_runs = knob("SIGLAKE_SEG_ISO_RUNS", 101);
+    let point_shapes: &[Shape] = &SHAPES[..SHAPES.len() - 1]; // drop `substring_scan`, the last shape
+    println!(
+        "\n## v1 vs v2 lookups, one file, isolated steady state ({} consecutive per form)\n\n\
+         | shape | v1 steady | v2 steady | v2 ÷ v1 |\n\
+         |---|---:|---:|---:|",
+        iso_runs
+    );
+    // Phase A: v1 alone. v1's 526 MiB working set never fits the caches, so
+    // every sample is a steady ~2.3 µs pointer-chase; the median is that state.
+    let v1_steady: Vec<Duration> = point_shapes
+        .iter()
+        .map(|shape| {
+            let mut samples = Vec::with_capacity(iso_runs);
+            for _ in 0..iso_runs {
+                let timed = Instant::now();
+                let got = if shape.substring {
+                    whole.rows_containing(shape.term).unwrap()
+                } else {
+                    whole.postings(shape.term).unwrap_or(&[]).to_vec()
+                };
+                samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            }
+            median(samples)
+        })
+        .collect();
+    // Phase B: v2 alone. Consecutive v2 lookups settle the anchor table and
+    // term window into L3; the one cold first sample is discarded by the
+    // median. This is the state the jump table is built for.
+    let v2_steady: Vec<Duration> = point_shapes
+        .iter()
+        .map(|shape| {
+            let mut samples = Vec::with_capacity(iso_runs);
+            for _ in 0..iso_runs {
+                let timed = Instant::now();
+                let got = if shape.substring {
+                    v2.rows_containing(shape.term).unwrap()
+                } else {
+                    v2.postings(shape.term).unwrap_or(&[]).to_vec()
+                };
+                samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            }
+            median(samples)
+        })
+        .collect();
+    for (i, shape) in point_shapes.iter().enumerate() {
+        let v1_med = v1_steady[i];
+        let v2_med = v2_steady[i];
+        println!(
+            "| {} | {:?} | {:?} | {:.2} |",
+            shape.name,
+            v1_med,
+            v2_med,
+            v2_med.as_nanos() as f64 / v1_med.as_nanos() as f64,
+        );
+    }
+    // No-copy: the table above pays a `Vec` allocation + copy of the postings
+    // on every sample (587 KB for `keyword`), which drowns the lookup. This
+    // consumes only the result length, isolating the index's own cost — the
+    // number the jump table and the fast-path normalization target.
+    println!(
+        "\n## v2 point lookup, no posting copy ({} consecutive)\n\n\
+         | shape | v2 no-copy |\n\
+         |---|---:|",
+        iso_runs
+    );
+    for shape in point_shapes {
+        let mut samples = Vec::with_capacity(iso_runs);
+        for _ in 0..iso_runs {
+            let timed = Instant::now();
+            let got = v2.postings(shape.term).map(|p| p.len());
+            samples.push(timed.elapsed());
+            std::hint::black_box(got);
+        }
+        println!("| {} | {:?} |", shape.name, median(samples));
+    }
+    // Amortized: the per-sample `Instant` above floors at ~1.2 µs on this box
+    // (the lookup is faster than the timer resolves), so every shape reads the
+    // same floor. One `Instant` around many lookups, divided by the count,
+    // amortizes the timer overhead and resolves the true sub-microsecond cost.
+    let amort = 20_000;
+    println!(
+        "\n## v2 point lookup, amortized over {amort} (true sub-µs cost)\n\n\
+         | shape | v1 amortized | v2 amortized | v2 ÷ v1 |\n\
+         |---|---:|---:|---:|"
+    );
+    for shape in point_shapes {
+        let v1_t = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..amort {
+            acc += whole.postings(shape.term).map(|p| p.len()).unwrap_or(0);
+        }
+        let v1_ns = v1_t.elapsed().as_nanos() as f64 / amort as f64;
+        std::hint::black_box(acc);
+        let v2_t = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..amort {
+            acc += v2.postings(shape.term).map(|p| p.len()).unwrap_or(0);
+        }
+        let v2_ns = v2_t.elapsed().as_nanos() as f64 / amort as f64;
+        std::hint::black_box(acc);
+        println!(
+            "| {} | {:.0} ns | {:.0} ns | {:.2} |",
+            shape.name,
+            v1_ns,
+            v2_ns,
+            v2_ns / v1_ns
         );
     }
 
