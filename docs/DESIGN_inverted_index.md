@@ -677,18 +677,6 @@ carries its own integrity wherever it is stored, including a future path that
 is neither of these two. Any of the three is a production format change and
 belongs to its own 0.2.0 card; this one changed no format, API or default.
 
-**Version-byte 2, reconciled (2026-11-05).** The flat-layout POC on
-`louis/save-some-ram` reuses the version byte `2` for a different purpose: it
-selects the **v2 flat on-disk layout** (`FlatIndex::to_bytes_v2`/`from_bytes_v2`),
-not the trailing-CRC idea from option (2) above. The two are independent
-concerns — one is a layout change, the other a checksum placement — and neither
-has shipped. If a trailing-CRC-under-version-2 scheme is ever adopted, it must
-not collide with the flat layout's use of the byte; the flat layout claims
-`2` first, so a future CRC would need a separate version value. This POC writes
-no v2 blobs to disk (the write path still emits v1), so on-disk there is no
-conflict today; the note exists so the two cards do not silently agree on
-different things.
-
 ### Footer CRC implementation (2026-09-19, #5204)
 
 The writer now emits option (3). The implemented namespace differs from the
