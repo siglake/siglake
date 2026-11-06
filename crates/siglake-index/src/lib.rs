@@ -29,8 +29,8 @@
 //! charges far less resident memory (no per-term `String`/`Vec` headers, no
 //! map/vector slack). It is the intended canonical resident form:
 //!
-//! - **from scratch** — [`FlatIndex::from_rows`] / [`FlatIndexBuilder`] build
-//!   it directly, with no intermediate map;
+//! - **from scratch** — [`FlatIndex::from_rows`] builds it directly, with no
+//!   intermediate map;
 //! - **from a v1 file** — [`InvertedIndex::flat`] converts a decoded
 //!   [`InvertedIndex`];
 //! - **on the wire** — [`FlatIndex::to_bytes_v2`] /
@@ -62,9 +62,13 @@ const INDEX_VERSION: u8 = 1;
 const INDEX_VERSION_2: u8 = 2;
 /// The target size of the jump table's local window, in bytes of term data.
 /// One anchor is recorded per `TARGET_WINDOW_BYTES` of `term_bytes`, so a
-/// point lookup narrows to a ≤ 32 KB window (L1) at any index size — the
-/// anchor count scales with the index, keeping the window in L1 from a few
-/// MB up to the 4 GB `u32`-offset cap.
+/// point lookup usually narrows to a ≤ 32 KB window (L1) at any index size —
+/// the anchor count scales with the index, keeping the window in L1 from a
+/// few MB up to the 4 GB `u32`-offset cap. The window is bounded by the gap
+/// between *consecutive distinct-prefix* anchors: a run of terms sharing an
+/// 8-byte prefix is covered by a single anchor (deduplicated in
+/// `from_parts`), so the local binary search spans that run — still O(log n)
+/// in the run, just not 32 KB-bounded.
 const TARGET_WINDOW_BYTES: usize = 32 * 1024;
 
 /// Parquet `key_value_metadata` key under which a data file carries its
@@ -166,10 +170,12 @@ pub struct FlatIndex {
     term_bytes: Vec<u8>,
     /// Jump table: `(first-8-bytes-of-term, term_index)`, one anchor every
     /// `TARGET_WINDOW_BYTES` of term bytes, at most one per 8-byte key.
-    /// Binary-searched to narrow a point lookup to a ≤ 32 KB local window
-    /// (L1) before the final binary search. The keys are strictly increasing
-    /// (deduplicated in `from_parts`), which is what `term_index`'s tie
-    /// back-off relies on.
+    /// Binary-searched to narrow a point lookup to a local window before the
+    /// final binary search: ≤ 32 KB between consecutive distinct-prefix
+    /// anchors, but a run of terms sharing an 8-byte prefix collapses to one
+    /// anchor, so consecutive anchors can be further apart and the window
+    /// spans the whole run. The keys are strictly increasing (deduplicated in
+    /// `from_parts`), which is what `term_index`'s tie back-off relies on.
     anchors: Vec<(u64, usize)>,
     n_rows: u32,
 }
@@ -189,16 +195,34 @@ impl FlatIndex {
         })
     }
 
+    /// The normalized form of `term`, as a `str`: borrows `term` in place when
+    /// it is already indexed-form ([`normalize_fast`]), else allocates the
+    /// [`normalize_query_term`] result. `None` when `term` is not indexable.
+    /// Every term-lookup path normalizes through here, so the fast/slow split
+    /// lives in one place.
+    fn normalize(term: &str) -> Option<Cow<'_, str>> {
+        if let Some(b) = Self::normalize_fast(term) {
+            // `b` is `[a-z0-9]`, so it is valid UTF-8; borrow it in place.
+            Some(Cow::Borrowed(
+                std::str::from_utf8(b).expect("normalize_fast bytes are [a-z0-9], valid UTF-8"),
+            ))
+        } else {
+            normalize_query_term(term).map(Cow::Owned)
+        }
+    }
+
     /// Build from the map-and-vectors form. Borrows the map, so during the
-    /// conversion both the map and the flat buffers are resident at once; use
-    /// [`InvertedIndex::consume`] to avoid that peak. The term order is
+    /// conversion both the map and the flat buffers are resident at once (the
+    /// peak is `map + flat`); the owned form
+    /// [`From<InvertedIndex> for FlatIndex`] has the same peak but drops the
+    /// map afterward, so only the flat index stays resident. The term order is
     /// preserved (it is the `BTreeMap` order), and the buffers are sized
     /// exactly, so the resident charge carries no growth headroom.
     ///
     /// Panics when the buffers would not fit the `u32`-offset layout (past
     /// 4 GiB of term bytes, postings, or span table); use
     /// [`try_from_map`](Self::try_from_map) for the checked form.
-    pub fn from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Self {
+    pub(crate) fn from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Self {
         Self::try_from_map(map, n_rows)
             .expect("the map form's buffers fit the flat layout's u32 offsets")
     }
@@ -206,7 +230,7 @@ impl FlatIndex {
     /// [`from_map`](Self::from_map) with the 4 GiB cap as `None` instead of a
     /// panic. The map form has no per-buffer offset cap, so a file past the
     /// flat layout's limit is the caller's signal to stay in the map form.
-    pub fn try_from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Option<Self> {
+    pub(crate) fn try_from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Option<Self> {
         let n_terms = map.len();
         let term_bytes_total: usize = map.keys().map(String::len).sum();
         let postings_total: usize = map.values().map(Vec::len).sum();
@@ -236,49 +260,6 @@ impl FlatIndex {
         Some(Self::from_parts(terms, postings, term_bytes, n_rows))
     }
 
-    /// [`try_from_map`](Self::try_from_map) that takes the map by value and
-    /// drains it as the flat buffers are built, so the map shrinks as the
-    /// flat form grows and the peak is about `max(map, flat)` rather than
-    /// `map + flat`. This is the consuming path a cache-load of a historical
-    /// v1 file takes (`InvertedIndex::consume`).
-    pub fn from_map_consuming(map: BTreeMap<String, Vec<u32>>, n_rows: u32) -> Self {
-        Self::try_from_map_consuming(map, n_rows)
-            .expect("the map form's buffers fit the flat layout's u32 offsets")
-    }
-
-    /// [`from_map_consuming`](Self::from_map_consuming) with the 4 GiB cap as
-    /// `None` instead of a panic.
-    pub fn try_from_map_consuming(map: BTreeMap<String, Vec<u32>>, n_rows: u32) -> Option<Self> {
-        let n_terms = map.len();
-        let term_bytes_total: usize = map.keys().map(String::len).sum();
-        let postings_total: usize = map.values().map(Vec::len).sum();
-        if !Self::map_fits_u32(n_terms, term_bytes_total, postings_total) {
-            return None;
-        }
-        let mut term_bytes = Vec::with_capacity(term_bytes_total);
-        let mut postings = Vec::with_capacity(postings_total);
-        let mut terms = Vec::with_capacity(n_terms);
-        // `into_iter` consumes the map by value and takes each entry out as
-        // the iterator advances, so the map shrinks as the flat buffers grow:
-        // the peak is about `max(map, flat)`, not `map + flat`.
-        for (term, rows) in map.into_iter() {
-            let bytes_start = u32::try_from(term_bytes.len())
-                .expect("a resident index's term buffer fits a u32 offset");
-            let postings_start = u32::try_from(postings.len())
-                .expect("a resident index's postings buffer fits a u32 offset");
-            let term_len =
-                u32::try_from(term.len()).expect("a resident index's term fits a u32 length");
-            term_bytes.extend_from_slice(term.as_bytes());
-            postings.extend_from_slice(&rows);
-            terms.push(TermSpan {
-                bytes_start,
-                term_len,
-                postings_start,
-            });
-        }
-        Some(Self::from_parts(terms, postings, term_bytes, n_rows))
-    }
-
     /// The 4 GiB `u32`-offset checks shared by the map-based constructors.
     /// The term-bytes and postings totals must fit `u32` (a running offset
     /// fits only if the total does, and a buffer past the cap could not
@@ -288,7 +269,9 @@ impl FlatIndex {
     fn map_fits_u32(n_terms: usize, term_bytes_total: usize, postings_total: usize) -> bool {
         u32::try_from(term_bytes_total).is_ok()
             && u32::try_from(postings_total).is_ok()
-            && n_terms * std::mem::size_of::<TermSpan>() <= u32::MAX as usize
+            && n_terms
+                .checked_mul(std::mem::size_of::<TermSpan>())
+                .is_some_and(|bytes| bytes <= u32::MAX as usize)
     }
 
     /// Assemble from already-built **sorted** buffers (term-sorted, contiguous
@@ -308,13 +291,16 @@ impl FlatIndex {
         n_rows: u32,
     ) -> Self {
         // Derive the jump table: one anchor per `TARGET_WINDOW_BYTES` of term
-        // bytes, so a point lookup narrows to a ≤ 32 KB window (L1) at any
-        // index size. The key is the term's first 8 bytes zero-padded, read
-        // big-endian (most-significant = first byte), so the keys are in the
-        // same lexicographic order as the terms. Only the *first* anchor per
-        // key is kept: a run of terms sharing an 8-byte prefix would otherwise
-        // produce duplicate keys, and `term_index` needs strictly increasing
-        // keys for its tie back-off to act as a lower-bound window (see there).
+        // bytes, so a point lookup usually narrows to a ≤ 32 KB window (L1)
+        // at any index size. The key is the term's first 8 bytes zero-padded,
+        // read big-endian (most-significant = first byte), so the keys are in
+        // the same lexicographic order as the terms. Only the *first* anchor
+        // per key is kept: a run of terms sharing an 8-byte prefix would
+        // otherwise produce duplicate keys, and `term_index` needs strictly
+        // increasing keys for its tie back-off to act as a lower-bound window
+        // (see there). The cost of that dedup: consecutive anchors can be more
+        // than 32 KB apart across a shared-prefix run, so the local window
+        // spans the run in that case.
         let mut anchors = Vec::new();
         if !terms.is_empty() && term_bytes.len() >= TARGET_WINDOW_BYTES {
             let mut next_anchor_at = TARGET_WINDOW_BYTES;
@@ -349,9 +335,10 @@ impl FlatIndex {
     /// Check the layout invariants: contiguous, in-bounds, strictly ascending
     /// UTF-8, non-empty term spans; non-empty, strictly ascending, in-domain
     /// postings; and each jump-table anchor's prefix matches its term.
-    /// Constructors call this (debug builds); it is public so an out-of-band
-    /// construction (e.g. FFI) can verify before use. Panics on a violation.
-    pub fn validate(&self) -> &Self {
+    /// Constructors call this (debug builds) as a tripwire; a release load that
+    /// bypasses the checked builders (e.g. an out-of-band construction) can call
+    /// it to verify before use. Panics on a violation.
+    pub(crate) fn validate(&self) -> &Self {
         let total_bytes = self.term_bytes.len();
         let total_postings = self.postings.len();
         let mut bytes_prev_end = 0usize;
@@ -394,11 +381,14 @@ impl FlatIndex {
             bytes_prev_end = bytes_end;
             postings_prev_end = postings_end;
         }
-        // Each anchor's stored prefix must match its term's first 8 bytes.
-        for &(prefix, i) in &self.anchors {
+        // Each anchor's index must be in range, its stored prefix must match
+        // its term's first 8 bytes, and the keys must be strictly increasing —
+        // `term_index`'s tie back-off (a lower-bound window) relies on there
+        // being at most one anchor per key.
+        for (a, &(prefix, i)) in self.anchors.iter().enumerate() {
+            assert!(i < self.terms.len(), "anchor index must be in range");
             let span = &self.terms[i];
-            let term = &self.term_bytes
-                [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize];
+            let term = Self::term_of(&self.term_bytes, span);
             let mut expected = [0u8; 8];
             let n = term.len().min(8);
             expected[..n].copy_from_slice(&term[..n]);
@@ -407,6 +397,12 @@ impl FlatIndex {
                 u64::from_be_bytes(expected),
                 "anchor prefix must match its term"
             );
+            if a > 0 {
+                assert!(
+                    self.anchors[a - 1].0 < prefix,
+                    "anchor keys must be strictly increasing (one per 8-byte key)"
+                );
+            }
         }
         self
     }
@@ -418,16 +414,20 @@ impl FlatIndex {
         Self::from_rows_with_tokenizer(rows, Tokenizer::Default)
     }
 
-    /// [`from_rows`](Self::from_rows) with an explicit tokenizer.
-    pub fn from_rows_with_tokenizer<'a, I: IntoIterator<Item = &'a str>>(
+    /// [`from_rows`](Self::from_rows) with an explicit tokenizer. The rows are
+    /// accumulated the same way as the map form (per-term postings, ascending
+    /// ordinals) and flattened at the end — it avoids the *named*
+    /// `InvertedIndex` intermediate, not the accumulation map; a truly
+    /// allocation-light flat build is a later optimization.
+    pub(crate) fn from_rows_with_tokenizer<'a, I: IntoIterator<Item = &'a str>>(
         rows: I,
         tokenizer: Tokenizer,
     ) -> Self {
-        let mut b = FlatIndexBuilder::with_tokenizer(tokenizer);
+        let mut b = IndexBuilder::with_tokenizer(tokenizer);
         for raw in rows {
             b.push_row(raw);
         }
-        b.build()
+        FlatIndex::from(b.build())
     }
 
     /// Number of rows indexed (the ordinal space is `0..n_rows()`).
@@ -459,11 +459,8 @@ impl FlatIndex {
     /// are in sorted term order, so this is a direct iteration.
     pub fn terms(&self) -> impl ExactSizeIterator<Item = (&str, &[u32])> + '_ {
         self.terms.iter().enumerate().map(|(i, span)| {
-            let term = std::str::from_utf8(
-                &self.term_bytes
-                    [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize],
-            )
-            .expect("a FlatIndex built here holds valid UTF-8 terms");
+            let term = std::str::from_utf8(Self::term_of(&self.term_bytes, span))
+                .expect("a FlatIndex built here holds valid UTF-8 terms");
             (
                 term,
                 &self.postings[span.postings_start as usize..self.postings_end(i)],
@@ -471,11 +468,12 @@ impl FlatIndex {
         })
     }
 
-    /// The term bytes for dictionary entry `i`.
-    fn term_bytes_at(&self, i: usize) -> &[u8] {
-        let span = &self.terms[i];
-        &self.term_bytes
-            [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize]
+    /// The term bytes for the dictionary entry described by `span`, within
+    /// `term_bytes`. The one place the "where do a term's bytes live?" rule
+    /// lives; every term read goes through it (it takes the buffer by value
+    /// so both `&self.term_bytes` and a decode-local buffer can use it).
+    fn term_of<'a>(term_bytes: &'a [u8], span: &TermSpan) -> &'a [u8] {
+        &term_bytes[span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize]
     }
 
     /// The `postings` slice's end index for term `i`: the next term's
@@ -504,7 +502,9 @@ impl FlatIndex {
         // Binary-search the anchors for the first one with prefix > qkey; `lo`
         // is that index (or the end when every anchor is <= qkey). The window
         // that contains `qkey` starts at the last anchor <= qkey and ends at
-        // the first anchor > qkey — one 32 KB window, no more.
+        // the first anchor > qkey — one window between two consecutive
+        // anchors, ≤ 32 KB except across a shared-prefix run (one anchor per
+        // distinct key), where it spans the run.
         let mut lo = 0usize;
         let mut hi = self.anchors.len();
         while lo < hi {
@@ -540,7 +540,7 @@ impl FlatIndex {
         let mut whi = end;
         while wlo < whi {
             let mid = (wlo + whi) / 2;
-            match self.term_bytes_at(mid).cmp(query) {
+            match Self::term_of(&self.term_bytes, &self.terms[mid]).cmp(query) {
                 std::cmp::Ordering::Less => wlo = mid + 1,
                 std::cmp::Ordering::Greater => whi = mid,
                 std::cmp::Ordering::Equal => return Some(mid),
@@ -553,32 +553,16 @@ impl FlatIndex {
     /// or `None` when the term is absent / not indexable. Mirrors
     /// [`InvertedIndex::postings`].
     pub fn postings(&self, term: &str) -> Option<&[u32]> {
-        // Fast path: an already-indexed term (lowercase ASCII alphanumeric)
-        // is used in place, skipping the `normalize_query_term` allocation.
-        // The fallback allocates but produces a byte-identical answer.
-        match Self::normalize_fast(term) {
-            Some(b) => self.postings_norm(b),
-            None => {
-                let owned = normalize_query_term(term)?;
-                self.postings_norm(owned.as_bytes())
-            }
-        }
+        let norm = Self::normalize(term)?;
+        self.term_index(norm.as_bytes())
+            .map(|i| self.postings_at(i))
     }
 
-    /// [`postings`](Self::postings) for an already-normalized term: the
-    /// fast/slow split above only changes how the bytes are obtained, never
-    /// how they are looked up.
-    fn postings_norm(&self, norm: &[u8]) -> Option<&[u32]> {
-        let i = self.term_index(norm)?;
-        let span = &self.terms[i];
-        Some(&self.postings[span.postings_start as usize..self.postings_end(i)])
-    }
-
-    /// The posting list of the `i`-th dictionary term, by position. Tests
-    /// use it to reach terms (like the empty term) that [`postings`]
+    /// The posting list of the `i`-th dictionary term, by position. Also the
+    /// one place the "where does term `i`'s postings live?" rule is applied;
+    /// tests use it to reach terms (like the empty term) that [`postings`]
     /// deliberately does not answer — below `MIN_TOKEN_LEN` a query cannot
     /// have produced the term, so the term API refuses it on both forms.
-    #[cfg(test)]
     fn postings_at(&self, i: usize) -> &[u32] {
         let span = &self.terms[i];
         &self.postings[span.postings_start as usize..self.postings_end(i)]
@@ -612,10 +596,10 @@ impl FlatIndex {
     /// [`InvertedIndex::rows_containing`]: the union of postings over every
     /// dictionary term containing the normalized substring.
     pub fn rows_containing(&self, substr: &str) -> Option<Vec<u32>> {
-        let norm = normalize_query_term(substr)?;
+        let norm = Self::normalize(substr)?;
         let mut acc: Vec<u32> = Vec::new();
         for (term, rows) in self.terms() {
-            if term.contains(&norm) {
+            if term.contains(norm.as_ref()) {
                 acc = union_sorted(&acc, rows);
             }
         }
@@ -721,11 +705,7 @@ impl FlatIndex {
         // order.
         let mut last_term: Option<&str> = None;
         for span in &terms {
-            let term = std::str::from_utf8(
-                &term_bytes
-                    [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize],
-            )
-            .ok()?;
+            let term = std::str::from_utf8(Self::term_of(&term_bytes, span)).ok()?;
             if let Some(prev) = last_term {
                 if prev >= term {
                     return None;
@@ -759,6 +739,19 @@ impl FlatIndex {
             return None;
         }
         Some(Self::from_parts(terms, postings, term_bytes, n_rows))
+    }
+}
+
+/// Convert an owned map-form index into the flat layout. The map is moved and
+/// dropped, so only the flat index stays resident. The conversion *peak* is
+/// `map + flat` (the flat buffers are allocated at full size before the copy),
+/// the same as the borrowing [`InvertedIndex::flat`]; the value of the owned
+/// form is the steady state — the map is gone when this returns. This is the
+/// path a cache-load of a historical v1 file takes. Panics past the 4 GiB
+/// `u32`-offset cap — use [`InvertedIndex::try_flat`] for the checked form.
+impl From<InvertedIndex> for FlatIndex {
+    fn from(index: InvertedIndex) -> Self {
+        FlatIndex::from_map(&index.postings, index.n_rows)
     }
 }
 
@@ -820,45 +813,6 @@ impl IndexBuilder {
             postings: self.postings,
             n_rows: self.n_rows,
         }
-    }
-}
-
-/// Accumulates rows into a [`FlatIndex`] — the from-scratch path to the flat
-/// layout, mirroring [`InvertedIndex::from_rows`].
-///
-/// It is a thin wrapper over [`IndexBuilder`]: the rows are accumulated the
-/// same way (per-term postings, ascending ordinals), and [`build`](Self::build)
-/// flattens the result into the flat layout. It avoids the *named*
-/// `InvertedIndex` intermediate, not the accumulation map — a truly
-/// allocation-light flat build is a later optimization.
-#[derive(Default)]
-pub struct FlatIndexBuilder {
-    inner: IndexBuilder,
-}
-
-impl FlatIndexBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn with_tokenizer(tokenizer: Tokenizer) -> Self {
-        Self {
-            inner: IndexBuilder::with_tokenizer(tokenizer),
-        }
-    }
-
-    /// Index the next row's `raw` text. The row ordinal is assigned in call
-    /// order (0-based), so callers must push rows in the file's physical
-    /// order. Delegates to [`IndexBuilder::push_row`].
-    pub fn push_row(&mut self, raw: &str) {
-        self.inner.push_row(raw)
-    }
-
-    /// Finalize into the flat layout by consuming the accumulated index: the
-    /// map is drained entry by entry as the flat buffers grow, so the peak is
-    /// about `max(map, flat)` rather than `map + flat`.
-    pub fn build(self) -> FlatIndex {
-        self.inner.build().consume()
     }
 }
 
@@ -944,11 +898,14 @@ impl InvertedIndex {
     /// The flat layout of this index: term-sorted spans over one postings
     /// buffer. This is the v1→v2 conversion — the path that loads a
     /// historical v1 file into the canonical form. It borrows the map, so both
-    /// the map and the flat buffers are resident during the conversion; use
-    /// [`consume`](Self::consume) to avoid that peak. A writer that already
-    /// has the rows should use [`FlatIndex::from_rows`] / [`FlatIndexBuilder`]
-    /// instead. `heap_size_bytes` on the result is the resident charge the
-    /// parsed-index budgets should use once they hold the flat form.
+    /// the map and the flat buffers are resident during the conversion (peak
+    /// `map + flat`); the owned form
+    /// [`From<InvertedIndex> for FlatIndex`] has the same peak but drops the
+    /// map afterward, so only the flat index stays resident. A writer that
+    /// already has the rows should use [`FlatIndex::from_rows`]
+    /// instead. `heap_size_bytes` on the result is the
+    /// resident charge the parsed-index budgets should use once they hold the
+    /// flat form.
     pub fn flat(&self) -> FlatIndex {
         FlatIndex::from_map(&self.postings, self.n_rows)
     }
@@ -960,29 +917,6 @@ impl InvertedIndex {
     /// this and falls back to keeping the map when it is `None`.
     pub fn try_flat(&self) -> Option<FlatIndex> {
         FlatIndex::try_from_map(&self.postings, self.n_rows)
-    }
-
-    /// Consume this map-form index into the flat layout. Unlike
-    /// [`flat`](Self::flat), the map is moved, so the caller cannot keep using
-    /// it, and the map is drained entry by entry as the flat buffers grow, so
-    /// the peak is about `max(map, flat)` rather than `map + flat`. This is
-    /// the path a cache-load of a historical v1 file should take — the result
-    /// is the resident form, and the map is not returned to the caller.
-    pub fn consume(self) -> FlatIndex {
-        FlatIndex::from_map_consuming(self.postings, self.n_rows)
-    }
-
-    /// Parse a resident-layout index back into the map form, so the two forms
-    /// stay interchangeable.
-    pub fn from_flat(flat: &FlatIndex) -> Option<Self> {
-        let mut postings = BTreeMap::new();
-        for (term, rows) in flat.terms() {
-            postings.insert(term.to_string(), rows.to_vec());
-        }
-        Some(Self {
-            postings,
-            n_rows: flat.n_rows(),
-        })
     }
 
     /// The dictionary in term order, each term with its ascending postings. The
@@ -1187,6 +1121,22 @@ impl InvertedIndex {
             return None;
         }
         Some(Self { postings, n_rows })
+    }
+}
+
+/// Parse a resident-layout index back into the map form, so the two forms stay
+/// interchangeable. The reverse of [`From<InvertedIndex> for FlatIndex`]: takes
+/// the flat index by value and drops it, so only the map form stays resident.
+impl From<FlatIndex> for InvertedIndex {
+    fn from(flat: FlatIndex) -> Self {
+        let mut postings = BTreeMap::new();
+        for (term, rows) in flat.terms() {
+            postings.insert(term.to_string(), rows.to_vec());
+        }
+        Self {
+            postings,
+            n_rows: flat.n_rows(),
+        }
     }
 }
 
@@ -1774,7 +1724,7 @@ mod tests {
         // A span is 12 bytes: three u32s, no padding.
         assert_eq!(std::mem::size_of::<TermSpan>(), 12);
         // Back to the map form, and it round-trips.
-        assert_eq!(InvertedIndex::from_flat(&flat), Some(i.clone()));
+        assert_eq!(InvertedIndex::from(flat), i);
     }
 
     #[test]
@@ -1927,10 +1877,10 @@ mod tests {
 
     #[test]
     fn flat_map_construction_paths_agree() {
-        // The borrowing (`flat`), consuming (`consume`), and fallible
+        // The borrowing (`flat`), owned (`From<InvertedIndex>`), and fallible
         // (`try_flat`) conversions must all produce the identical flat layout
         // for the same rows: same spans, same postings, same jump table, same
-        // charge. `consume` drains the map, so any divergence from the
+        // charge. The owned form moves the map, so any divergence from the
         // borrowing path would show up here.
         let rows: Vec<String> = (0..2_000)
             .map(|r| format!("service-{} status {} row-{r:04}", r % 7, 200 + r % 3))
@@ -1940,12 +1890,12 @@ mod tests {
         let c = InvertedIndex::from_rows(rows.iter().map(String::as_str));
         let by_borrow = a.flat();
         let by_try = a.try_flat().expect("a small index fits the u32 cap");
-        let by_consume = b.consume();
+        let by_owned = FlatIndex::from(b);
         assert_eq!(by_borrow, by_try, "try_flat must equal flat");
-        assert_eq!(by_borrow, by_consume, "consume must equal flat");
+        assert_eq!(by_borrow, by_owned, "From<InvertedIndex> must equal flat");
         assert_eq!(
             by_borrow.heap_size_bytes(),
-            by_consume.heap_size_bytes(),
+            by_owned.heap_size_bytes(),
             "the charge must not depend on the construction path"
         );
         // `a` is still usable after the borrowing conversions; `b` was moved.
@@ -1993,7 +1943,7 @@ mod tests {
         let bytes = flat.to_bytes_v2();
         let back = FlatIndex::from_bytes_v2(&bytes).expect("v2 blob round-trips");
         assert_eq!(back, flat);
-        assert_eq!(InvertedIndex::from_flat(&back), Some(i.clone()));
+        assert_eq!(InvertedIndex::from(back), i);
         // The two versions refuse each other's blobs: the stored form is v1,
         // the resident form v2, and a reader must not parse one as the other.
         assert!(
@@ -2016,8 +1966,8 @@ mod tests {
         let back = FlatIndex::from_bytes_v2(&flat.to_bytes_v2()).expect("round-trips");
         assert_eq!(back, flat);
         assert_eq!(
-            InvertedIndex::from_flat(&back),
-            Some(InvertedIndex::from_rows(std::iter::empty::<&str>()))
+            InvertedIndex::from(back),
+            InvertedIndex::from_rows(std::iter::empty::<&str>())
         );
     }
 
@@ -2061,12 +2011,16 @@ mod tests {
             "bad version"
         );
 
-        // A term count no payload can cover.
+        // A term count no payload can cover. `total_postings` is present (0)
+        // so the blob survives the header read and is rejected by the
+        // `n_terms > remaining / 2` guard itself, not by truncation while
+        // reading the total.
         let mut out = Vec::new();
         out.extend_from_slice(INDEX_MAGIC);
         out.push(INDEX_VERSION_2);
         write_varint(&mut out, 3);
         write_varint(&mut out, u32::MAX as u64);
+        write_varint(&mut out, 0);
         assert!(out.len() < 16, "the hostile blob stays tiny");
         assert!(FlatIndex::from_bytes_v2(&out).is_none());
 
