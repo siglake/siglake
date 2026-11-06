@@ -264,8 +264,14 @@ fn report_segmented_vs_whole_file() {
     let to_flat = Instant::now();
     let v2 = whole.flat();
     let v2_build = to_flat.elapsed();
-    let v2_round_trip = FlatIndex::from_bytes_v2(&v2.to_bytes_v2()).expect("v2 layout round-trips");
-    assert_eq!(v2_round_trip, v2);
+    // The real v2 load path: the on-disk bytes, parsed by `from_bytes_v2` (the
+    // reader's path once the write side emits v2), timed separately from the
+    // in-memory `flat()` conversion. The two must agree.
+    let v2_blob = v2.to_bytes_v2();
+    let load = Instant::now();
+    let v2_loaded = FlatIndex::from_bytes_v2(&v2_blob).expect("v2 layout round-trips");
+    let v2_load = load.elapsed();
+    assert_eq!(v2_loaded, v2);
 
     let open = Instant::now();
     let reader = SegmentedReader::open(SliceSource::shared(std::sync::Arc::clone(&seg_bytes)))
@@ -275,10 +281,11 @@ fn report_segmented_vs_whole_file() {
 
     println!(
         "\n## one file ({} rows, {} terms, {} row groups)\n\n\
-         | format | build / convert | serialized | parse/open | resident | resident B/row |\n\
+         | format | build / convert | serialized | parse / load | resident | resident B/row |\n\
          |---|---:|---:|---:|---:|---:|\n\
          | whole-file v1 (map) | {:?} | {} | {:?} | {} | {:.1} |\n\
-         | whole-file v2 (flat) | {:?} | {} | — | {} | {:.1} |\n\
+         | whole-file v2 (flat, in-mem) | {:?} | {} | — | {} | {:.1} |\n\
+         | whole-file v2 (flat, from_bytes) | — | {} | {:?} | {} | {:.1} |\n\
          | seg2 | {:?} | {} | {:?} | {} | {:.1} |\n\
          \nserialized ratio {:.2}x · v1→v2 resident {:.1}x · v1→seg2 resident {:.0}x · \
          seg2 dictionary {} · postings {} · directory {}",
@@ -291,7 +298,11 @@ fn report_segmented_vs_whole_file() {
         mib(whole.heap_size_bytes() as u64),
         whole.heap_size_bytes() as f64 / rows_per_file as f64,
         v2_build,
-        mib(v2_round_trip.to_bytes_v2().len() as u64),
+        mib(v2_blob.len() as u64),
+        mib(v2.heap_size_bytes() as u64),
+        v2.heap_size_bytes() as f64 / rows_per_file as f64,
+        mib(v2_blob.len() as u64),
+        v2_load,
         mib(v2.heap_size_bytes() as u64),
         v2.heap_size_bytes() as f64 / rows_per_file as f64,
         seg_build,
@@ -399,24 +410,44 @@ fn report_segmented_vs_whole_file() {
     for shape in SHAPES {
         let mut v1_samples = Vec::with_capacity(runs);
         let mut v2_samples = Vec::with_capacity(runs);
-        for _ in 0..runs {
-            let timed = Instant::now();
-            let got1 = if shape.substring {
-                whole.rows_containing(shape.term).unwrap()
-            } else {
-                whole.postings(shape.term).unwrap_or(&[]).to_vec()
+        // Alternate which form is timed first each run: a fixed v1-then-v2
+        // order lets one form inherit the other's cold-cache / branch-predictor
+        // state, and a median over a biased sample is not a fair ratio.
+        for run in 0..runs {
+            let v1_first = run % 2 == 0;
+            let lookup_v1 = |index: &InvertedIndex| {
+                if shape.substring {
+                    index.rows_containing(shape.term).unwrap()
+                } else {
+                    index.postings(shape.term).unwrap_or(&[]).to_vec()
+                }
             };
-            v1_samples.push(timed.elapsed());
-            std::hint::black_box(got1);
-
-            let timed = Instant::now();
-            let got2 = if shape.substring {
-                v2.rows_containing(shape.term).unwrap()
-            } else {
-                v2.postings(shape.term).unwrap_or(&[]).to_vec()
+            let lookup_v2 = |index: &FlatIndex| {
+                if shape.substring {
+                    index.rows_containing(shape.term).unwrap()
+                } else {
+                    index.postings(shape.term).unwrap_or(&[]).to_vec()
+                }
             };
-            v2_samples.push(timed.elapsed());
-            std::hint::black_box(got2);
+            if v1_first {
+                let timed = Instant::now();
+                let got = lookup_v1(&whole);
+                v1_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+                let timed = Instant::now();
+                let got = lookup_v2(&v2);
+                v2_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            } else {
+                let timed = Instant::now();
+                let got = lookup_v2(&v2);
+                v2_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+                let timed = Instant::now();
+                let got = lookup_v1(&whole);
+                v1_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            }
         }
         // The two forms must answer the same rows.
         let a = if shape.substring {

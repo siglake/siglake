@@ -256,6 +256,19 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   turnovers rather than for as long as its file is planned, which is the
   approximation that keeps a compacted-away file's blob from being retained
   forever; the plan-level signal that would replace it does not exist.
+- **The v2 flat inverted index caps its buffers at 4 GiB and is not written to
+  disk yet.** `FlatIndex` keeps one `u32`-offset term dictionary and one
+  `u32`-offset postings buffer, so every buffer's start must fit a `u32` — a
+  resident index past 4 GiB of term bytes, postings, or span table is refused
+  at construction (`from_map`/`from_parts`), not truncated. A file that would
+  need more is indexed in the v1 map form, which has no per-buffer offset cap.
+  The v2 on-disk form (`to_bytes_v2`/`from_bytes_v2`, version byte `2`) stores
+  cumulative term lengths and delta-encoded postings and is the same size as
+  the v1 blob to within a varint or two; it exists as a POC and is read only
+  through the v1→v2 conversion path. The write path still emits v1, so nothing
+  stores a v2 blob and no reader depends on one. The 4 GiB cap is a
+  deliberate, checked limit: the offsets are the layout, and a `u32` that
+  overflowed would silently corrupt the index rather than fail loud.
 - **A footer inverted index's CRC-32 shares the Parquet footer it checks.** New
   files carry the blob under `siglake.inverted_index.v1[.<column>]` and its
   eight-hex-character CRC under the disjoint
