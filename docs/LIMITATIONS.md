@@ -256,29 +256,6 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   turnovers rather than for as long as its file is planned, which is the
   approximation that keeps a compacted-away file's blob from being retained
   forever; the plan-level signal that would replace it does not exist.
-- **The v2 flat inverted index caps its buffers at 4 GiB and is not written to
-  disk yet.** `FlatIndex` keeps one `u32`-offset term dictionary and one
-  `u32`-offset postings buffer, so every buffer's start must fit a `u32` — a
-  resident index past 4 GiB of term bytes, postings, or span table is refused
-  at construction, not truncated. The infallible conversions
-  (`InvertedIndex::flat` and `FlatIndex::from(InvertedIndex)`) **panic** on
-  such an index; the fallible `InvertedIndex::try_flat` returns `None`. The map
-  form has no per-buffer offset cap, so a file past the flat limit stays
-  indexed in the v1 map form — but that fallback is a caller decision:
-  **nothing in the query path chooses it yet.** Only the borrowing
-  `try_flat` can serve that fallback; the owned `FlatIndex::from(InvertedIndex)`
-  takes the map by value, so a panic has already dropped it and there is no map
-  form left to fall back to. Wiring the `try_flat` → keep-the-map fallback into
-  the cache-load is out of scope for this POC, so until it lands a historical
-  file past 4 GiB that reaches the flat conversion panics (or, via `try_flat`,
-  is declined and left unindexed).
-  The v2 on-disk form (`to_bytes_v2`/`from_bytes_v2`, version byte `2`) stores
-  cumulative term lengths and delta-encoded postings and is the same size as
-  the v1 blob to within a varint or two; it exists as a POC and is read only
-  through the v1→v2 conversion path. The write path still emits v1, so nothing
-  stores a v2 blob and no reader depends on one. The 4 GiB cap is a
-  deliberate, checked limit: the offsets are the layout, and a `u32` that
-  overflowed would silently corrupt the index rather than fail loud.
 - **A footer inverted index's CRC-32 shares the Parquet footer it checks.** New
   files carry the blob under `siglake.inverted_index.v1[.<column>]` and its
   eight-hex-character CRC under the disjoint
