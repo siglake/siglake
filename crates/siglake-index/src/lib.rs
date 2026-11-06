@@ -18,19 +18,58 @@
 //! Scope (first slice): the core structure, build, query (single term + AND of
 //! terms), and a compact self-describing serialization. Wiring into the write
 //! path and the query-time RowSelection are later slices.
+//!
+//! ## Two forms
+//!
+//! The index has two in-memory forms. [`InvertedIndex`] is the original
+//! map-and-vectors form (`BTreeMap<String, Vec<u32>>`); it is what the v1
+//! stored blob decodes to, and is kept as-is so historical files read
+//! unchanged. [`FlatIndex`] is the flat form — one term byte array, one
+//! postings buffer, one [`TermSpan`] per term — which the same answer set
+//! charges far less resident memory (no per-term `String`/`Vec` headers, no
+//! map/vector slack). It is the intended canonical resident form:
+//!
+//! - **from scratch** — [`FlatIndex::from_rows`] builds it directly, with no
+//!   intermediate map;
+//! - **from a v1 file** — [`InvertedIndex::flat`] converts a decoded
+//!   [`InvertedIndex`];
+//! - **on the wire** — [`FlatIndex::to_bytes_v2`] /
+//!   [`FlatIndex::from_bytes_v2`] round-trip the v2 blob (the write path
+//!   flipping to emit v2 is the maintainer's integration, not this change).
+//!
+//! Both forms answer identically: `postings`, `matching_rows_all`, and
+//! `rows_containing` are implemented on each.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use siglake_bloom::{normalize_query_term, Tokenizer};
+use siglake_bloom::{normalize_query_term, Tokenizer, MIN_TOKEN_LEN};
 
 pub mod segmented;
 pub mod spill;
 
 /// Magic prefixing a serialized index blob.
 const INDEX_MAGIC: &[u8; 4] = b"KIDX";
-/// Serialization version.
+/// Serialization version of the stored blob (footer KV / Puffin sidecar). This
+/// is what the write path emits today; readers must keep parsing it for
+/// historical files.
 const INDEX_VERSION: u8 = 1;
+/// Serialization version of the flat (resident) layout — the intended
+/// canonical form. In this POC it is the in-memory form a v1 decode re-parses
+/// into, and it round-trips through [`FlatIndex::to_bytes_v2`] /
+/// [`FlatIndex::from_bytes_v2`]; the write path flipping to emit it is the
+/// maintainer's integration, not part of this change.
+const INDEX_VERSION_2: u8 = 2;
+/// The target size of the jump table's local window, in bytes of term data.
+/// One anchor is recorded per `TARGET_WINDOW_BYTES` of `term_bytes`, so a
+/// point lookup usually narrows to a ≤ 32 KB window (L1) at any index size —
+/// the anchor count scales with the index, keeping the window in L1 from a
+/// few MB up to the 4 GB `u32`-offset cap. The window is bounded by the gap
+/// between *consecutive distinct-prefix* anchors: a run of terms sharing an
+/// 8-byte prefix is covered by a single anchor (deduplicated in
+/// `from_parts`), so the local binary search spans that run — still O(log n)
+/// in the run, just not 32 KB-bounded.
+const TARGET_WINDOW_BYTES: usize = 32 * 1024;
 
 /// Parquet `key_value_metadata` key under which a data file carries its
 /// hex-encoded inverted-index blob (set at write time, read at query time —
@@ -93,6 +132,640 @@ pub struct InvertedIndex {
     n_rows: u32,
 }
 
+/// One dictionary entry: where a term lives in the two shared buffers.
+/// Private — a `FlatIndex` is only ever produced by a constructor that
+/// validates the layout, so the readers may rely on the invariants.
+///
+/// The offsets are `u32` and are enforced to fit by every constructor (each
+/// refuses an input whose buffers would not fit, so the cap is checked, not
+/// assumed). `term_len` is `u32`, not `u16`, because the `Raw` tokenizer
+/// makes the entire line a single token, so a term can be longer than 65535
+/// bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TermSpan {
+    /// Byte offset of this term in the term buffer.
+    bytes_start: u32,
+    /// Byte length of this term in the term buffer.
+    term_len: u32,
+    /// Offset of this term's first posting in the postings buffer.
+    postings_start: u32,
+}
+
+/// The resident (canonical) layout: one term byte array, all postings in a
+/// single `u32` buffer, and one 12-byte span per term — all in **sorted term
+/// order**. A derived jump table (`anchors`) provides O(log) point lookups
+/// with an L1-resident local window, so the sorted array stays contiguous
+/// for the substring sweep and the wire format.
+///
+/// Compared with the map-and-vectors form this drops the per-entry
+/// `String` + `Vec<u32>` headers (48 bytes per term on 64-bit), the
+/// `BTreeMap` node slack and the per-`Vec` capacity slack. What it buys is a
+/// smaller cache charge for the same answer set: `heap_size_bytes` on the map
+/// form is the number the parsed-index budgets were sized from, and it
+/// overstates this layout by the per-entry headers and the slack.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlatIndex {
+    terms: Vec<TermSpan>,
+    postings: Vec<u32>,
+    term_bytes: Vec<u8>,
+    /// Jump table: `(first-8-bytes-of-term, term_index)`, one anchor every
+    /// `TARGET_WINDOW_BYTES` of term bytes, at most one per 8-byte key.
+    /// Binary-searched to narrow a point lookup to a local window before the
+    /// final binary search: ≤ 32 KB between consecutive distinct-prefix
+    /// anchors, but a run of terms sharing an 8-byte prefix collapses to one
+    /// anchor, so consecutive anchors can be further apart and the window
+    /// spans the whole run. The keys are strictly increasing (deduplicated in
+    /// `from_parts`), which is what `term_index`'s tie back-off relies on.
+    anchors: Vec<(u64, usize)>,
+    n_rows: u32,
+}
+
+impl FlatIndex {
+    /// [`normalize_query_term`](siglake_bloom::normalize_query_term) without
+    /// the allocation: `Some(bytes)` when `term` is *already* in indexed
+    /// form — length ≥ `MIN_TOKEN_LEN` and every byte in `[a-z0-9]` (the exact
+    /// set `normalize_query_term` produces via `to_ascii_lowercase`). Any
+    /// uppercase, whitespace, or short term returns `None` and the caller
+    /// takes the allocating path, which must produce the identical answer.
+    fn normalize_fast(term: &str) -> Option<&[u8]> {
+        let b = term.as_bytes();
+        (b.len() >= MIN_TOKEN_LEN).then_some(b).filter(|b| {
+            b.iter()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        })
+    }
+
+    /// The normalized form of `term`, as a `str`: borrows `term` in place when
+    /// it is already indexed-form ([`normalize_fast`]), else allocates the
+    /// [`normalize_query_term`] result. `None` when `term` is not indexable.
+    /// Every term-lookup path normalizes through here, so the fast/slow split
+    /// lives in one place.
+    fn normalize(term: &str) -> Option<Cow<'_, str>> {
+        if let Some(b) = Self::normalize_fast(term) {
+            // `b` is `[a-z0-9]`, so it is valid UTF-8; borrow it in place.
+            Some(Cow::Borrowed(
+                std::str::from_utf8(b).expect("normalize_fast bytes are [a-z0-9], valid UTF-8"),
+            ))
+        } else {
+            normalize_query_term(term).map(Cow::Owned)
+        }
+    }
+
+    /// Build from the map-and-vectors form. Borrows the map, so during the
+    /// conversion both the map and the flat buffers are resident at once (the
+    /// peak is `map + flat`); the owned form
+    /// [`From<InvertedIndex> for FlatIndex`] has the same peak but drops the
+    /// map afterward, so only the flat index stays resident. The term order is
+    /// preserved (it is the `BTreeMap` order), and the buffers are sized
+    /// exactly, so the resident charge carries no growth headroom.
+    ///
+    /// Panics when the buffers would not fit the `u32`-offset layout (past
+    /// 4 GiB of term bytes, postings, or span table); use
+    /// [`try_from_map`](Self::try_from_map) for the checked form.
+    pub(crate) fn from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Self {
+        Self::try_from_map(map, n_rows)
+            .expect("the map form's buffers fit the flat layout's u32 offsets")
+    }
+
+    /// [`from_map`](Self::from_map) with the 4 GiB cap as `None` instead of a
+    /// panic. The map form has no per-buffer offset cap, so a file past the
+    /// flat layout's limit is the caller's signal to stay in the map form.
+    pub(crate) fn try_from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Option<Self> {
+        let n_terms = map.len();
+        let term_bytes_total: usize = map.keys().map(String::len).sum();
+        let postings_total: usize = map.values().map(Vec::len).sum();
+        if !Self::map_fits_u32(n_terms, term_bytes_total, postings_total) {
+            return None;
+        }
+        let mut term_bytes = Vec::with_capacity(term_bytes_total);
+        let mut postings = Vec::with_capacity(postings_total);
+        let mut terms = Vec::with_capacity(n_terms);
+        for (term, rows) in map {
+            // The totals fit `u32`, so every running offset does: these are
+            // unreachable tripwires, not the cap check (that is above).
+            let bytes_start = u32::try_from(term_bytes.len())
+                .expect("a resident index's term buffer fits a u32 offset");
+            let postings_start = u32::try_from(postings.len())
+                .expect("a resident index's postings buffer fits a u32 offset");
+            let term_len =
+                u32::try_from(term.len()).expect("a resident index's term fits a u32 length");
+            term_bytes.extend_from_slice(term.as_bytes());
+            postings.extend_from_slice(rows);
+            terms.push(TermSpan {
+                bytes_start,
+                term_len,
+                postings_start,
+            });
+        }
+        Some(Self::from_parts(terms, postings, term_bytes, n_rows))
+    }
+
+    /// The 4 GiB `u32`-offset checks shared by the map-based constructors.
+    /// The term-bytes and postings totals must fit `u32` (a running offset
+    /// fits only if the total does, and a buffer past the cap could not
+    /// round-trip through `from_bytes_v2`, which derives offsets with a
+    /// checked `u32` cursor); the span table is bounded to `u32` as well, so
+    /// all three buffers the layout is made of stay inside the offset width.
+    fn map_fits_u32(n_terms: usize, term_bytes_total: usize, postings_total: usize) -> bool {
+        u32::try_from(term_bytes_total).is_ok()
+            && u32::try_from(postings_total).is_ok()
+            && n_terms
+                .checked_mul(std::mem::size_of::<TermSpan>())
+                .is_some_and(|bytes| bytes <= u32::MAX as usize)
+    }
+
+    /// Assemble from already-built **sorted** buffers (term-sorted, contiguous
+    /// spans, ascending in-domain postings). The buffers go straight into the
+    /// resident layout — the sorted array is the wire format and the
+    /// contiguous sweep target — and the jump table is derived from them.
+    /// Every constructor goes through here, so a `FlatIndex` is always valid.
+    ///
+    /// [`validate`](Self::validate) is a full `O(n)` pass over every buffer, so
+    /// it runs only in debug builds as a constructor tripwire — free on the
+    /// release load path. An out-of-band construction (e.g. FFI) that bypasses
+    /// the checked builders should call it explicitly.
+    fn from_parts(
+        terms: Vec<TermSpan>,
+        postings: Vec<u32>,
+        term_bytes: Vec<u8>,
+        n_rows: u32,
+    ) -> Self {
+        // Derive the jump table: one anchor per `TARGET_WINDOW_BYTES` of term
+        // bytes, so a point lookup usually narrows to a ≤ 32 KB window (L1)
+        // at any index size. The key is the term's first 8 bytes zero-padded,
+        // read big-endian (most-significant = first byte), so the keys are in
+        // the same lexicographic order as the terms. Only the *first* anchor
+        // per key is kept: a run of terms sharing an 8-byte prefix would
+        // otherwise produce duplicate keys, and `term_index` needs strictly
+        // increasing keys for its tie back-off to act as a lower-bound window
+        // (see there). The cost of that dedup: consecutive anchors can be more
+        // than 32 KB apart across a shared-prefix run, so the local window
+        // spans the run in that case.
+        let mut anchors = Vec::new();
+        if !terms.is_empty() && term_bytes.len() >= TARGET_WINDOW_BYTES {
+            let mut next_anchor_at = TARGET_WINDOW_BYTES;
+            for (i, span) in terms.iter().enumerate() {
+                let bytes_start = span.bytes_start as usize;
+                if bytes_start >= next_anchor_at {
+                    next_anchor_at += TARGET_WINDOW_BYTES;
+                    let term = &term_bytes[bytes_start..bytes_start + span.term_len as usize];
+                    let mut prefix = [0u8; 8];
+                    let n = term.len().min(8);
+                    prefix[..n].copy_from_slice(&term[..n]);
+                    let key = u64::from_be_bytes(prefix);
+                    if anchors.last().map(|(k, _)| *k) != Some(key) {
+                        anchors.push((key, i));
+                    }
+                }
+            }
+        }
+        let index = Self {
+            terms,
+            postings,
+            term_bytes,
+            anchors,
+            n_rows,
+        };
+        if cfg!(debug_assertions) {
+            index.validate();
+        }
+        index
+    }
+
+    /// Check the layout invariants: contiguous, in-bounds, strictly ascending
+    /// UTF-8, non-empty term spans; non-empty, strictly ascending, in-domain
+    /// postings; and each jump-table anchor's prefix matches its term.
+    /// Constructors call this (debug builds) as a tripwire; a release load that
+    /// bypasses the checked builders (e.g. an out-of-band construction) can call
+    /// it to verify before use. Panics on a violation.
+    pub(crate) fn validate(&self) -> &Self {
+        let total_bytes = self.term_bytes.len();
+        let total_postings = self.postings.len();
+        let mut bytes_prev_end = 0usize;
+        let mut postings_prev_end = 0usize;
+        let mut last_term: Option<&[u8]> = None;
+        for (i, span) in self.terms.iter().enumerate() {
+            let bytes_end = bytes_prev_end + span.term_len as usize;
+            assert!(
+                bytes_prev_end == span.bytes_start as usize && bytes_end <= total_bytes,
+                "term spans must be contiguous and in bounds"
+            );
+            let postings_end = self.postings_end(i);
+            assert!(
+                postings_prev_end == span.postings_start as usize
+                    && postings_end >= postings_prev_end
+                    && postings_end <= total_postings,
+                "posting spans must be contiguous and in bounds"
+            );
+            let term = &self.term_bytes[bytes_prev_end..bytes_end];
+            // An empty term is legitimate: `Tokenizer::Raw` emits one for a
+            // null or empty column value, and the v1 decoder documents it as
+            // a legal dictionary entry. It is the first term (nothing sorts
+            // before it), so it composes with the ascending check below.
+            assert!(
+                std::str::from_utf8(term).is_ok(),
+                "term bytes must be valid UTF-8"
+            );
+            if let Some(prev) = last_term {
+                assert!(prev < term, "terms must be strictly ascending");
+            }
+            last_term = Some(term);
+            let rows = &self.postings[postings_prev_end..postings_end];
+            assert!(!rows.is_empty(), "a term must have at least one posting");
+            for w in rows.windows(2) {
+                assert!(w[0] < w[1], "postings must be strictly ascending");
+            }
+            if let Some(&last) = rows.last() {
+                assert!(last < self.n_rows, "postings must be inside the row domain");
+            }
+            bytes_prev_end = bytes_end;
+            postings_prev_end = postings_end;
+        }
+        // Each anchor's index must be in range, its stored prefix must match
+        // its term's first 8 bytes, and the keys must be strictly increasing —
+        // `term_index`'s tie back-off (a lower-bound window) relies on there
+        // being at most one anchor per key.
+        for (a, &(prefix, i)) in self.anchors.iter().enumerate() {
+            assert!(i < self.terms.len(), "anchor index must be in range");
+            let span = &self.terms[i];
+            let term = Self::term_of(&self.term_bytes, span);
+            let mut expected = [0u8; 8];
+            let n = term.len().min(8);
+            expected[..n].copy_from_slice(&term[..n]);
+            assert_eq!(
+                prefix,
+                u64::from_be_bytes(expected),
+                "anchor prefix must match its term"
+            );
+            if a > 0 {
+                assert!(
+                    self.anchors[a - 1].0 < prefix,
+                    "anchor keys must be strictly increasing (one per 8-byte key)"
+                );
+            }
+        }
+        self
+    }
+
+    /// Build directly from an iterator of rows' `raw` text, in physical order.
+    /// The from-scratch path to the flat layout — no intermediate
+    /// [`InvertedIndex`] — mirroring [`InvertedIndex::from_rows`].
+    pub fn from_rows<'a, I: IntoIterator<Item = &'a str>>(rows: I) -> Self {
+        Self::from_rows_with_tokenizer(rows, Tokenizer::Default)
+    }
+
+    /// [`from_rows`](Self::from_rows) with an explicit tokenizer. The rows are
+    /// accumulated the same way as the map form (per-term postings, ascending
+    /// ordinals) and flattened at the end — it avoids the *named*
+    /// `InvertedIndex` intermediate, not the accumulation map; a truly
+    /// allocation-light flat build is a later optimization.
+    pub(crate) fn from_rows_with_tokenizer<'a, I: IntoIterator<Item = &'a str>>(
+        rows: I,
+        tokenizer: Tokenizer,
+    ) -> Self {
+        let mut b = IndexBuilder::with_tokenizer(tokenizer);
+        for raw in rows {
+            b.push_row(raw);
+        }
+        FlatIndex::from(b.build())
+    }
+
+    /// Number of rows indexed (the ordinal space is `0..n_rows()`).
+    pub fn n_rows(&self) -> u32 {
+        self.n_rows
+    }
+
+    /// Number of distinct indexed terms.
+    pub fn n_terms(&self) -> usize {
+        self.terms.len()
+    }
+
+    /// Resident heap of this layout: the three vectors' *capacities*, the
+    /// jump table, plus the struct itself. Because every builder sizes the
+    /// buffers exactly, the capacity is the real allocation — no growth
+    /// headroom to bill, unlike the map form's floor. (Allocator overhead is
+    /// not counted; the figure is the byte total the buffers request, which
+    /// is what the cache budget wants.)
+    pub fn heap_size_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.terms.capacity() * std::mem::size_of::<TermSpan>()
+            + self.postings.capacity() * std::mem::size_of::<u32>()
+            + self.term_bytes.capacity()
+            + self.anchors.capacity() * std::mem::size_of::<(u64, usize)>()
+    }
+
+    /// The dictionary in term order, each term with its ascending
+    /// postings — the same view `InvertedIndex::terms` exposes. The buffers
+    /// are in sorted term order, so this is a direct iteration.
+    pub fn terms(&self) -> impl ExactSizeIterator<Item = (&str, &[u32])> + '_ {
+        self.terms.iter().enumerate().map(|(i, span)| {
+            let term = std::str::from_utf8(Self::term_of(&self.term_bytes, span))
+                .expect("a FlatIndex built here holds valid UTF-8 terms");
+            (
+                term,
+                &self.postings[span.postings_start as usize..self.postings_end(i)],
+            )
+        })
+    }
+
+    /// The term bytes for the dictionary entry described by `span`, within
+    /// `term_bytes`. The one place the "where do a term's bytes live?" rule
+    /// lives; every term read goes through it (it takes the buffer by value
+    /// so both `&self.term_bytes` and a decode-local buffer can use it).
+    fn term_of<'a>(term_bytes: &'a [u8], span: &TermSpan) -> &'a [u8] {
+        &term_bytes[span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize]
+    }
+
+    /// The `postings` slice's end index for term `i`: the next term's
+    /// `postings_start`, or the buffer end for the last term. The one place
+    /// the "where does term `i`'s postings end?" rule lives.
+    fn postings_end(&self, i: usize) -> usize {
+        if i + 1 < self.terms.len() {
+            self.terms[i + 1].postings_start as usize
+        } else {
+            self.postings.len()
+        }
+    }
+
+    /// Find the term index for `query` (already normalized bytes) using the
+    /// jump table: binary-search the anchors (L2-resident) to narrow to a
+    /// ≤ `TARGET_WINDOW_BYTES` local window, then binary-search that window
+    /// (L1-resident). Falls back to a full binary search when the jump table
+    /// is empty (tiny index). `None` when the term is absent.
+    fn term_index(&self, query: &[u8]) -> Option<usize> {
+        // The query's 8-byte zero-padded prefix, read big-endian (most-
+        // significant = first byte) so it orders lexicographically.
+        let mut qprefix = [0u8; 8];
+        let n = query.len().min(8);
+        qprefix[..n].copy_from_slice(&query[..n]);
+        let qkey = u64::from_be_bytes(qprefix);
+        // Binary-search the anchors for the first one with prefix > qkey; `lo`
+        // is that index (or the end when every anchor is <= qkey). The window
+        // that contains `qkey` starts at the last anchor <= qkey and ends at
+        // the first anchor > qkey — one window between two consecutive
+        // anchors, ≤ 32 KB except across a shared-prefix run (one anchor per
+        // distinct key), where it spans the run.
+        let mut lo = 0usize;
+        let mut hi = self.anchors.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.anchors[mid].0 <= qkey {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // The window's start is the last anchor with prefix <= qkey. But a
+        // *tied* prefix (first 8 bytes equal) is decided by the 9th+ bytes,
+        // which the key cannot see: when `anchors[lo-1]`'s prefix equals
+        // `qkey`, the query's full term may sort *before* that anchor, so the
+        // window must reach one anchor further back to include it. This is
+        // only correct because `from_parts` keeps at most one anchor per key:
+        // with strictly increasing keys, "back up one anchor" is the same as
+        // "back up to the last strictly-smaller key" — a lower-bound window.
+        // If anchors ever carry duplicate keys again, this becomes a
+        // false-negative source (the window can start past an earlier
+        // same-key anchor whose terms sort before the query).
+        let mut start = if lo == 0 { 0 } else { self.anchors[lo - 1].1 };
+        if lo >= 1 && self.anchors[lo - 1].0 == qkey {
+            start = if lo >= 2 { self.anchors[lo - 2].1 } else { 0 };
+        }
+        let end = if lo < self.anchors.len() {
+            self.anchors[lo].1
+        } else {
+            self.terms.len()
+        };
+        // Binary-search the local window.
+        let mut wlo = start;
+        let mut whi = end;
+        while wlo < whi {
+            let mid = (wlo + whi) / 2;
+            match Self::term_of(&self.term_bytes, &self.terms[mid]).cmp(query) {
+                std::cmp::Ordering::Less => wlo = mid + 1,
+                std::cmp::Ordering::Greater => whi = mid,
+                std::cmp::Ordering::Equal => return Some(mid),
+            }
+        }
+        None
+    }
+
+    /// Ascending row ordinals containing `term` (normalized as the blooms do),
+    /// or `None` when the term is absent / not indexable. Mirrors
+    /// [`InvertedIndex::postings`].
+    pub fn postings(&self, term: &str) -> Option<&[u32]> {
+        let norm = Self::normalize(term)?;
+        self.term_index(norm.as_bytes())
+            .map(|i| self.postings_at(i))
+    }
+
+    /// The posting list of the `i`-th dictionary term, by position. Also the
+    /// one place the "where does term `i`'s postings live?" rule is applied;
+    /// tests use it to reach terms (like the empty term) that [`postings`]
+    /// deliberately does not answer — below `MIN_TOKEN_LEN` a query cannot
+    /// have produced the term, so the term API refuses it on both forms.
+    fn postings_at(&self, i: usize) -> &[u32] {
+        let span = &self.terms[i];
+        &self.postings[span.postings_start as usize..self.postings_end(i)]
+    }
+
+    /// Row ordinals matching **all** `terms` (AND) — the intersection of their
+    /// postings, ascending. Mirrors [`InvertedIndex::matching_rows_all`].
+    pub fn matching_rows_all(&self, terms: &[&str]) -> Vec<u32> {
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let mut lists: Vec<&[u32]> = Vec::with_capacity(terms.len());
+        for t in terms {
+            match self.postings(t) {
+                Some(p) => lists.push(p),
+                None => return Vec::new(),
+            }
+        }
+        lists.sort_by_key(|l| l.len());
+        let mut acc: Vec<u32> = lists[0].to_vec();
+        for list in &lists[1..] {
+            acc = intersect_sorted(&acc, list);
+            if acc.is_empty() {
+                break;
+            }
+        }
+        acc
+    }
+
+    /// Row ordinals matching `raw LIKE '%substr%'`, mirroring
+    /// [`InvertedIndex::rows_containing`]: the union of postings over every
+    /// dictionary term containing the normalized substring.
+    pub fn rows_containing(&self, substr: &str) -> Option<Vec<u32>> {
+        let norm = Self::normalize(substr)?;
+        let mut acc: Vec<u32> = Vec::new();
+        for (term, rows) in self.terms() {
+            if term.contains(norm.as_ref()) {
+                acc = union_sorted(&acc, rows);
+            }
+        }
+        Some(acc)
+    }
+
+    /// Serialize to the v2 wire form: the magic prefix with version
+    /// [`INDEX_VERSION_2`], then `n_rows`, the term count, the **total posting
+    /// count**, each term's length, all the term bytes in term order, and per
+    /// term its posting count and delta-encoded postings. The term and posting
+    /// offsets are cumulative, so they are not stored — which keeps the blob
+    /// about the v1 size. Storing the total posting count is what lets
+    /// [`from_bytes_v2`] preallocate its postings buffer without a second pass
+    /// over the (large) posting section. [`from_bytes_v2`] parses it. This is
+    /// the canonical blob the layout is meant to be stored as; in this POC
+    /// nothing writes it yet (the write path emits v1).
+    pub fn to_bytes_v2(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, self.n_rows as u64);
+        write_varint(&mut out, self.terms.len() as u64);
+        write_varint(&mut out, self.postings.len() as u64);
+        for span in &self.terms {
+            write_varint(&mut out, span.term_len as u64);
+        }
+        out.extend_from_slice(&self.term_bytes);
+        for (i, span) in self.terms.iter().enumerate() {
+            let rows = &self.postings[span.postings_start as usize..self.postings_end(i)];
+            write_varint(&mut out, rows.len() as u64);
+            let mut prev = 0u32;
+            for &r in rows {
+                write_varint(&mut out, (r - prev) as u64);
+                prev = r;
+            }
+        }
+        out
+    }
+
+    /// Parse a blob produced by [`to_bytes_v2`]. Returns `None` on a bad
+    /// magic/version or a truncated/garbled body.
+    ///
+    /// One forward pass over the whole blob: the header carries the total
+    /// posting count, so the postings buffer is preallocated exactly up front
+    /// and the (large) posting section is read **once** — there is no dry-run
+    /// pass and no seek back over it. Offsets are derived cumulatively in
+    /// `usize` (never as a `u32` sum that could overflow), and every length is
+    /// untrusted input checked against the bytes that remain.
+    ///
+    /// The semantic checks (strictly-ascending UTF-8 terms, strictly-ascending
+    /// in-domain postings) are made here, on untrusted bytes, returning `None`
+    /// rather than reaching [`Self::validate`], which panics by design — the
+    /// same untrusted-input posture [`InvertedIndex::from_bytes`] takes.
+    pub fn from_bytes_v2(bytes: &[u8]) -> Option<Self> {
+        let mut c = Cursor::new(bytes);
+        if c.take(4)? != INDEX_MAGIC {
+            return None;
+        }
+        let version = c.u8()?;
+        if version != INDEX_VERSION_2 {
+            return None;
+        }
+        let n_rows: u32 = c.varint()?.try_into().ok()?;
+        let n_terms: usize = c.varint()?.try_into().ok()?;
+        let total_postings: usize = c.varint()?.try_into().ok()?;
+        // Cheap guard against a huge `n_terms` driving the term-length read
+        // (and the term-spans `Vec`) before any term is actually present: each
+        // term costs at least one byte for its length varint and one for its
+        // (non-empty) posting count.
+        if n_terms > c.remaining() / 2 {
+            return None;
+        }
+        // `total_postings` is untrusted and becomes a `with_capacity` below:
+        // bound it to the bytes that remain (every posting costs at least one
+        // delta byte) and to `u32` (the resident layout's offset width) so a
+        // hostile or corrupt header cannot drive an arbitrary allocation.
+        if total_postings > c.remaining() || u32::try_from(total_postings).is_err() {
+            return None;
+        }
+        // Term section: the per-term lengths, then the concatenated term
+        // bytes. A length of zero is legal — the `Raw` tokenizer emits an
+        // empty term for a null or empty column value, and it is the
+        // dictionary's first entry. All offsets derived cumulatively in
+        // `usize` (never a `u32` sum).
+        let mut terms = Vec::with_capacity(n_terms);
+        let mut bytes_cursor = 0usize;
+        for _ in 0..n_terms {
+            let term_len: usize = c.varint()?.try_into().ok()?;
+            if bytes_cursor.checked_add(term_len)? > c.remaining() {
+                return None;
+            }
+            let bytes_start = u32::try_from(bytes_cursor).ok()?;
+            let term_len_u32 = u32::try_from(term_len).ok()?;
+            terms.push(TermSpan {
+                bytes_start,
+                term_len: term_len_u32,
+                postings_start: 0, // derived from `plen` in the decode below
+            });
+            bytes_cursor += term_len;
+        }
+        let term_bytes = c.take(bytes_cursor)?.to_vec();
+        // The v2 form must have strictly ascending UTF-8 terms in buffer
+        // order.
+        let mut last_term: Option<&str> = None;
+        for span in &terms {
+            let term = std::str::from_utf8(Self::term_of(&term_bytes, span)).ok()?;
+            if let Some(prev) = last_term {
+                if prev >= term {
+                    return None;
+                }
+            }
+            last_term = Some(term);
+        }
+        // Posting section: one forward decode into a buffer preallocated to
+        // the header's total, which the guard above has bounded to the bytes
+        // remaining and to `u32`, so the allocation is always affordable.
+        let mut postings = Vec::with_capacity(total_postings);
+        let mut postings_cursor = 0u32;
+        for span in &mut terms {
+            let plen: u32 = c.varint()?.try_into().ok()?;
+            if plen == 0 || (plen as usize) > c.remaining() {
+                return None;
+            }
+            span.postings_start = postings_cursor;
+            postings_cursor = postings_cursor.checked_add(plen)?;
+            decode_delta_postings(&mut c, n_rows, plen as usize, &mut postings)?;
+        }
+        // The decoded total must equal the header's: a larger declared total
+        // would leave extra (unbilled) capacity and fail to round-trip the
+        // header; a smaller one means the per-term counts disagree with it.
+        if postings.len() != total_postings {
+            return None;
+        }
+        // A well-formed blob is consumed exactly: trailing bytes mean the
+        // counts in the header disagree with the payload.
+        if c.remaining() != 0 {
+            return None;
+        }
+        Some(Self::from_parts(terms, postings, term_bytes, n_rows))
+    }
+}
+
+/// Convert an owned map-form index into the flat layout. The map is moved and
+/// dropped, so only the flat index stays resident. The conversion *peak* is
+/// `map + flat` (the flat buffers are allocated at full size before the copy),
+/// the same as the borrowing [`InvertedIndex::flat`]; the value of the owned
+/// form is the steady state — the map is gone when this returns. This is the
+/// path a cache-load of a historical v1 file takes. Panics past the 4 GiB
+/// `u32`-offset cap — use [`InvertedIndex::try_flat`] for the checked form.
+impl From<InvertedIndex> for FlatIndex {
+    fn from(index: InvertedIndex) -> Self {
+        FlatIndex::from_map(&index.postings, index.n_rows)
+    }
+}
+
+/// The distinct, sorted tokens of a row's `raw` text, normalized exactly as
+/// the blooms normalize them. Shared by both builders so the map form and the
+/// flat form index a row identically — a skew between them would be an index
+/// that answers differently depending only on which layout built it.
+fn row_tokens(tokenizer: &Tokenizer, raw: &str) -> Vec<String> {
+    let mut seen = tokenizer.tokenize(raw);
+    seen.sort();
+    seen.dedup();
+    seen
+}
+
 /// Accumulates rows into an [`InvertedIndex`]. Feed each row's `raw` text in
 /// physical row order; the ordinal is the call count.
 pub struct IndexBuilder {
@@ -127,11 +800,7 @@ impl IndexBuilder {
     /// order (0-based), so callers must push rows in the file's physical order.
     pub fn push_row(&mut self, raw: &str) {
         let ordinal = self.n_rows;
-        // Distinct tokens only — a term appears once per row in the postings.
-        let mut seen: Vec<String> = self.tokenizer.tokenize(raw);
-        seen.sort();
-        seen.dedup();
-        for token in seen {
+        for token in row_tokens(&self.tokenizer, raw) {
             self.postings.entry(token).or_default().push(ordinal);
         }
         self.n_rows += 1;
@@ -145,6 +814,40 @@ impl IndexBuilder {
             n_rows: self.n_rows,
         }
     }
+}
+
+/// Decode `count` delta-encoded postings from `c` into `out`, appending.
+/// `None` if a delta does not round-trip through `u64`, a later delta is zero
+/// (postings are strictly ascending), the running ordinal overflows `u32`, or
+/// an ordinal walks past the row domain `0..n_rows`. The caller reads the count
+/// and bounds it against `c.remaining()`; this reads exactly `count` deltas.
+/// Writing into a caller buffer (rather than returning a fresh `Vec`) is what
+/// lets the v2 decoder append straight into its one preallocated postings
+/// buffer with no per-term allocation or second copy. Shared by the v1 and v2
+/// decoders so the posting invariants live in one place.
+fn decode_delta_postings(
+    c: &mut Cursor,
+    n_rows: u32,
+    count: usize,
+    out: &mut Vec<u32>,
+) -> Option<()> {
+    let mut prev = 0u32;
+    for nth in 0..count {
+        let delta: u32 = c.varint()?.try_into().ok()?;
+        // Only the first ordinal may be zero: postings are strictly ascending,
+        // so every later delta is at least one.
+        if nth > 0 && delta == 0 {
+            return None;
+        }
+        prev = prev.checked_add(delta)?;
+        // Postings are row ordinals within this file. One at or past `n_rows`
+        // would select a row the index does not claim to cover.
+        if prev >= n_rows {
+            return None;
+        }
+        out.push(prev);
+    }
+    Some(())
 }
 
 impl InvertedIndex {
@@ -190,6 +893,30 @@ impl InvertedIndex {
                     ENTRY_OVERHEAD + term.len() + rows.len() * std::mem::size_of::<u32>()
                 })
                 .sum::<usize>()
+    }
+
+    /// The flat layout of this index: term-sorted spans over one postings
+    /// buffer. This is the v1→v2 conversion — the path that loads a
+    /// historical v1 file into the canonical form. It borrows the map, so both
+    /// the map and the flat buffers are resident during the conversion (peak
+    /// `map + flat`); the owned form
+    /// [`From<InvertedIndex> for FlatIndex`] has the same peak but drops the
+    /// map afterward, so only the flat index stays resident. A writer that
+    /// already has the rows should use [`FlatIndex::from_rows`]
+    /// instead. `heap_size_bytes` on the result is the
+    /// resident charge the parsed-index budgets should use once they hold the
+    /// flat form.
+    pub fn flat(&self) -> FlatIndex {
+        FlatIndex::from_map(&self.postings, self.n_rows)
+    }
+
+    /// [`flat`](Self::flat) with the 4 GiB `u32`-offset cap as `None`
+    /// instead of a panic. A file past the flat layout's limit stays in the
+    /// map form, which has no per-buffer offset cap — the caller that needs
+    /// to choose between the two (a cache-load of a historical file) uses
+    /// this and falls back to keeping the map when it is `None`.
+    pub fn try_flat(&self) -> Option<FlatIndex> {
+        FlatIndex::try_from_map(&self.postings, self.n_rows)
     }
 
     /// The dictionary in term order, each term with its ascending postings. The
@@ -382,24 +1109,10 @@ impl InvertedIndex {
             if plen == 0 || plen > c.remaining() {
                 return None;
             }
+            // The map form keeps a `Vec` per term, so this decodes into a
+            // fresh one (the v2 decoder appends into its single buffer).
             let mut rows = Vec::with_capacity(plen);
-            let mut prev = 0u32;
-            for nth in 0..plen {
-                let delta: u32 = c.varint()?.try_into().ok()?;
-                // Only the first ordinal may be zero: postings are strictly
-                // ascending, so every later delta is at least one.
-                if nth > 0 && delta == 0 {
-                    return None;
-                }
-                prev = prev.checked_add(delta)?;
-                // Postings are row ordinals within this file. One at or past
-                // `n_rows` would select a row the index does not claim to
-                // cover.
-                if prev >= n_rows {
-                    return None;
-                }
-                rows.push(prev);
-            }
+            decode_delta_postings(&mut c, n_rows, plen, &mut rows)?;
             postings.insert(term, rows);
         }
         // A well-formed blob is consumed exactly: trailing bytes mean the
@@ -408,6 +1121,22 @@ impl InvertedIndex {
             return None;
         }
         Some(Self { postings, n_rows })
+    }
+}
+
+/// Parse a resident-layout index back into the map form, so the two forms stay
+/// interchangeable. The reverse of [`From<InvertedIndex> for FlatIndex`]: takes
+/// the flat index by value and drops it, so only the map form stays resident.
+impl From<FlatIndex> for InvertedIndex {
+    fn from(flat: FlatIndex) -> Self {
+        let mut postings = BTreeMap::new();
+        for (term, rows) in flat.terms() {
+            postings.insert(term.to_string(), rows.to_vec());
+        }
+        Self {
+            postings,
+            n_rows: flat.n_rows(),
+        }
     }
 }
 
@@ -926,6 +1655,507 @@ mod tests {
                              byte {pos} := {replacement:#04x}"
                         );
                         assert!(rows.windows(2).all(|w| w[0] < w[1]), "postings unordered");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flat_layout_matches_the_map_form() {
+        let i = idx();
+        let flat = i.flat();
+        // Same dictionary, same postings, term order.
+        let flat_terms: Vec<(&str, Vec<u32>)> =
+            flat.terms().map(|(t, rows)| (t, rows.to_vec())).collect();
+        let map_terms: Vec<(&str, Vec<u32>)> =
+            i.terms().map(|(t, rows)| (t, rows.to_vec())).collect();
+        assert_eq!(flat_terms, map_terms);
+        assert_eq!(flat.n_rows, i.n_rows());
+        // The query API answers the same as the map form, term by term and
+        // across the AND / substring shapes.
+        for term in [
+            "error",
+            "database",
+            "login",
+            "timeout",
+            "connecting",
+            "absent",
+            "ERROR",
+        ] {
+            assert_eq!(
+                flat.postings(term).map(<[u32]>::to_vec),
+                i.postings(term).map(<[u32]>::to_vec),
+                "postings({term})"
+            );
+        }
+        assert_eq!(
+            flat.matching_rows_all(&["database", "error"]),
+            i.matching_rows_all(&["database", "error"])
+        );
+        assert_eq!(
+            flat.matching_rows_all(&["error", "kafka"]),
+            i.matching_rows_all(&["error", "kafka"])
+        );
+        assert_eq!(flat.rows_containing("data"), i.rows_containing("data"));
+        assert_eq!(flat.rows_containing("xyz"), i.rows_containing("xyz"));
+        assert_eq!(flat.rows_containing("ab"), i.rows_containing("ab"));
+        // The buffers are sized exactly: the charge is the capacity, and a
+        // builder that grew them would bill the cache for headroom.
+        assert_eq!(flat.term_bytes.capacity(), flat.term_bytes.len());
+        assert_eq!(flat.postings.capacity(), flat.postings.len());
+        assert_eq!(flat.terms.capacity(), flat.terms.len());
+        // The map form's charge overstates the flat form's by the per-entry
+        // headers and the BTreeMap/Vec slack.
+        assert!(
+            flat.heap_size_bytes() < i.heap_size_bytes(),
+            "flat {} must charge under the map form {}",
+            flat.heap_size_bytes(),
+            i.heap_size_bytes()
+        );
+        // And the flat charge is exact: the vectors' capacities + the
+        // jump table + the struct itself.
+        let exact = std::mem::size_of::<FlatIndex>()
+            + flat.terms.capacity() * std::mem::size_of::<TermSpan>()
+            + flat.postings.capacity() * std::mem::size_of::<u32>()
+            + flat.term_bytes.capacity()
+            + flat.anchors.capacity() * std::mem::size_of::<(u64, usize)>();
+        assert_eq!(flat.heap_size_bytes(), exact);
+        // A span is 12 bytes: three u32s, no padding.
+        assert_eq!(std::mem::size_of::<TermSpan>(), 12);
+        // Back to the map form, and it round-trips.
+        assert_eq!(InvertedIndex::from(flat), i);
+    }
+
+    #[test]
+    fn normalize_fast_agrees_with_the_slow_path() {
+        // The fast path must return `Some` exactly when it is safe to use the
+        // term in place, and the answer it yields must equal the allocating
+        // `normalize_query_term` on every input — a divergence would be an
+        // index that answers differently depending on a term's casing.
+        let cases = [
+            "queen",      // already indexed: fast
+            "rareneedle", // already indexed: fast
+            "row-000000", // hyphen: slow
+            "QUEEN",      // uppercase: slow (must not borrow as-is)
+            "Queen",      // mixed case: slow
+            "q1",         // too short: both None
+            "  queen",    // leading space: slow
+            "queen ",     // trailing space: slow
+            "queen x",    // interior space: slow
+            "quéen",      // non-ASCII: slow
+            "",           // empty: both None
+            "a1b2c3",     // alnum lowercase: fast
+        ];
+        for term in cases {
+            let fast = FlatIndex::normalize_fast(term);
+            let slow = normalize_query_term(term);
+            // The invariant is one-way: a fast path is only taken when the
+            // bytes are already in indexed form, so `fast = Some(b)` implies
+            // `slow = Some(s)` with `b == s`. `fast = None` is always safe —
+            // the allocating path answers whatever it answers.
+            if let (Some(f), Some(s)) = (fast, &slow) {
+                assert_eq!(f, s.as_bytes(), "{term:?}");
+            } else if fast.is_some() {
+                panic!("{term:?}: fast path taken but slow path is None");
+            }
+        }
+        // The one that matters: an uppercase term must NOT be fast-pathed,
+        // or `postings("QUEEN")` would search for the literal and miss.
+        assert!(FlatIndex::normalize_fast("QUEEN").is_none());
+        assert_eq!(normalize_query_term("QUEEN").as_deref(), Some("queen"));
+    }
+
+    #[test]
+    fn flat_point_lookup_is_correct_when_the_jump_table_is_populated() {
+        // The jump table only exists once `term_bytes` crosses
+        // `TARGET_WINDOW_BYTES` (32 KB). Every other flat test stays under
+        // that, so the lookup falls back to a full binary search and a
+        // broken window computation passes silently. This one builds well
+        // past the threshold and checks the jump-table path against the map
+        // form: every present term, plus a sweep of absent probes in between.
+        let n = 8_000usize; // 8_000 * 10 B = 80 KB of term bytes
+        let keys: Vec<String> = (0..n).map(|k| format!("term{k:06}")).collect();
+        let flat = FlatIndex::from_rows(keys.iter().map(String::as_str));
+        assert!(
+            !flat.anchors.is_empty(),
+            "the index must be large enough to derive a jump table"
+        );
+        let i = InvertedIndex::from_rows(keys.iter().map(String::as_str));
+        // Every present term, including those near window boundaries (the
+        // anchors sit at 32 KB intervals, so mid-window and boundary terms
+        // are the ones a window off-by-one drops).
+        for k in (0..n).step_by(37) {
+            let term = format!("term{k:06}");
+            assert_eq!(
+                flat.postings(&term).map(<[u32]>::to_vec),
+                i.postings(&term).map(<[u32]>::to_vec),
+                "present term {term}"
+            );
+        }
+        // Absent probes: between-term and out-of-domain terms must be `None`,
+        // not a wrong neighbour (a too-narrow window returns `None`, a too-
+        // wide one risks a false hit).
+        for k in 1..n {
+            let probe = format!("term{k:06}x");
+            assert!(flat.postings(&probe).is_none(), "absent term {probe}");
+        }
+        // A substring sweep must still agree with the map form: the whole-
+        // dictionary walk is the one path that never touches the jump table,
+        // so it guards the resident layout the jump table indexes.
+        assert_eq!(
+            flat.rows_containing("term0001"),
+            i.rows_containing("term0001")
+        );
+    }
+
+    #[test]
+    fn flat_point_lookup_is_correct_when_anchors_share_a_prefix() {
+        // The failure mode the anchor dedup exists for: thousands of terms
+        // sharing the first 8 bytes, so the byte-spaced anchors land *inside*
+        // one 8-byte-prefix run and would all carry the same key. Without the
+        // dedup, a query whose full term sorts before an anchor's term is
+        // windowed past it and returns `None` while the map form answers.
+        // This is the reviewer's repro: 8,000 terms, 14 bytes each
+        // (`term0000{k:06}`), ≈ 112 KB of term bytes.
+        let n = 8_000usize;
+        let keys: Vec<String> = (0..n).map(|k| format!("term0000{k:06}")).collect();
+        let flat = FlatIndex::from_rows(keys.iter().map(String::as_str));
+        let i = InvertedIndex::from_rows(keys.iter().map(String::as_str));
+        // Every term shares the prefix "term0000", so the dedup must collapse
+        // the whole table to a single anchor — the first term that crossed a
+        // 32 KB boundary.
+        assert_eq!(flat.anchors.len(), 1, "one anchor per distinct 8-byte key");
+        // The previously-failing case: the smallest term sorts before the
+        // anchor's term but shares its key, so the window must reach back to
+        // term 0 to include it.
+        assert_eq!(
+            flat.postings("term0000000000").map(<[u32]>::to_vec),
+            i.postings("term0000000000").map(<[u32]>::to_vec),
+            "the first term of the shared-prefix run"
+        );
+        // Full sweep: every present term, plus absent probes between them.
+        for k in (0..n).step_by(31) {
+            let term = format!("term0000{k:06}");
+            assert_eq!(
+                flat.postings(&term).map(<[u32]>::to_vec),
+                i.postings(&term).map(<[u32]>::to_vec),
+                "present term {term}"
+            );
+            if k + 1 < n {
+                let probe = format!("term0000{k:06}z");
+                assert!(flat.postings(&probe).is_none(), "absent term {probe}");
+            }
+        }
+    }
+
+    #[test]
+    fn flat_raw_tokenizer_empty_value_round_trips() {
+        // A null/empty `raw` value is one empty token under `Tokenizer::Raw`
+        // (`tokenize("") == vec![""]`), and the v1 decoder documents an empty
+        // term as a legal dictionary entry. The flat form must carry it:
+        // build it, serialize it, parse it back, and answer it — the
+        // v1→v2 conversion path is what a cache-load of a historical Raw
+        // index takes.
+        let rows = ["", "alpha beta", "", "gamma"];
+        let map = InvertedIndex::from_rows_with_tokenizer(rows.iter().copied(), Tokenizer::Raw);
+        let flat = map.flat();
+        assert_eq!(flat.n_terms(), 3); // "", "alpha beta", "gamma"
+                                       // The empty term is the dictionary's first entry.
+        assert_eq!(flat.postings_at(0), &[0u32, 2]);
+        // The term API refuses it on both forms: below `MIN_TOKEN_LEN` a
+        // query cannot have produced the term, so both answer `None`.
+        assert_eq!(flat.postings(""), None);
+        assert_eq!(map.postings(""), None);
+        // The round trip keeps the empty term: the old `term_len == 0`
+        // rejection dropped it, breaking "both forms answer identically".
+        let blob = flat.to_bytes_v2();
+        let loaded = FlatIndex::from_bytes_v2(&blob).expect("empty term round-trips");
+        assert_eq!(loaded, flat);
+        assert_eq!(loaded.postings_at(0), &[0u32, 2]);
+    }
+
+    #[test]
+    fn flat_map_construction_paths_agree() {
+        // The borrowing (`flat`), owned (`From<InvertedIndex>`), and fallible
+        // (`try_flat`) conversions must all produce the identical flat layout
+        // for the same rows: same spans, same postings, same jump table, same
+        // charge. The owned form moves the map, so any divergence from the
+        // borrowing path would show up here.
+        let rows: Vec<String> = (0..2_000)
+            .map(|r| format!("service-{} status {} row-{r:04}", r % 7, 200 + r % 3))
+            .collect();
+        let a = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let b = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let c = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let by_borrow = a.flat();
+        let by_try = a.try_flat().expect("a small index fits the u32 cap");
+        let by_owned = FlatIndex::from(b);
+        assert_eq!(by_borrow, by_try, "try_flat must equal flat");
+        assert_eq!(by_borrow, by_owned, "From<InvertedIndex> must equal flat");
+        assert_eq!(
+            by_borrow.heap_size_bytes(),
+            by_owned.heap_size_bytes(),
+            "the charge must not depend on the construction path"
+        );
+        // `a` is still usable after the borrowing conversions; `b` was moved.
+        assert_eq!(a.n_terms(), c.n_terms());
+        // And the fallible form reports a fit for a small index.
+        assert!(c.try_flat().is_some());
+    }
+
+    #[test]
+    fn flat_from_rows_matches_the_v1_to_v2_path() {
+        // The from-scratch path and the v1→v2 path must produce the identical
+        // flat layout for the same rows: same spans, same postings, same bytes,
+        // same charge.
+        let rows: Vec<String> = (0..500)
+            .map(|r| format!("service-{} status {} row-{r:04}", r % 7, 200 + r % 3))
+            .collect();
+        let via_map = InvertedIndex::from_rows(rows.iter().map(String::as_str)).flat();
+        let direct = FlatIndex::from_rows(rows.iter().map(String::as_str));
+        assert_eq!(direct, via_map, "from-scratch and v1→v2 must agree");
+        assert_eq!(
+            direct.to_bytes_v2(),
+            via_map.to_bytes_v2(),
+            "the two paths must serialize identically"
+        );
+        assert_eq!(direct.heap_size_bytes(), via_map.heap_size_bytes());
+        // And it answers like the map form it stands in for. The terms are
+        // delimiter-free and ≥ `MIN_TOKEN_LEN` so `postings` actually indexes
+        // them — a hyphenated term would normalize to `None` on both sides and
+        // the comparison would pass vacuously.
+        let i = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        for term in ["service", "status", "row", "absent"] {
+            assert_eq!(
+                direct.postings(term).map(<[u32]>::to_vec),
+                i.postings(term).map(<[u32]>::to_vec)
+            );
+        }
+        // At least one is present, so the loop above is not all-`None`.
+        assert!(direct.postings("service").is_some());
+    }
+
+    #[test]
+    fn flat_v2_round_trips_and_is_version_separated() {
+        let i = idx();
+        let flat = i.flat();
+        let bytes = flat.to_bytes_v2();
+        let back = FlatIndex::from_bytes_v2(&bytes).expect("v2 blob round-trips");
+        assert_eq!(back, flat);
+        assert_eq!(InvertedIndex::from(back), i);
+        // The two versions refuse each other's blobs: the stored form is v1,
+        // the resident form v2, and a reader must not parse one as the other.
+        assert!(
+            InvertedIndex::from_bytes(&bytes).is_none(),
+            "v2 blob is not v1"
+        );
+        assert!(
+            FlatIndex::from_bytes_v2(&i.to_bytes()).is_none(),
+            "v1 blob is not v2"
+        );
+    }
+
+    #[test]
+    fn flat_empty_index_round_trips() {
+        // The 0-term edge: no spans, no term bytes, no postings. The v2
+        // decoder's contiguity checks must accept the empty body.
+        let flat = FlatIndex::from_rows(std::iter::empty::<&str>());
+        assert_eq!(flat.n_rows(), 0);
+        assert_eq!(flat.n_terms(), 0);
+        let back = FlatIndex::from_bytes_v2(&flat.to_bytes_v2()).expect("round-trips");
+        assert_eq!(back, flat);
+        assert_eq!(
+            InvertedIndex::from(back),
+            InvertedIndex::from_rows(std::iter::empty::<&str>())
+        );
+    }
+
+    /// A well-formed **v2** blob (sorted term order, matching the resident
+    /// layout) from sorted `(term, deltas)` pairs, so a hostile case can break
+    /// exactly one field. The body is: `n_rows`, `n_terms`, `total_postings`,
+    /// the term lengths, the term bytes, then per term its posting count and
+    /// deltas — all in sorted term order.
+    fn v2_blob(n_rows: u64, terms: &[(&[u8], &[u64])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, n_rows);
+        write_varint(&mut out, terms.len() as u64);
+        let total: u64 = terms.iter().map(|(_, d)| d.len() as u64).sum();
+        write_varint(&mut out, total);
+        for (term, _) in terms {
+            write_varint(&mut out, term.len() as u64);
+        }
+        for (term, _) in terms {
+            out.extend_from_slice(term);
+        }
+        for (_, deltas) in terms {
+            write_varint(&mut out, deltas.len() as u64);
+            for &d in *deltas {
+                write_varint(&mut out, d);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn flat_v2_refuses_hostile_blobs() {
+        // Bad magic / version.
+        assert!(FlatIndex::from_bytes_v2(b"").is_none());
+        assert!(FlatIndex::from_bytes_v2(b"XXXX\x02").is_none(), "bad magic");
+        let mut bad_version = v2_blob(3, &[(b"ab", &[0])]);
+        bad_version[4] = 99;
+        assert!(
+            FlatIndex::from_bytes_v2(&bad_version).is_none(),
+            "bad version"
+        );
+
+        // A term count no payload can cover. `total_postings` is present (0)
+        // so the blob survives the header read and is rejected by the
+        // `n_terms > remaining / 2` guard itself, not by truncation while
+        // reading the total.
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, 3);
+        write_varint(&mut out, u32::MAX as u64);
+        write_varint(&mut out, 0);
+        assert!(out.len() < 16, "the hostile blob stays tiny");
+        assert!(FlatIndex::from_bytes_v2(&out).is_none());
+
+        // A term length that runs past the term-byte region.
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, 3);
+        write_varint(&mut out, 1);
+        write_varint(&mut out, 1); // total_postings
+        write_varint(&mut out, 200); // term_len past the two bytes that follow
+        out.extend_from_slice(b"ab");
+        write_varint(&mut out, 1);
+        out.push(0);
+        assert!(FlatIndex::from_bytes_v2(&out).is_none());
+
+        // A zero-length term: legitimate (the `Raw` tokenizer emits one for
+        // a null/empty value), and it round-trips. The term API cannot reach
+        // it (`normalize_query_term("")` is `None`, below `MIN_TOKEN_LEN`),
+        // so it is checked by position.
+        let empty = v2_blob(3, &[(b"", &[0])]);
+        let parsed = FlatIndex::from_bytes_v2(&empty).expect("empty term is legal");
+        assert_eq!(parsed.n_terms(), 1);
+        assert_eq!(parsed.postings_at(0), &[0u32]);
+
+        // An empty postings list: a term is stored only when a row has it.
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"ab", &[])])).is_none());
+
+        // A posting count that overruns the remaining deltas.
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, 3);
+        write_varint(&mut out, 1);
+        write_varint(&mut out, 5); // total_postings
+        write_varint(&mut out, 2); // "ab"
+        out.extend_from_slice(b"ab");
+        write_varint(&mut out, 5); // claims five postings
+        out.push(0); // but only one delta
+        assert!(FlatIndex::from_bytes_v2(&out).is_none());
+
+        // A total_postings no payload can cover: a tiny blob declaring a
+        // huge total. The header guard (before any allocation) must refuse
+        // it — this is the class of input v1's per-count checks removed.
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, 3); // n_rows
+        write_varint(&mut out, 1); // n_terms
+        write_varint(&mut out, u64::MAX); // total_postings: absurd
+        write_varint(&mut out, 2); // term_len
+        out.extend_from_slice(b"ab");
+        write_varint(&mut out, 1); // plen
+        out.push(0); // one delta
+        assert!(out.len() < 24, "the hostile blob stays tiny");
+        assert!(FlatIndex::from_bytes_v2(&out).is_none());
+
+        // A declared total larger than the per-term counts: the decode
+        // succeeds but the sum check must refuse (the blob would not
+        // round-trip its own header and would over-allocate capacity).
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, 3); // n_rows
+        write_varint(&mut out, 1); // n_terms
+        write_varint(&mut out, 9); // total_postings: nine
+        write_varint(&mut out, 2); // term_len
+        out.extend_from_slice(b"ab");
+        write_varint(&mut out, 1); // plen: one
+        out.push(0); // one delta
+        assert!(FlatIndex::from_bytes_v2(&out).is_none());
+
+        // A posting that walks past the row domain.
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"ab", &[3])])).is_none());
+        // Two postings, the second out of domain (n_rows = 3, so 1 then 3).
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"ab", &[1, 2])])).is_none());
+
+        // A zero delta after the first repeats the previous ordinal.
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(9, &[(b"ab", &[2, 0])])).is_none());
+
+        // A delta that fits u32 but walks the running ordinal past u32.
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(
+            u32::MAX as u64,
+            &[(b"ab", &[u32::MAX as u64, u32::MAX as u64])]
+        ))
+        .is_none());
+
+        // A delta past u32.
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(100, &[(b"ab", &[(1u64 << 32) + 5])])).is_none());
+
+        // Duplicate terms (the v2 sorted form must be strictly ascending in
+        // buffer order).
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"ab", &[0]), (b"ab", &[1])])).is_none());
+        // Descending terms.
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"cd", &[0]), (b"ab", &[1])])).is_none());
+
+        // Non-UTF-8 term bytes.
+        assert!(FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"\xff\xfe", &[0])])).is_none());
+
+        // Trailing payload: the body must be consumed exactly.
+        let mut good = v2_blob(3, &[(b"ab", &[0])]);
+        good.push(0);
+        assert!(FlatIndex::from_bytes_v2(&good).is_none());
+
+        // The exact-fit boundary is accepted: an in-domain, ascending index.
+        assert_eq!(
+            FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"abc", &[0, 2])]))
+                .and_then(|i| i.postings("abc").map(<[u32]>::to_vec)),
+            Some(vec![0, 2])
+        );
+    }
+
+    /// Every one-byte truncation and every single-byte mutation of a valid v2
+    /// blob must come back as `None` or as a decoded index — never a panic.
+    #[test]
+    fn flat_v2_survives_truncation_and_mutation() {
+        let good = v2_blob(3, &[(b"ab", &[0, 2]), (b"cd", &[1])]);
+        for cut in 0..good.len() {
+            assert!(
+                FlatIndex::from_bytes_v2(&good[..cut]).is_none(),
+                "a truncated blob is never valid (cut at {cut})"
+            );
+        }
+        for pos in 0..good.len() {
+            for replacement in [0x00u8, 0x01, 0x7f, 0x80, 0xff] {
+                let mut mutated = good.clone();
+                mutated[pos] = replacement;
+                if let Some(index) = FlatIndex::from_bytes_v2(&mutated) {
+                    // Whatever survives is internally consistent: every posting
+                    // inside the row domain it declares.
+                    for (term, rows) in index.terms() {
+                        assert!(
+                            rows.iter().all(|row| *row < index.n_rows()),
+                            "term {term:?} escaped the row domain after byte {pos} := {replacement:#04x}"
+                        );
                     }
                 }
             }
