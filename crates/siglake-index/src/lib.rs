@@ -195,10 +195,15 @@ impl FlatIndex {
         Self::from_parts(terms, postings, term_bytes, n_rows)
     }
 
-    /// Assemble from already-built buffers, checking that every buffer fits a
-    /// `u32` offset, then validating the invariants. Every constructor goes
-    /// through here, so a `FlatIndex` is always valid; a violation panics
-    /// (the inputs come from checked, in-process data, not untrusted bytes).
+    /// Assemble from already-built buffers. Every constructor goes through
+    /// here, so a `FlatIndex` is always valid: `from_map`/`from_rows` build
+    /// contiguous, term-sorted, ascending buffers by construction, and
+    /// `from_bytes_v2` checks the invariants itself before calling here.
+    ///
+    /// [`validate`](Self::validate) is a full `O(n)` pass over every buffer, so
+    /// it runs only in debug builds as a constructor tripwire — free on the
+    /// release load path. An out-of-band construction (e.g. FFI) that bypasses
+    /// the checked builders should call it explicitly.
     fn from_parts(
         terms: Vec<TermSpan>,
         postings: Vec<u32>,
@@ -211,7 +216,9 @@ impl FlatIndex {
             term_bytes,
             n_rows,
         };
-        index.validate();
+        if cfg!(debug_assertions) {
+            index.validate();
+        }
         index
     }
 
@@ -231,11 +238,7 @@ impl FlatIndex {
                 bytes_prev_end == span.bytes_start as usize && bytes_end <= total_bytes,
                 "term spans must be contiguous and in bounds"
             );
-            let postings_end = if i + 1 < self.terms.len() {
-                self.terms[i + 1].postings_start as usize
-            } else {
-                total_postings
-            };
+            let postings_end = self.postings_end(i);
             assert!(
                 postings_prev_end == span.postings_start as usize
                     && postings_end >= postings_prev_end
@@ -316,12 +319,10 @@ impl FlatIndex {
                     [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize],
             )
             .expect("a FlatIndex built here holds valid UTF-8 terms");
-            let end = if i + 1 < self.terms.len() {
-                self.terms[i + 1].postings_start as usize
-            } else {
-                self.postings.len()
-            };
-            (term, &self.postings[span.postings_start as usize..end])
+            (
+                term,
+                &self.postings[span.postings_start as usize..self.postings_end(i)],
+            )
         })
     }
 
@@ -330,6 +331,18 @@ impl FlatIndex {
         let span = &self.terms[i];
         &self.term_bytes
             [span.bytes_start as usize..span.bytes_start as usize + span.term_len as usize]
+    }
+
+    /// The `postings` slice's end index for term `i`: the next term's
+    /// `postings_start`, or the buffer end for the last term. The one place the
+    /// "where does term `i`'s postings end?" rule lives — `validate`, `terms`,
+    /// `postings`, and `to_bytes_v2` all ask it.
+    fn postings_end(&self, i: usize) -> usize {
+        if i + 1 < self.terms.len() {
+            self.terms[i + 1].postings_start as usize
+        } else {
+            self.postings.len()
+        }
     }
 
     /// Binary search the term-sorted dictionary for `query` (already
@@ -356,12 +369,7 @@ impl FlatIndex {
         let norm = normalize_query_term(term)?;
         let i = self.term_index(norm.as_bytes())?;
         let span = &self.terms[i];
-        let end = if i + 1 < self.terms.len() {
-            self.terms[i + 1].postings_start as usize
-        } else {
-            self.postings.len()
-        };
-        Some(&self.postings[span.postings_start as usize..end])
+        Some(&self.postings[span.postings_start as usize..self.postings_end(i)])
     }
 
     /// Row ordinals matching **all** `terms` (AND) — the intersection of their
@@ -403,30 +411,28 @@ impl FlatIndex {
     }
 
     /// Serialize to the v2 wire form: the magic prefix with version
-    /// [`INDEX_VERSION_2`], then `n_rows`, the term count, each term's length,
-    /// all the term bytes in term order, and per term its posting count and
-    /// delta-encoded postings. The term and posting offsets are cumulative, so
-    /// they are not stored — which keeps the blob about the v1 size.
-    /// [`from_bytes_v2`] parses it. This is the canonical blob the layout is
-    /// meant to be stored as; in this POC nothing writes it yet (the write
-    /// path emits v1).
+    /// [`INDEX_VERSION_2`], then `n_rows`, the term count, the **total posting
+    /// count**, each term's length, all the term bytes in term order, and per
+    /// term its posting count and delta-encoded postings. The term and posting
+    /// offsets are cumulative, so they are not stored — which keeps the blob
+    /// about the v1 size. Storing the total posting count is what lets
+    /// [`from_bytes_v2`] preallocate its postings buffer without a second pass
+    /// over the (large) posting section. [`from_bytes_v2`] parses it. This is
+    /// the canonical blob the layout is meant to be stored as; in this POC
+    /// nothing writes it yet (the write path emits v1).
     pub fn to_bytes_v2(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(INDEX_MAGIC);
         out.push(INDEX_VERSION_2);
         write_varint(&mut out, self.n_rows as u64);
         write_varint(&mut out, self.terms.len() as u64);
+        write_varint(&mut out, self.postings.len() as u64);
         for span in &self.terms {
             write_varint(&mut out, span.term_len as u64);
         }
         out.extend_from_slice(&self.term_bytes);
         for (i, span) in self.terms.iter().enumerate() {
-            let end = if i + 1 < self.terms.len() {
-                self.terms[i + 1].postings_start as usize
-            } else {
-                self.postings.len()
-            };
-            let rows = &self.postings[span.postings_start as usize..end];
+            let rows = &self.postings[span.postings_start as usize..self.postings_end(i)];
             write_varint(&mut out, rows.len() as u64);
             let mut prev = 0u32;
             for &r in rows {
@@ -438,16 +444,19 @@ impl FlatIndex {
     }
 
     /// Parse a blob produced by [`to_bytes_v2`]. Returns `None` on a bad
-    /// magic/version or a truncated/garbled body — the same structural
-    /// invariants [`InvertedIndex::from_bytes`] checks: strictly ascending
-    /// UTF-8 terms, and postings strictly ascending and inside `0..n_rows`.
+    /// magic/version or a truncated/garbled body.
     ///
-    /// Every length is untrusted input. Offsets are derived cumulatively in
-    /// `usize` (never as a `u32` sum that could overflow), the term and
-    /// posting spans are checked against the remaining bytes before anything
-    /// is allocated from them, and the postings buffer is preallocated exactly
-    /// (a first pass sums the per-term counts) so the resident charge carries
-    /// no growth headroom.
+    /// One forward pass over the whole blob: the header carries the total
+    /// posting count, so the postings buffer is preallocated exactly up front
+    /// and the (large) posting section is read **once** — there is no dry-run
+    /// pass and no seek back over it. Offsets are derived cumulatively in
+    /// `usize` (never as a `u32` sum that could overflow), and every length is
+    /// untrusted input checked against the bytes that remain.
+    ///
+    /// The semantic checks (strictly-ascending UTF-8 terms, strictly-ascending
+    /// in-domain postings) are made here, on untrusted bytes, returning `None`
+    /// rather than reaching [`Self::validate`], which panics by design — the
+    /// same untrusted-input posture [`InvertedIndex::from_bytes`] takes.
     pub fn from_bytes_v2(bytes: &[u8]) -> Option<Self> {
         let mut c = Cursor::new(bytes);
         if c.take(4)? != INDEX_MAGIC {
@@ -458,14 +467,16 @@ impl FlatIndex {
         }
         let n_rows: u32 = c.varint()?.try_into().ok()?;
         let n_terms: usize = c.varint()?.try_into().ok()?;
-        // Each term costs at least one byte for its length varint and one for
-        // its (non-empty) posting count — the ceiling checked before any
-        // allocation, as the v1 decoder does.
+        let total_postings: usize = c.varint()?.try_into().ok()?;
+        // Cheap guard against a huge `n_terms` driving the term-length read
+        // (and the term-spans `Vec`) before any term is actually present: each
+        // term costs at least one byte for its length varint and one for its
+        // (non-empty) posting count.
         if n_terms > c.remaining() / 2 {
             return None;
         }
-        // Pass 1: term lengths → the cumulative byte offsets and the term
-        // buffer's size, all checked in `usize`.
+        // Term section: the per-term lengths, then the concatenated term bytes.
+        // All offsets derived cumulatively in `usize` (never a `u32` sum).
         let mut terms = Vec::with_capacity(n_terms);
         let mut bytes_cursor = 0usize;
         for _ in 0..n_terms {
@@ -478,7 +489,7 @@ impl FlatIndex {
             terms.push(TermSpan {
                 bytes_start,
                 term_len: term_len_u32,
-                postings_start: 0, // filled in pass 2
+                postings_start: 0, // derived from `plen` in the decode below
             });
             bytes_cursor += term_len;
         }
@@ -500,13 +511,13 @@ impl FlatIndex {
             }
             last_term = Some(term);
         }
-        // Pass 2 (dry run): the deltas are variable-length, so a single forward
-        // pass cannot both read every per-term count and leave the cursor at
-        // the section start. Read each count, skip its deltas, and accumulate
-        // the exact posting total — then seek back and decode for real.
-        let posting_start = c.pos();
+        // Posting section: one forward decode into a buffer preallocated to the
+        // header's total. The total is untrusted — a corrupt or hostile value
+        // can over-allocate here — but that is the same corruption-DoS surface
+        // the footer CRC covers, and this system reads back only its own files,
+        // so no guard is added; see `docs/LIMITATIONS.md`.
+        let mut postings = Vec::with_capacity(total_postings);
         let mut postings_cursor = 0u32;
-        let mut postings_capacity = 0usize;
         for span in &mut terms {
             let plen: usize = c.varint()?.try_into().ok()?;
             if plen == 0 || plen > c.remaining() {
@@ -514,30 +525,10 @@ impl FlatIndex {
             }
             span.postings_start = postings_cursor;
             postings_cursor = postings_cursor.checked_add(plen as u32)?;
-            postings_capacity = postings_capacity.checked_add(plen)?;
-            for _ in 0..plen {
-                c.varint()?; // skip this term's deltas
-            }
+            decode_delta_postings(&mut c, n_rows, plen, &mut postings)?;
         }
-        // Pass 3: re-read the posting section into a buffer preallocated to the
-        // exact total, checking the row domain and strict order.
-        c.seek(posting_start);
-        let mut postings = Vec::with_capacity(postings_capacity);
-        for _ in 0..terms.len() {
-            let plen: usize = c.varint()?.try_into().ok()?;
-            let mut prev = 0u32;
-            for nth in 0..plen {
-                let delta: u32 = c.varint()?.try_into().ok()?;
-                if nth > 0 && delta == 0 {
-                    return None;
-                }
-                prev = prev.checked_add(delta)?;
-                if prev >= n_rows {
-                    return None;
-                }
-                postings.push(prev);
-            }
-        }
+        // A well-formed blob is consumed exactly: trailing bytes mean the
+        // counts in the header disagree with the payload.
         if c.remaining() != 0 {
             return None;
         }
@@ -643,6 +634,40 @@ impl FlatIndexBuilder {
     pub fn build(self) -> FlatIndex {
         self.inner.build().consume()
     }
+}
+
+/// Decode `count` delta-encoded postings from `c` into `out`, appending.
+/// `None` if a delta does not round-trip through `u64`, a later delta is zero
+/// (postings are strictly ascending), the running ordinal overflows `u32`, or
+/// an ordinal walks past the row domain `0..n_rows`. The caller reads the count
+/// and bounds it against `c.remaining()`; this reads exactly `count` deltas.
+/// Writing into a caller buffer (rather than returning a fresh `Vec`) is what
+/// lets the v2 decoder append straight into its one preallocated postings
+/// buffer with no per-term allocation or second copy. Shared by the v1 and v2
+/// decoders so the posting invariants live in one place.
+fn decode_delta_postings(
+    c: &mut Cursor,
+    n_rows: u32,
+    count: usize,
+    out: &mut Vec<u32>,
+) -> Option<()> {
+    let mut prev = 0u32;
+    for nth in 0..count {
+        let delta: u32 = c.varint()?.try_into().ok()?;
+        // Only the first ordinal may be zero: postings are strictly ascending,
+        // so every later delta is at least one.
+        if nth > 0 && delta == 0 {
+            return None;
+        }
+        prev = prev.checked_add(delta)?;
+        // Postings are row ordinals within this file. One at or past `n_rows`
+        // would select a row the index does not claim to cover.
+        if prev >= n_rows {
+            return None;
+        }
+        out.push(prev);
+    }
+    Some(())
 }
 
 impl InvertedIndex {
@@ -915,24 +940,10 @@ impl InvertedIndex {
             if plen == 0 || plen > c.remaining() {
                 return None;
             }
+            // The map form keeps a `Vec` per term, so this decodes into a
+            // fresh one (the v2 decoder appends into its single buffer).
             let mut rows = Vec::with_capacity(plen);
-            let mut prev = 0u32;
-            for nth in 0..plen {
-                let delta: u32 = c.varint()?.try_into().ok()?;
-                // Only the first ordinal may be zero: postings are strictly
-                // ascending, so every later delta is at least one.
-                if nth > 0 && delta == 0 {
-                    return None;
-                }
-                prev = prev.checked_add(delta)?;
-                // Postings are row ordinals within this file. One at or past
-                // `n_rows` would select a row the index does not claim to
-                // cover.
-                if prev >= n_rows {
-                    return None;
-                }
-                rows.push(prev);
-            }
+            decode_delta_postings(&mut c, n_rows, plen, &mut rows)?;
             postings.insert(term, rows);
         }
         // A well-formed blob is consumed exactly: trailing bytes mean the
@@ -1051,16 +1062,6 @@ impl<'a> Cursor<'a> {
     /// is checked against before anything is allocated from it.
     fn remaining(&self) -> usize {
         self.buf.len().saturating_sub(self.pos)
-    }
-    /// The read position, for a multi-pass decode that measures a section then
-    /// re-reads it.
-    fn pos(&self) -> usize {
-        self.pos
-    }
-    /// Rewind to an earlier position (the v2 decoder measures the posting
-    /// section in one pass, then reads it back into a preallocated buffer).
-    fn seek(&mut self, pos: usize) {
-        self.pos = pos;
     }
     /// LEB128, rejecting any encoding that does not round-trip through `u64`:
     /// more than ten bytes, or a tenth byte carrying more than the single
@@ -1607,14 +1608,17 @@ mod tests {
     }
 
     /// A well-formed v2 blob from `(term, deltas)` pairs, so a hostile case can
-    /// break exactly one field. The body is: `n_rows`, `n_terms`, the term
-    /// lengths, the term bytes, then per term its posting count and deltas.
+    /// break exactly one field. The body is: `n_rows`, `n_terms`,
+    /// `total_postings`, the term lengths, the term bytes, then per term its
+    /// posting count and deltas.
     fn v2_blob(n_rows: u64, terms: &[(&[u8], &[u64])]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(INDEX_MAGIC);
         out.push(INDEX_VERSION_2);
         write_varint(&mut out, n_rows);
         write_varint(&mut out, terms.len() as u64);
+        let total: u64 = terms.iter().map(|(_, d)| d.len() as u64).sum();
+        write_varint(&mut out, total);
         for (term, _) in terms {
             write_varint(&mut out, term.len() as u64);
         }
@@ -1657,6 +1661,7 @@ mod tests {
         out.push(INDEX_VERSION_2);
         write_varint(&mut out, 3);
         write_varint(&mut out, 1);
+        write_varint(&mut out, 1); // total_postings
         write_varint(&mut out, 200); // term_len past the two bytes that follow
         out.extend_from_slice(b"ab");
         write_varint(&mut out, 1);
@@ -1675,6 +1680,7 @@ mod tests {
         out.push(INDEX_VERSION_2);
         write_varint(&mut out, 3);
         write_varint(&mut out, 1);
+        write_varint(&mut out, 5); // total_postings
         write_varint(&mut out, 2); // "ab"
         out.extend_from_slice(b"ab");
         write_varint(&mut out, 5); // claims five postings
