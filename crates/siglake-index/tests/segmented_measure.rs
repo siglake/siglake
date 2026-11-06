@@ -272,6 +272,14 @@ fn report_segmented_vs_whole_file() {
     let v2_loaded = FlatIndex::from_bytes_v2(&v2_blob).expect("v2 layout round-trips");
     let v2_load = load.elapsed();
     assert_eq!(v2_loaded, v2);
+    // `PartialEq` compares values, not capacities: a decoder that grew a
+    // buffer past its exact size would pass the value check but bill the
+    // cache for headroom, so the charge is asserted on its own.
+    assert_eq!(
+        v2_loaded.heap_size_bytes(),
+        v2.heap_size_bytes(),
+        "the decoded index must bill the same resident charge"
+    );
 
     let open = Instant::now();
     let reader = SegmentedReader::open(SliceSource::shared(std::sync::Arc::clone(&seg_bytes)))
@@ -303,8 +311,8 @@ fn report_segmented_vs_whole_file() {
         v2.heap_size_bytes() as f64 / rows_per_file as f64,
         mib(v2_blob.len() as u64),
         v2_load,
-        mib(v2.heap_size_bytes() as u64),
-        v2.heap_size_bytes() as f64 / rows_per_file as f64,
+        mib(v2_loaded.heap_size_bytes() as u64),
+        v2_loaded.heap_size_bytes() as f64 / rows_per_file as f64,
         seg_build,
         mib(seg_bytes.len() as u64),
         seg_open,
