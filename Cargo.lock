@@ -6572,6 +6572,7 @@ dependencies = [
  "iceberg",
  "jsonwebtoken",
  "libc",
+ "log",
  "metrics",
  "metrics-util",
  "opentelemetry",
@@ -6893,6 +6894,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
  "webpki-roots 0.26.11",
 ]
 
@@ -6974,6 +6976,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -7012,6 +7015,7 @@ dependencies = [
  "stringprep",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -7036,6 +7040,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

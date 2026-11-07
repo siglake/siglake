@@ -48,7 +48,7 @@ opentelemetry-http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "json", "macros", "tls-rustls-aws-lc-rs"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "chrono", "uuid", "json", "macros", "tls-rustls-aws-lc-rs"] }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -62,6 +62,8 @@ utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
 
 [dev-dependencies]
+# Real global log capture for the isolated history omission privacy regression.
+log = "=0.4.33"
 # Enables the mixed-writer promotion fixture without exposing its unsafe write
 # helper in production builds.
 siglake-storage = { workspace = true, features = ["test-utils"] }

@@ -23,6 +23,7 @@ pub mod discovery;
 pub mod error;
 pub mod format;
 mod health;
+pub mod history;
 pub mod hot_cache;
 mod indexes_routes;
 pub mod jaeger_limits;
