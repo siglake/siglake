@@ -8,22 +8,121 @@ use sqlx::{
 use std::{path::PathBuf, time::Duration};
 use tokio::sync::{Mutex, MutexGuard};
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
-struct Fixture {
+pub(super) struct Fixture {
     _guard: MutexGuard<'static, ()>,
-    admin: PgPool,
-    writer: HistoryWriter,
-    reader: HistoryReader,
-    socket: PathBuf,
+    pub(super) admin: PgPool,
+    pub(super) writer: HistoryWriter,
+    pub(super) reader: HistoryReader,
+    pub(super) socket: PathBuf,
 }
-fn options(socket: &std::path::Path, role: &str) -> PgConnectOptions {
-    PgConnectOptions::new()
+fn assert_fixture_isolation(socket: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // Inspect ONLY files created by our disposable runner, never real HOME or
+    // passfiles. new_without_pgpass still imports PG environment defaults.
+    for (name, _) in std::env::vars_os() {
+        assert!(
+            !name.to_string_lossy().starts_with("PG")
+                || matches!(
+                    name.to_str(),
+                    Some(
+                        "PGPASSFILE"
+                            | "PGHOST"
+                            | "PGPORT"
+                            | "PGUSER"
+                            | "PGDATABASE"
+                            | "PGPASSWORD"
+                            | "PGSSLMODE"
+                            | "PGAPPNAME"
+                    )
+                ),
+            "unexpected PostgreSQL environment variable"
+        );
+    }
+    assert!(
+        std::env::var_os("PGHOST").is_some_and(|actual| actual.as_os_str() == socket.as_os_str()),
+        "PGHOST is not the fixture socket"
+    );
+    for (name, expected) in [
+        ("PGPORT", "5432"),
+        ("PGUSER", "fixture_admin"),
+        ("PGDATABASE", "qh_fixture"),
+        ("PGPASSWORD", ""),
+        ("PGSSLMODE", "disable"),
+        ("PGAPPNAME", "siglake-history-fixture"),
+    ] {
+        assert!(
+            std::env::var(name).is_ok_and(|value| value == expected),
+            "non-fixture PostgreSQL default"
+        );
+    }
+    assert!(std::env::var_os("DATABASE_URL").is_none());
+    for (name, relative) in [
+        ("HOME", "home"),
+        ("XDG_CONFIG_HOME", "xdg-config"),
+        ("XDG_CACHE_HOME", "xdg-cache"),
+        ("XDG_DATA_HOME", "xdg-data"),
+        ("XDG_STATE_HOME", "xdg-state"),
+    ] {
+        assert!(
+            std::env::var_os(name)
+                .is_some_and(|actual| actual.as_os_str() == socket.join(relative).as_os_str()),
+            "non-fixture isolation path"
+        );
+        assert_eq!(
+            std::fs::metadata(socket.join(relative))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+    for (name, relative) in [
+        ("PGPASSFILE", "empty.pgpass"),
+        ("AWS_CONFIG_FILE", "providers/aws-config"),
+        ("AWS_SHARED_CREDENTIALS_FILE", "providers/aws-credentials"),
+        ("BOTO_CONFIG", "providers/boto-config"),
+        (
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "providers/google-credentials",
+        ),
+        ("KUBECONFIG", "providers/kubeconfig"),
+    ] {
+        assert!(
+            std::env::var_os(name)
+                .is_some_and(|actual| actual.as_os_str() == socket.join(relative).as_os_str()),
+            "non-fixture isolation path"
+        );
+        let metadata = std::fs::metadata(socket.join(relative)).unwrap();
+        assert!(metadata.is_file() && metadata.len() == 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+    let fallback = std::fs::metadata(socket.join("home/.pgpass")).unwrap();
+    assert!(fallback.is_file() && fallback.len() == 0);
+    assert_eq!(fallback.permissions().mode() & 0o777, 0o600);
+    assert_eq!(std::env::var("AWS_EC2_METADATA_DISABLED").unwrap(), "true");
+    assert_eq!(
+        std::env::var("AWS_EC2_METADATA_V1_DISABLED").unwrap(),
+        "true"
+    );
+    assert_eq!(std::env::var("CARGO_NET_OFFLINE").unwrap(), "true");
+}
+pub(super) fn options(socket: &std::path::Path, role: &str) -> PgConnectOptions {
+    assert_fixture_isolation(socket);
+    let options = PgConnectOptions::new_without_pgpass()
         .host(socket.to_str().unwrap())
+        .socket(socket)
         .port(5432)
         .database("qh_fixture")
         .username(role)
-        .ssl_mode(PgSslMode::Disable)
+        .password("") // Synthetic trust-auth fixture only; no passfile lookup.
+        .application_name("siglake-history-fixture")
+        .ssl_mode(PgSslMode::Disable);
+    assert_eq!(options.get_socket().unwrap(), socket);
+    assert_eq!(options.get_options(), None);
+    options
 }
-async fn fixture() -> Fixture {
+pub(super) async fn fixture() -> Fixture {
     let guard = DB_LOCK.lock().await;
     let socket = PathBuf::from(
         std::env::var("SIGLAKE_HISTORY_FIXTURE_DIR").expect("use scripts/check-query-history.sh"),
@@ -84,7 +183,7 @@ async fn event(f: &Fixture, tenant: &str, sql: &str) -> PendingExecution {
     )
     .unwrap()
 }
-fn terminal(outcome: Outcome) -> TerminalExecution {
+pub(super) fn terminal(outcome: Outcome) -> TerminalExecution {
     let code = match outcome {
         Outcome::Success => None,
         Outcome::Rejected => Some(ErrorCode::Planning),
@@ -114,7 +213,7 @@ fn terminal(outcome: Outcome) -> TerminalExecution {
     )
     .unwrap()
 }
-async fn json_row(f: &Fixture, id: Uuid) -> serde_json::Value {
+pub(super) async fn json_row(f: &Fixture, id: Uuid) -> serde_json::Value {
     sqlx::query_scalar("SELECT to_jsonb(e) FROM query_history.executions e WHERE execution_id=$1")
         .bind(id)
         .fetch_one(&f.admin)
@@ -624,7 +723,7 @@ async fn postgres_audits_pgapp_schema_and_late_privileges() {
 
 /// Backdate ONLY synthetic fixture rows, with privileged TEST inspection. The
 /// production writer has neither ALTER TABLE nor a controllable clock API.
-async fn expire(f: &Fixture, event: &mut PendingExecution) {
+pub(super) async fn expire(f: &Fixture, event: &mut PendingExecution) {
     sqlx::query("ALTER TABLE query_history.executions DISABLE TRIGGER immutable_receipt")
         .execute(&f.admin)
         .await

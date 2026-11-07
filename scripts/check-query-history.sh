@@ -3,16 +3,13 @@
 set -euo pipefail
 [[ $# == 0 ]] || { echo 'No database target arguments accepted' >&2; exit 2; }
 root=$(cd "$(dirname "$0")/.." && pwd)
-exec env -i HOME="$HOME" PATH=/run/current-system/sw/bin:/usr/bin:/bin bash -s -- "$root" <<'ISOLATED_FIXTURE'
+exec env -i PATH=/run/current-system/sw/bin:/usr/bin:/bin bash -s -- "$root" <<'ISOLATED_FIXTURE'
 set -euo pipefail
 umask 077
-cd "$1"
+root=$1
 source /data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-auth/pinned/env.sh
 pg=/nix/store/zjpr4rk3vqlfz012idz4i6f04g5naiwz-postgresql-16.14/bin
 for tool in initdb pg_ctl createdb psql postgres; do [[ -x "$pg/$tool" ]] || { echo "Missing cached Postgres tool: $tool" >&2; exit 1; }; done
-[[ $(rustc --version) == 'rustc 1.95.0 '* ]] || exit 1
-[[ $(cargo --version) == 'cargo 1.95.0 '* ]] || exit 1
-[[ $(cargo clippy --version) == 'clippy 0.1.95 '* ]] || exit 1
 work=$(mktemp -d /tmp/siglake-history-XXXXXX)
 started=false
 cleanup() {
@@ -22,6 +19,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+source "$root/scripts/query-history-isolation.bash"
+history_isolate_environment "$work"
+cd "$work"
+printf 'Cargo launch cwd: %s\nManifest: %s\nCompiler: %s\nCargo: %s\n' "$PWD" "$root/Cargo.toml" "$(command -v rustc)" "$(command -v cargo)"
+[[ $(rustc --version) == 'rustc 1.95.0 '* ]] || exit 1
+[[ $(cargo --version) == 'cargo 1.95.0 '* ]] || exit 1
+[[ $(cargo clippy --version) == 'clippy 0.1.95 '* ]] || exit 1
 "$pg/initdb" -D "$work/data" --username=fixture_admin --no-locale --encoding=UTF8 --auth=trust >"$work/init.log"
 started=true
 "$pg/pg_ctl" -D "$work/data" -l "$work/server.log" -o "-k $work -h '' -c log_min_error_statement=panic -c log_error_verbosity=terse" -w start >/dev/null
@@ -39,15 +43,15 @@ CREATE TABLE app_catalog.secrets (value text);
 REVOKE ALL ON SCHEMA app_catalog FROM PUBLIC;
 REVOKE ALL ON app_catalog.secrets FROM PUBLIC;
 SQL
-"$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -f crates/siglake-query-server/src/history/schema.sql >>"$work/setup.log"
+"$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -f "$root/crates/siglake-query-server/src/history/schema.sql" >>"$work/setup.log"
 printf 'isolated-history-fixture-v1\n' > "$work/fixture-marker"
 export SIGLAKE_HISTORY_FIXTURE_DIR="$work"
 "$pg/postgres" --version
 cargo --version
 rustc --version
 cargo clippy --version
-timeout 600 cargo test --locked -p siglake-query-server --test history_redaction_logging
-timeout 600 cargo test --locked -p siglake-query-server --lib history:: -- --include-ignored --test-threads=1
+timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test history_redaction_logging
+timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --lib history:: -- --include-ignored --test-threads=1
 # Separate, fixed synthetic row proves a real server restart, not just a new pool.
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U qh_writer -d qh_fixture >"$work/restart.log" <<'SQL'
 WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now)

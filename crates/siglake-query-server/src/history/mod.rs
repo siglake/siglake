@@ -1,6 +1,11 @@
-//! Inert history foundations. No routes, startup tasks, audit cutover or runtime DDL.
+//! Internal history primitives and opt-in lifecycle object. No route/startup
+//! wiring, audit cutover, environment configuration or runtime DDL.
 pub mod redaction;
+mod runtime;
 mod store;
+pub use runtime::{
+    Delivery, HistoryHealth, HistoryService, LossReason, ObservationHandle, WRITE_BUDGET,
+};
 pub use store::{HistoryReader, HistoryWriter, StoredExecution, WriteResult};
 
 use crate::auth::CallerIdentity;

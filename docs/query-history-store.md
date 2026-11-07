@@ -1,6 +1,11 @@
-# Query history storage/privacy foundations (inert)
+# Query history storage/privacy foundations (not routed)
 
-This is M2 slice 2, **not usable query history**. `siglake_query_server::history`
+The [internal runtime core](query-history-runtime.md) now wraps these primitives
+when explicitly constructed (currently tests only); the storage/reader contract
+below is unchanged. Runtime scheduling, deadlines, retries and health are defined
+there, not in the bare store methods. No application startup/route is wired.
+
+This foundation is **not usable routed query history**. `siglake_query_server::history`
 exports internal Rust primitives only. Nothing calls these from routes/startup,
 creates a pool from environment, runs migrations, schedules cleanup, replaces
 legacy audit, or changes authentication. No console/public event-ingestion API.
@@ -101,16 +106,17 @@ then supply that tenant; no caller SQL/cursor/header may establish authority.
   when unknown; DB `admission_observed_at`/`finished_observed_at` record evidence
   persistence, **not original execution times**. Measured monotonic duration is
   separately nullable. Retries preserve observed timestamps and expiry.
-* `heartbeat`/`mark_indeterminate` are explicit primitives only; heartbeat lease
-  decisions, routing ownership and scheduling are later work. Recovery does not
+* `heartbeat`/`mark_indeterminate` are explicit primitives only; the internal
+  runtime core now owns bounded lease recovery and scheduling when constructed.
+  Routing ownership remains later integration work. Recovery does not
   pretend that a dead lease means execution failed/stopped. Coverage contains
   only tenant/bounded gap reason/window/expiry columns; there is no general
   telemetry service or collector here.
 
-If the history DB is down **before any trusted receipt exists**, the next
-lifecycle slice must preserve query availability, report unknown/gap coverage
-when possible, and not invent/backdate a recovery receipt or silently reset the
-30-day clock. This slice provides no local-time fallback. Store calls themselves
+If the history DB is down **before any trusted receipt exists**, the internal
+runtime core preserves query availability with a disabled/unobserved handle,
+reports known loss signals when possible, and never invents/backdates a recovery
+receipt or silently resets the 30-day clock. This slice provides no local-time fallback. Store calls themselves
 are not execution-availability policy: per-write 100ms deadlines, bounded retry
 queues/loss metrics and cancellation/stream/batch lifecycle ownership are not
 wired or claimed here. An unavailable store is an error, not an empty list.
@@ -148,9 +154,10 @@ ordered `FOR UPDATE SKIP LOCKED`, expiry indexes and a stable DB statement-time
 cutoff usable by the index. It deletes bounded batches of expired executions,
 coverage and stale unreferenced owners atomically. Failure rolls back, later
 explicit calls catch up. Return count is executions deleted, not total metadata
-or a guarantee that cleanup finished. **No sweeper is running today.** Startup
-catch-up, continuous ~60s scheduling, health/readiness/overdue-age reporting and
-bounded runtime deadlines remain slice 3.
+or a guarantee that cleanup finished. **No application/production sweeper is running today.** The internal runtime
+core provides startup catch-up, ~60s scheduling, health/readiness/overdue-age
+reporting and bounded deadlines only when explicitly constructed, currently in
+local tests.
 
 This deletes primary rows only, not secure disk erasure, WAL, long-lived MVCC
 snapshots, replicas, backups, final snapshots or historical raw audit/job copies.
@@ -169,6 +176,21 @@ binaries, creates its own fresh socket-only cluster/database/distinct roles,
 applies the migration only there, and trap-cleans only its own fixture. No
 DATABASE_URL, production target argument, Docker, downloads of images or cloud
 calls. The fixture marker and fixed database/role names guard ignored DB tests.
+
+The runner uses fresh private HOME/XDG/provider paths, explicit empty 0600
+PGPASSFILE and private HOME/.pgpass (including SQLx's fallback), cleared inherited
+PG defaults followed only by fixed synthetic socket/database settings, empty
+provider files and disabled AWS metadata discovery. Fixture construction uses
+`new_without_pgpass` plus explicit settings and checks isolation first; that
+constructor alone would NOT isolate PG environment defaults. The internal API
+accepts trusted already-constructed options and does not vouch for their
+provenance. Isolated Cargo state links only known registry caches for locked
+offline builds, never original Cargo config/credentials or HOME. Cargo launches
+from a private temporary cwd with explicit manifest; real HOME/worktree ancestor
+configuration is avoided, but root-/tmp-level configuration remains a trusted host
+assumption, not a filesystem sandbox. Earlier runs
+that retained real HOME are trust-limited; corrected full selected reruns are
+required. No actual passfile/provider configuration was inspected.
 
 The runner also verifies a persisted synthetic row across an actual PostgreSQL
 server restart with fsync enabled (not a power-loss/backup-restore test).
