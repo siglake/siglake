@@ -6443,6 +6443,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "async-compression",
  "async-stream",
  "async-trait",
  "axum",
@@ -6470,6 +6471,7 @@ dependencies = [
  "simd-json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "tower",
  "tower-http",
@@ -7493,19 +7495,14 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
- "async-compression",
  "base64 0.22.1",
  "bitflags 2.13.0",
  "bytes",
- "futures-core",
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "mime",
  "pin-project-lite",
- "tokio",
- "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

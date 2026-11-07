@@ -260,6 +260,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
         "413":
           description: Body exceeds the ingest body cap (env-tunable, 16 MiB by default).
         "429":
@@ -440,6 +448,14 @@ paths:
                 $ref: "#/components/schemas/SiglakeErrorBody"
         "403":
           description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
           content:
             application/json:
               schema:
@@ -736,6 +752,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
         "413":
           description: >-
             Body exceeds the ingest body cap (env-tunable via
@@ -768,7 +792,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
         "503":
-          description: "Shedding load: the memory circuit breaker tripped, the backpressure queue is full, or a novel tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane cap because recovery requires routing or operator action."
+          description: "Shedding load: the memory circuit breaker tripped, the backpressure queue is full, the gzip decode budget is exhausted (`SIGLAKE_INGEST_GZIP_DECODE_BUDGET_BYTES`), or a novel tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane cap because recovery requires routing or operator action."
           headers:
             retry-after:
               schema:
@@ -892,6 +916,14 @@ paths:
                 $ref: "#/components/schemas/SiglakeErrorBody"
         "403":
           description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
           content:
             application/json:
               schema:

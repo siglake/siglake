@@ -68,7 +68,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, watch, Mutex};
 use tonic::{Code, Request as TonicRequest, Response as TonicResponse, Status};
-use tower_http::decompression::RequestDecompressionLayer;
 
 use utoipa::OpenApi as _;
 use utoipa_axum::router::OpenApiRouter;
@@ -86,11 +85,27 @@ use siglake_wal::WalWriter;
 use siglake_wal::{PROCESSING_DIR, SEALED_DIR};
 
 pub mod backpressure;
+mod body_timeout;
+mod content_encoding;
 pub mod mem_guard;
 pub mod openapi_dto;
 pub mod otlp;
 pub mod otlp_traces;
 pub mod rate_limit;
+
+pub use body_timeout::DEFAULT_BODY_READ_TIMEOUT;
+pub use content_encoding::DEFAULT_GZIP_DECODE_BUDGET_BYTES;
+
+/// The `endpoint` label an ingest handler counts under, from the request path,
+/// for refusals made by a middleware before any handler runs.
+fn ingest_endpoint_label(path: &str) -> &'static str {
+    match path {
+        "/v1/logs" => "otlp",
+        "/v1/traces" => "otlp_traces",
+        p if p.ends_with("/_bulk") => "es_bulk",
+        _ => "other",
+    }
+}
 
 struct InFlightGuard {
     endpoint: &'static str,
@@ -1121,33 +1136,20 @@ fn ingest_routes() -> OpenApiRouter<AppState> {
 /// The OTLP/HTTP export routes, which also accept gzip request bodies.
 ///
 /// The OTLP specification requires every server to accept `Content-Encoding:
-/// gzip`, and the Collector's `otlphttp` exporter sends it by default. The spec
-/// also requires the body size to be limited *after* decompression. That half
-/// needs nothing here: [`axum::extract::DefaultBodyLimit`] is enforced by the
-/// `Bytes` extractor, which wraps the body it is given, and that body is the
-/// decoded stream. So the ingest body cap counts decoded bytes. A small body
-/// that inflates past the cap is a `413` once the cap is reached, and is never
-/// inflated whole. `gzip_cap_counts_decoded_bytes` pins that.
-///
-/// This is a `route_layer`, so the decoder runs inside the rate-limit and auth
-/// middlewares that [`router`] adds. A request they refuse is refused before any
-/// byte is inflated, and decoding is lazy: it happens as the handler reads the
-/// body. Only gzip is enabled, and the other codings are switched off by name,
-/// so a tower-http feature turned on elsewhere in the workspace cannot widen the
-/// set. Any other coding gets `415` with `Accept-Encoding: gzip`, instead of a
-/// misleading `400 invalid OTLP` from parsing compressed bytes. `identity`, or
-/// no header at all, passes through unchanged.
+/// gzip`, and the Collector's `otlphttp` exporter sends it by default. The
+/// decoding, the body cap on decoded bytes, and the budget that bounds how much
+/// a gzip burst can inflate at once are in [`content_encoding`]. This is a
+/// `route_layer`, so it runs inside the rate-limit and auth middlewares that
+/// [`router`] adds: a request they refuse is refused before any byte is
+/// inflated. Any coding other than `gzip` or `identity` gets `415` with
+/// `Accept-Encoding: gzip`.
 fn otlp_routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::default()
         .routes(routes!(post_otlp_logs))
         .routes(routes!(post_otlp_traces))
-        .route_layer(
-            RequestDecompressionLayer::new()
-                .gzip(true)
-                .no_deflate()
-                .no_br()
-                .no_zstd(),
-        )
+        .route_layer(middleware::from_fn(
+            content_encoding::otlp_content_encoding_middleware,
+        ))
 }
 
 /// The ES read surface: routed, answering `501`, and deliberately absent from
@@ -1208,6 +1210,12 @@ pub fn router(state: AppState) -> Router {
     let ingest = ingest_routes()
         .split_for_parts()
         .0
+        // Innermost of the three, so the body-read deadline starts once rate
+        // limiting and auth have passed the request (`body_timeout`).
+        .route_layer(middleware::from_fn_with_state(
+            body_timeout::BodyReadTimeout::from_env(),
+            body_timeout::body_read_timeout_middleware,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             ingest_auth_middleware,
@@ -1228,11 +1236,15 @@ pub fn router(state: AppState) -> Router {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(16 * 1024 * 1024);
+    // The OTLP routes' gzip gate (`content_encoding`). One per router, so the
+    // decode budget is per server, not per process.
+    let gzip_gate = content_encoding::GzipDecodeGate::from_env(body_limit, state.mem_guard.clone());
     public_routes()
         .split_for_parts()
         .0
         .merge(ingest)
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        .layer(axum::Extension(gzip_gate))
         // Per-request `tracing` span (http.method, http.uri, http.status).
         // With the OTel traces layer installed (`siglake_core::telemetry`), these
         // spans are forwarded as OTel spans automatically; no-op when OTel is off.
@@ -2577,6 +2589,9 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
             (env-tunable via `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). \
             A gzip body is measured after decompression. Rejected by the framework, \
             so the body is not the usual error envelope."),
+        (status = 408, description = "The request body did not arrive within the \
+            body-read timeout (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).",
+         body = SiglakeErrorBody),
         (status = 415, description = "`Content-Encoding` names a coding other \
             than `gzip` or `identity`. Rejected by the framework with an empty body.",
          headers(("accept-encoding" = String,
@@ -2584,8 +2599,9 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
         (status = 503, description = "Shedding load: the memory circuit breaker \
-            tripped, the backpressure queue is full, or a novel tenant/index key \
-            reached the persistent lane cap. Retry-After is omitted for the lane \
+            tripped, the backpressure queue is full, the gzip decode budget is \
+            exhausted (`SIGLAKE_INGEST_GZIP_DECODE_BUDGET_BYTES`), or a novel \
+            tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane \
             cap because recovery requires routing or operator action.",
          body = SiglakeErrorBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying; \
@@ -2729,6 +2745,9 @@ async fn post_otlp_logs(
         (status = 413, description = "Body exceeds the ingest body cap \
             (env-tunable, 16 MiB by default). A gzip body is measured after \
             decompression."),
+        (status = 408, description = "The request body did not arrive within the \
+            body-read timeout (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).",
+         body = SiglakeErrorBody),
         (status = 415, description = "`Content-Encoding` names a coding other \
             than `gzip` or `identity`. Rejected by the framework with an empty body.",
          headers(("accept-encoding" = String,
@@ -3382,6 +3401,9 @@ fn es_not_implemented(reason: impl Into<String>) -> ApiError {
             before.", body = SiglakeErrorBody),
         (status = 413, description = "Body exceeds the ingest body cap \
             (env-tunable, 16 MiB by default)."),
+        (status = 408, description = "The request body did not arrive within the \
+            body-read timeout (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).",
+         body = SiglakeErrorBody),
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
         (status = 503, description = "Transient load shedding, or a novel \
@@ -3458,6 +3480,9 @@ async fn post_es_bulk(
             `--max-tenants` and the resolved tenant is one it has not admitted \
             before.", body = SiglakeErrorBody),
         (status = 413, description = "Body exceeds the ingest body cap."),
+        (status = 408, description = "The request body did not arrive within the \
+            body-read timeout (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).",
+         body = SiglakeErrorBody),
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
         (status = 503, description = "Transient load shedding, or a novel \
