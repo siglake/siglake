@@ -260,6 +260,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
         "413":
           description: Body exceeds the ingest body cap (env-tunable, 16 MiB by default).
         "429":
@@ -440,6 +448,14 @@ paths:
                 $ref: "#/components/schemas/SiglakeErrorBody"
         "403":
           description: "Tenant refused: this ingester is single-tenant and the header named another tenant, or the header disagrees with (or the token lacks) the JWT tenant claim, or the resolved tenant is outside `--allowed-tenants`, or this ingester is at `--max-tenants` and the resolved tenant is one it has not admitted before."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
           content:
             application/json:
               schema:
@@ -632,6 +648,10 @@ paths:
         anything else — including a missing header — is decoded as protobuf.** The
         response echoes the request's format.
 
+        Either format may be sent with `Content-Encoding: gzip`, as the OTLP
+        specification requires. The body cap applies to the decompressed bytes, and
+        any other content coding is refused with `415`.
+
         The `x-siglake-*` and `x-scope-orgid` parameter names below are the values of
         the `INDEX_HEADER`, `COMMIT_HEADER` and `TENANT_HEADER` constants; the
         attribute needs literals, so `header_params_match_constants` pins them.
@@ -677,7 +697,7 @@ paths:
           - string
           - "null"
       requestBody:
-        description: OTLP `ExportLogsServiceRequest`.
+        description: "OTLP `ExportLogsServiceRequest`, optionally sent with `Content-Encoding: gzip`."
         content:
           application/json:
             schema:
@@ -713,7 +733,9 @@ paths:
         "400":
           description: >-
             Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header
-            value. Also `commit=force` when a remote drain consumes the mirrored WAL.
+            value. Also `commit=force` when a remote drain consumes the mirrored WAL. A corrupt
+            gzip stream is also `400`, but the framework rejects it while reading the body,
+            so its body is plain text rather than the usual error envelope.
           content:
             application/json:
               schema:
@@ -730,11 +752,26 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
         "413":
           description: >-
             Body exceeds the ingest body cap (env-tunable via
-            `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). Rejected by the framework, so the body is not the usual
-            error envelope.
+            `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). A gzip body is measured after decompression. Rejected by
+            the framework, so the body is not the usual error envelope.
+        "415":
+          description: "`Content-Encoding` names a coding other than `gzip` or `identity`. Rejected by the framework with an empty body."
+          headers:
+            accept-encoding:
+              schema:
+                type: string
+              description: "The accepted request content coding: `gzip`."
         "429":
           description: Rate limited.
           headers:
@@ -755,7 +792,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
         "503":
-          description: "Shedding load: the memory circuit breaker tripped, the backpressure queue is full, or a novel tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane cap because recovery requires routing or operator action."
+          description: "Shedding load: the memory circuit breaker tripped, the backpressure queue is full, the gzip decode budget is exhausted (`SIGLAKE_INGEST_GZIP_DECODE_BUDGET_BYTES`), or a novel tenant/index key reached the persistent lane cap. Retry-After is omitted for the lane cap because recovery requires routing or operator action."
           headers:
             retry-after:
               schema:
@@ -783,8 +820,9 @@ paths:
       description: |-
         Spans are stored as events in a traces index and are queryable both through
         SQL and through the Jaeger-compatible read API on the query server.
-        Content-type handling is identical to `POST /v1/logs`: JSON only when
-        `Content-Type` contains `application/json`, protobuf otherwise.
+        Content-type and content-coding handling are identical to `POST /v1/logs`:
+        JSON only when `Content-Type` contains `application/json`, protobuf
+        otherwise, and either may be sent with `Content-Encoding: gzip`.
       operationId: post_otlp_traces
       parameters:
       - name: commit
@@ -827,7 +865,7 @@ paths:
           - string
           - "null"
       requestBody:
-        description: OTLP `ExportTraceServiceRequest`.
+        description: "OTLP `ExportTraceServiceRequest`, optionally sent with `Content-Encoding: gzip`."
         content:
           application/json:
             schema:
@@ -863,7 +901,9 @@ paths:
         "400":
           description: >-
             Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header
-            value. Also `commit=force` when a remote drain consumes the mirrored WAL.
+            value. Also `commit=force` when a remote drain consumes the mirrored WAL. A corrupt
+            gzip stream is also `400`, but the framework rejects it while reading the body,
+            so its body is plain text rather than the usual error envelope.
           content:
             application/json:
               schema:
@@ -880,8 +920,25 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
+        "408":
+          description: >-
+            The request body did not arrive within the body-read timeout
+            (`SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS`, 30 s by default).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SiglakeErrorBody"
         "413":
-          description: Body exceeds the ingest body cap (env-tunable, 16 MiB by default).
+          description: >-
+            Body exceeds the ingest body cap (env-tunable, 16 MiB by default). A gzip body
+            is measured after decompression.
+        "415":
+          description: "`Content-Encoding` names a coding other than `gzip` or `identity`. Rejected by the framework with an empty body."
+          headers:
+            accept-encoding:
+              schema:
+                type: string
+              description: "The accepted request content coding: `gzip`."
         "429":
           description: Rate limited.
           headers:

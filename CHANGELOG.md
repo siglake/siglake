@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **OTLP/HTTP gzip:** `POST /v1/logs` and `POST /v1/traces` accept
+  `Content-Encoding: gzip`, as the OTLP specification requires, so the
+  Collector's `otlphttp` exporter works with its default `compression: gzip`.
+  The ingest body cap (`SIGLAKE_INGEST_MAX_BODY_BYTES`) counts decompressed
+  bytes, and every member of a multi-member gzip stream is decoded. Codings are
+  matched case-insensitively and `x-gzip` is `gzip`. Any other content coding,
+  or more than one `Content-Encoding` header, is `415` with `Accept-Encoding:
+  gzip`; previously it failed as an undecodable body with `400`. OTLP/gRPC still
+  refuses compressed requests; see `docs/LIMITATIONS.md`.
+- **Bounded gzip decoding:** gzip lets a small request inflate to the full body
+  cap, so decoding runs after rate limiting and authentication, a tripped memory
+  breaker refuses a gzip request before decoding it, and decoded gzip bytes in
+  flight share one budget per server (`SIGLAKE_INGEST_GZIP_DECODE_BUDGET_BYTES`,
+  default 128 MiB, never below one body cap). A request whose decoded bytes do
+  not fit is `503` with `Retry-After: 1`, counted in
+  `siglake_ingest_requests_total{status="503"}` and
+  `siglake_ingest_gzip_budget_rejected_total`. The budget counts decoded bytes,
+  not requests, so small gzip requests are rarely refused; parsing adds a
+  multiple of it on top.
+- **Body-read timeout:** every ingest route now cuts off a request body that has
+  not fully arrived within `SIGLAKE_INGEST_BODY_READ_TIMEOUT_SECS` (default 30;
+  `0` disables it) with `408`, counted in
+  `siglake_ingest_requests_total{status="408"}`. Before, a client that stopped
+  sending held its connection and buffered body indefinitely. The deadline
+  starts after rate limiting and authentication and covers only reading the
+  body, so a slow `commit=force` is not affected.
+
 ## 0.4.0
 
 - **Query correctness and bounded fallback:** empty records responses retain

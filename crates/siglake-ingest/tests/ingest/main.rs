@@ -6,6 +6,7 @@ mod fake_idp;
 mod lane_cap;
 mod mem_breaker_accounting;
 mod middleware_refusals;
+mod otlp_gzip;
 mod otlp_round_trip;
 mod readiness;
 mod redis_rate_budget;

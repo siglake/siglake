@@ -6443,6 +6443,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "arrow-array",
+ "async-compression",
  "async-stream",
  "async-trait",
  "axum",
@@ -6450,6 +6451,7 @@ dependencies = [
  "chrono",
  "criterion",
  "datafusion",
+ "flate2",
  "futures",
  "jsonwebtoken",
  "metrics",
@@ -6469,6 +6471,7 @@ dependencies = [
  "simd-json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "tower",
  "tower-http",

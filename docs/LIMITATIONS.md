@@ -17,6 +17,15 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   encodings; `otel.any_values` carries the typed, presence-preserving form for
   affected log values. Trace ingest keeps its existing scope and resource
   mapping; this log change does not claim trace-side fidelity.
+- **OTLP/gRPC does not accept compressed requests.** OTLP/HTTP accepts
+  `Content-Encoding: gzip`, but the gRPC listener is built without tonic's
+  `gzip` codec. A request sent with `grpc-encoding: gzip` is refused with
+  `UNIMPLEMENTED` ("Content is compressed with `gzip` which isn't supported").
+  The OTLP specification requires servers to accept gzip on both transports,
+  and the Collector's `otlp` exporter compresses by default, so a gRPC client
+  needs `compression: none` until this is done. The fix would enable tonic's
+  `gzip` feature and `accept_compressed` on both services. tonic already caps
+  the decompressed message at the decoding limit.
 - **The dependency rebase has matched historical performance evidence with
   explicit limits.** The October 11 pre-adoption/current comparison kept all
   21 median ratios below 2x, but four original absolute latency goals failed.
