@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **OTLP/HTTP gzip:** `POST /v1/logs` and `POST /v1/traces` accept
+  `Content-Encoding: gzip`, as the OTLP specification requires, so the
+  Collector's `otlphttp` exporter works with its default `compression: gzip`.
+  The ingest body cap (`SIGLAKE_INGEST_MAX_BODY_BYTES`) counts decompressed
+  bytes. Any other content coding is `415` with `Accept-Encoding: gzip`;
+  previously it failed as an undecodable body with `400`. Decoding runs after
+  rate limiting and authentication. OTLP/gRPC still refuses compressed
+  requests; see `docs/LIMITATIONS.md`.
+
 ## 0.4.0
 
 - **Query correctness and bounded fallback:** empty records responses retain

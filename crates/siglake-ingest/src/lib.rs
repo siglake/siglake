@@ -68,6 +68,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{broadcast, watch, Mutex};
 use tonic::{Code, Request as TonicRequest, Response as TonicResponse, Status};
+use tower_http::decompression::RequestDecompressionLayer;
 
 use utoipa::OpenApi as _;
 use utoipa_axum::router::OpenApiRouter;
@@ -1108,14 +1109,45 @@ fn public_routes() -> OpenApiRouter<AppState> {
 fn ingest_routes() -> OpenApiRouter<AppState> {
     OpenApiRouter::default()
         .routes(routes!(get_es_root, head_es_root))
-        .routes(routes!(post_otlp_logs))
-        .routes(routes!(post_otlp_traces))
+        .merge(otlp_routes())
         .routes(routes!(get_es_cluster_health))
         .routes(routes!(get_es_cluster_health_compat))
         .routes(routes!(post_es_bulk))
         .routes(routes!(post_es_bulk_with_index))
         .merge(es_read_stubs())
         .routes(routes!(get_stream))
+}
+
+/// The OTLP/HTTP export routes, which also accept gzip request bodies.
+///
+/// The OTLP specification requires every server to accept `Content-Encoding:
+/// gzip`, and the Collector's `otlphttp` exporter sends it by default. The spec
+/// also requires the body size to be limited *after* decompression. That half
+/// needs nothing here: [`axum::extract::DefaultBodyLimit`] is enforced by the
+/// `Bytes` extractor, which wraps the body it is given, and that body is the
+/// decoded stream. So the ingest body cap counts decoded bytes. A small body
+/// that inflates past the cap is a `413` once the cap is reached, and is never
+/// inflated whole. `gzip_cap_counts_decoded_bytes` pins that.
+///
+/// This is a `route_layer`, so the decoder runs inside the rate-limit and auth
+/// middlewares that [`router`] adds. A request they refuse is refused before any
+/// byte is inflated, and decoding is lazy: it happens as the handler reads the
+/// body. Only gzip is enabled, and the other codings are switched off by name,
+/// so a tower-http feature turned on elsewhere in the workspace cannot widen the
+/// set. Any other coding gets `415` with `Accept-Encoding: gzip`, instead of a
+/// misleading `400 invalid OTLP` from parsing compressed bytes. `identity`, or
+/// no header at all, passes through unchanged.
+fn otlp_routes() -> OpenApiRouter<AppState> {
+    OpenApiRouter::default()
+        .routes(routes!(post_otlp_logs))
+        .routes(routes!(post_otlp_traces))
+        .route_layer(
+            RequestDecompressionLayer::new()
+                .gzip(true)
+                .no_deflate()
+                .no_br()
+                .no_zstd(),
+        )
 }
 
 /// The ES read surface: routed, answering `501`, and deliberately absent from
@@ -2482,6 +2514,10 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
 /// anything else — including a missing header — is decoded as protobuf.** The
 /// response echoes the request's format.
 ///
+/// Either format may be sent with `Content-Encoding: gzip`, as the OTLP
+/// specification requires. The body cap applies to the decompressed bytes, and
+/// any other content coding is refused with `415`.
+///
 /// The `x-siglake-*` and `x-scope-orgid` parameter names below are the values of
 /// the `INDEX_HEADER`, `COMMIT_HEADER` and `TENANT_HEADER` constants; the
 /// attribute needs literals, so `header_params_match_constants` pins them.
@@ -2490,7 +2526,8 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
     path = "/v1/logs",
     tag = "otlp",
     request_body(
-        description = "OTLP `ExportLogsServiceRequest`.",
+        description = "OTLP `ExportLogsServiceRequest`, optionally sent with \
+            `Content-Encoding: gzip`.",
         content(
             (Vec<u8> = "application/x-protobuf"),
             (Vec<u8> = "application/json"),
@@ -2525,7 +2562,9 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
          )),
         (status = 400, description = "Undecodable body, or an invalid index, \
             commit-mode or `X-Scope-OrgID` header value. Also `commit=force` \
-            when a remote drain consumes the mirrored WAL.",
+            when a remote drain consumes the mirrored WAL. A corrupt gzip stream \
+            is also `400`, but the framework rejects it while reading the body, so \
+            its body is plain text rather than the usual error envelope.",
          body = SiglakeErrorBody),
         (status = 401, description = "Missing or invalid credentials.", body = SiglakeErrorBody),
         (status = 403, description = "Tenant refused: this ingester is \
@@ -2536,7 +2575,12 @@ fn mem_breaker_response(endpoint: &'static str) -> Response {
             before.", body = SiglakeErrorBody),
         (status = 413, description = "Body exceeds the ingest body cap \
             (env-tunable via `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). \
-            Rejected by the framework, so the body is not the usual error envelope."),
+            A gzip body is measured after decompression. Rejected by the framework, \
+            so the body is not the usual error envelope."),
+        (status = 415, description = "`Content-Encoding` names a coding other \
+            than `gzip` or `identity`. Rejected by the framework with an empty body.",
+         headers(("accept-encoding" = String,
+            description = "The accepted request content coding: `gzip`."))),
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
         (status = 503, description = "Shedding load: the memory circuit breaker \
@@ -2627,14 +2671,16 @@ async fn post_otlp_logs(
 ///
 /// Spans are stored as events in a traces index and are queryable both through
 /// SQL and through the Jaeger-compatible read API on the query server.
-/// Content-type handling is identical to `POST /v1/logs`: JSON only when
-/// `Content-Type` contains `application/json`, protobuf otherwise.
+/// Content-type and content-coding handling are identical to `POST /v1/logs`:
+/// JSON only when `Content-Type` contains `application/json`, protobuf
+/// otherwise, and either may be sent with `Content-Encoding: gzip`.
 #[utoipa::path(
     post,
     path = "/v1/traces",
     tag = "otlp",
     request_body(
-        description = "OTLP `ExportTraceServiceRequest`.",
+        description = "OTLP `ExportTraceServiceRequest`, optionally sent with \
+            `Content-Encoding: gzip`.",
         content(
             (Vec<u8> = "application/x-protobuf"),
             (Vec<u8> = "application/json"),
@@ -2669,7 +2715,9 @@ async fn post_otlp_logs(
          )),
         (status = 400, description = "Undecodable body, or an invalid index, \
             commit-mode or `X-Scope-OrgID` header value. Also `commit=force` \
-            when a remote drain consumes the mirrored WAL.",
+            when a remote drain consumes the mirrored WAL. A corrupt gzip stream \
+            is also `400`, but the framework rejects it while reading the body, so \
+            its body is plain text rather than the usual error envelope.",
          body = SiglakeErrorBody),
         (status = 401, description = "Missing or invalid credentials.", body = SiglakeErrorBody),
         (status = 403, description = "Tenant refused: this ingester is \
@@ -2679,7 +2727,12 @@ async fn post_otlp_logs(
             `--max-tenants` and the resolved tenant is one it has not admitted \
             before.", body = SiglakeErrorBody),
         (status = 413, description = "Body exceeds the ingest body cap \
-            (env-tunable, 16 MiB by default)."),
+            (env-tunable, 16 MiB by default). A gzip body is measured after \
+            decompression."),
+        (status = 415, description = "`Content-Encoding` names a coding other \
+            than `gzip` or `identity`. Rejected by the framework with an empty body.",
+         headers(("accept-encoding" = String,
+            description = "The accepted request content coding: `gzip`."))),
         (status = 429, description = "Rate limited.", body = RateLimitBody,
          headers(("retry-after" = u64, description = "Seconds to wait before retrying."))),
         (status = 503, description = "Transient load shedding, or a novel \

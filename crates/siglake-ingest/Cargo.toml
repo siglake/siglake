@@ -44,6 +44,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
 criterion = "0.5"
+# Gzipping OTLP/HTTP request bodies in the Content-Encoding tests.
+flate2 = "1"
 mimalloc = { version = "0.1", default-features = false }
 datafusion = { workspace = true }
 futures = { workspace = true }
