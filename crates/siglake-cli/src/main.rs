@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use datafusion::prelude::SessionContext;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshot};
 use object_store::path::Path as ObjectPath;
@@ -25,6 +25,13 @@ use siglake_wal::WalWriter;
 mod sql_client;
 
 const DEFAULT_OTLP_GRPC_LISTEN: &str = "0.0.0.0:4317";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum OidcProfile {
+    #[default]
+    Generic,
+    CognitoAccess,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -210,19 +217,28 @@ enum Command {
         auth_tokens: Option<String>,
         /// OIDC issuer URL for JWT verification (e.g.
         /// `https://cognito-idp.us-east-1.amazonaws.com/<pool-id>`).
-        /// When set together with `--oidc-audience`, every request must
+        /// In generic mode, with `--oidc-audience`, every request must
         /// carry a valid `Authorization: Bearer <jwt>`. Takes precedence
         /// over `--auth-tokens`.
         #[arg(long, env = "SIGLAKE_OIDC_ISSUER")]
         oidc_issuer: Option<String>,
-        /// OIDC audience (client ID) to validate in the JWT `aud` claim.
+        /// Expected generic OIDC `aud` claim. Not used by cognito-access.
         #[arg(long, env = "SIGLAKE_OIDC_AUDIENCE")]
         oidc_audience: Option<String>,
+        /// Explicit token contract; cognito-access requires a signed tenant
+        /// and client_id instead of the human app client's audience.
+        #[arg(
+            long,
+            value_enum,
+            default_value = "generic",
+            env = "SIGLAKE_INGEST_OIDC_PROFILE"
+        )]
+        oidc_profile: OidcProfile,
         /// JWT claim that carries the tenant. When set, the tenant comes from
         /// the VERIFIED token rather than the `X-Scope-OrgID` header, and a
         /// header naming a different tenant is refused.
         ///
-        /// Requires `--oidc-issuer` and `--oidc-audience`: the tenant comes
+        /// Requires `--oidc-issuer` (and `--oidc-audience` in generic mode): the tenant comes
         /// from a verified token, so with no verifier there is nothing to take
         /// it from. Setting it alone — with static `--auth-tokens`, with open
         /// auth, or with `--trust-scope-header` still routing on the header —
@@ -1415,6 +1431,7 @@ async fn run(cli: Cli) -> Result<()> {
             auth_tokens,
             oidc_issuer,
             oidc_audience,
+            oidc_profile,
             ingest_rate_per_sec,
             ingest_rate_burst,
             ingest_rate_redis_url,
@@ -1442,6 +1459,7 @@ async fn run(cli: Cli) -> Result<()> {
                 auth_tokens.as_deref(),
                 oidc_issuer.as_deref(),
                 oidc_audience.as_deref(),
+                oidc_profile,
                 ingest_rate_per_sec,
                 ingest_rate_burst,
                 ingest_rate_redis_url,
@@ -2667,6 +2685,7 @@ async fn run_ingest_server(
     auth_tokens: Option<&str>,
     oidc_issuer: Option<&str>,
     oidc_audience: Option<&str>,
+    oidc_profile: OidcProfile,
     ingest_rate_per_sec: f64,
     ingest_rate_burst: f64,
     ingest_rate_redis_url: Option<String>,
@@ -2686,7 +2705,9 @@ async fn run_ingest_server(
     // first startup side effect — the metrics listener, the WAL directory, the
     // catalog — rather than in the verifier branch a few hundred lines down,
     // which never ran for the case that mattered.
-    if let Some(err) = ingest_oidc_config_error(oidc_issuer, oidc_audience, oidc_tenant_claim) {
+    if let Some(err) =
+        ingest_profile_config_error(oidc_profile, oidc_issuer, oidc_audience, oidc_tenant_claim)
+    {
         bail!("{err}");
     }
     let oidc_tenant_claim = oidc_tenant_claim_from(oidc_tenant_claim);
@@ -2959,7 +2980,9 @@ async fn run_ingest_server(
     let tokens = auth_tokens
         .map(siglake_ingest::AuthTokens::from_csv)
         .filter(|t| !t.is_empty());
-    if ingest_auth_open_from(auth_tokens, oidc_issuer, oidc_audience) {
+    if oidc_profile == OidcProfile::Generic
+        && ingest_auth_open_from(auth_tokens, oidc_issuer, oidc_audience)
+    {
         tracing::warn!(
             "no `--auth-tokens` / SIGLAKE_AUTH_TOKENS supplied — ingest is open; \
              only safe inside a trusted network"
@@ -3118,38 +3141,46 @@ async fn run_ingest_server(
     );
     let remote_wal_drain =
         remote_wal_drain_from(std::env::var("SIGLAKE_REMOTE_WAL_DRAIN").ok().as_deref());
-    let oidc_verifier = match (oidc_issuer, oidc_audience) {
-        (Some(issuer), Some(audience)) => {
-            tracing::info!(issuer, audience, "ingest OIDC auth enabled");
-            let verifier = siglake_core::oidc::OidcVerifier::from_issuer(
-                issuer.to_string(),
-                audience.to_string(),
-            )
-            .await
-            .with_context(|| format!("OIDC discovery failed for issuer {issuer}"))?;
-            let verifier = match oidc_tenant_claim {
-                Some(claim) => {
-                    tracing::info!(claim, "ingest tenancy bound to a verified JWT claim");
-                    verifier.with_tenant_claim(claim)
-                }
-                None => {
-                    tracing::warn!(
-                        "ingest tenancy comes from the {} header only — any accepted credential \
-                         can write as any tenant. Set --oidc-tenant-claim on a shared cluster.",
-                        siglake_ingest::TENANT_HEADER
-                    );
-                    verifier
-                }
-            };
-            Some(verifier)
+    let oidc_verifier = if let Some(issuer) = oidc_issuer {
+        let verifier = match oidc_profile {
+            OidcProfile::Generic => {
+                siglake_core::oidc::OidcVerifier::from_issuer(
+                    issuer.to_string(),
+                    oidc_audience
+                        .expect("validated generic audience")
+                        .to_string(),
+                )
+                .await
+            }
+            OidcProfile::CognitoAccess => {
+                siglake_core::oidc::OidcVerifier::from_cognito_access_issuer(
+                    issuer.to_string(),
+                    oidc_tenant_claim
+                        .expect("validated access tenant claim")
+                        .to_string(),
+                )
+                .await
+            }
         }
-        // Both unreachable: `ingest_oidc_config_error` refused a half-set pair
-        // at entry, and a claim with no verifier with it. They stay as the
-        // exhaustive arms, not as the check.
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!("--oidc-issuer and --oidc-audience must both be set (or neither)");
-        }
-        (None, None) => None,
+        .with_context(|| format!("OIDC discovery failed for issuer {issuer}"))?;
+        tracing::info!(profile = ?oidc_profile, "ingest OIDC token contract enabled");
+        let verifier = match oidc_tenant_claim {
+            Some(claim) => {
+                tracing::info!(claim, "ingest tenancy bound to a verified JWT claim");
+                verifier.with_tenant_claim(claim)
+            }
+            None => {
+                tracing::warn!(
+                    "ingest tenancy comes from the {} header only — any accepted credential \
+                     can write as any tenant. Set --oidc-tenant-claim on a shared cluster.",
+                    siglake_ingest::TENANT_HEADER
+                );
+                verifier
+            }
+        };
+        Some(verifier)
+    } else {
+        None
     };
     // A tenant id is a client header, and each novel value mints a lane with an
     // open file, metric label values, and an Iceberg namespace downstream.
@@ -5548,6 +5579,25 @@ fn ingest_auth_open_from(
     !has_static_tokens && !has_oidc
 }
 
+/// Profile validation precedes all ingest startup side effects.
+fn ingest_profile_config_error(
+    profile: OidcProfile,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    tenant_claim: Option<&str>,
+) -> Option<&'static str> {
+    if profile == OidcProfile::Generic {
+        return ingest_oidc_config_error(issuer, audience, tenant_claim);
+    }
+    if issuer.is_none_or(|issuer| issuer.trim().is_empty()) {
+        return Some("--oidc-profile cognito-access requires --oidc-issuer");
+    }
+    if oidc_tenant_claim_from(tenant_claim).is_none() {
+        return Some("--oidc-profile cognito-access requires --oidc-tenant-claim");
+    }
+    None
+}
+
 /// Why the ingester refuses to start with this OIDC configuration, if it does.
 ///
 /// `--oidc-tenant-claim` says the tenant comes from a VERIFIED token. Without
@@ -7077,5 +7127,71 @@ mod inline_time_rebuild_cost_tests {
         assert_eq!(costs.time_group_counts.decoded_files, 6);
         assert_eq!(costs.time_group_counts.decoded_bytes, 600);
         assert_eq!(costs.json(false)["measurement"], "incomplete");
+    }
+}
+
+#[cfg(test)]
+mod cognito_profile_tests {
+    use super::*;
+
+    #[test]
+    fn ingest_profile_is_opt_in_and_requires_signed_tenancy_before_startup() {
+        let cli = Cli::try_parse_from(["siglake", "ingest-server"]).unwrap();
+        let Command::IngestServer { oidc_profile, .. } = cli.command else {
+            panic!("wrong command")
+        };
+        assert_eq!(oidc_profile, OidcProfile::Generic);
+        assert!(
+            Cli::try_parse_from(["siglake", "ingest-server", "--oidc-profile", "unknown"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "siglake",
+            "ingest-server",
+            "--oidc-profile",
+            "cognito-access",
+            "--oidc-issuer",
+            "https://issuer.invalid",
+            "--oidc-tenant-claim",
+            "org",
+        ])
+        .unwrap();
+        let Command::IngestServer {
+            oidc_profile,
+            oidc_issuer,
+            oidc_audience,
+            oidc_tenant_claim,
+            ..
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(oidc_profile, OidcProfile::CognitoAccess);
+        assert_eq!(
+            ingest_profile_config_error(
+                oidc_profile,
+                oidc_issuer.as_deref(),
+                oidc_audience.as_deref(),
+                oidc_tenant_claim.as_deref()
+            ),
+            None
+        );
+        for (issuer, claim) in [
+            (None, Some("org")),
+            (Some(""), Some("org")),
+            (Some("issuer"), None),
+            (Some("issuer"), Some("  ")),
+        ] {
+            assert!(
+                ingest_profile_config_error(OidcProfile::CognitoAccess, issuer, None, claim)
+                    .is_some()
+            );
+        }
+        assert!(ingest_profile_config_error(
+            OidcProfile::Generic,
+            Some("issuer"),
+            None,
+            Some("org")
+        )
+        .is_some());
     }
 }

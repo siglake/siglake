@@ -20959,6 +20959,7 @@ mod batch_lifecycle_tests {
     fn identity() -> CallerIdentity {
         CallerIdentity {
             subject: "lifecycle-test".into(),
+            provider_principal: None,
             email: None,
             tenant: None,
             coordinator: false,

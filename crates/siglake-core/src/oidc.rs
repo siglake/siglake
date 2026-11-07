@@ -6,17 +6,17 @@
 //! the cached keys (matched by `kid`); on cache miss or expiry the
 //! verifier refreshes the JWKS once and retries.
 //!
-//! Algorithms: RS256/RS384/RS512 + ES256/ES384 (whatever the IDP
-//! declares in the JWKS). HMAC algorithms are intentionally not
+//! Generic algorithms: RS256/RS384/RS512 + ES256/ES384. The explicit
+//! Cognito access-token profile pins RS256. HMAC algorithms are intentionally not
 //! accepted — they'd require a shared secret with the IDP which
 //! doesn't fit the BYOC story.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
-use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm, KeyOperations, PublicKeyUse};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -33,6 +33,7 @@ pub const JWKS_CACHE_TTL: Duration = Duration::from_secs(900); // 15 min
 pub struct OidcVerifier {
     issuer: String,
     audience: String,
+    cognito_access: bool,
     jwks_uri: String,
     http: reqwest::Client,
     cache: Arc<RwLock<JwksCache>>,
@@ -85,6 +86,7 @@ impl OidcVerifier {
         Self {
             issuer,
             audience,
+            cognito_access: false,
             jwks_uri,
             http,
             cache: Arc::new(RwLock::new(JwksCache {
@@ -96,10 +98,44 @@ impl OidcVerifier {
         }
     }
 
+    /// Explicit Cognito access-token contract. Discovery uses only the
+    /// operator's trusted issuer, never a submitted token's claims.
+    /// A tenant claim is mandatory; request boundaries still validate its value.
+    pub async fn from_cognito_access_issuer(
+        issuer: String,
+        tenant_claim: String,
+    ) -> Result<Self, OidcError> {
+        if issuer.trim().is_empty() || tenant_claim.trim().is_empty() {
+            return Err(OidcError::Config(
+                "Cognito access requires an issuer and tenant claim".into(),
+            ));
+        }
+        let mut verifier = Self::from_issuer(issuer, String::new()).await?;
+        verifier.cognito_access = true;
+        Ok(verifier.with_tenant_claim(tenant_claim))
+    }
+
+    /// Explicit access-token constructor for an operator-pinned JWKS endpoint.
+    pub fn with_cognito_access_jwks_uri(
+        issuer: String,
+        jwks_uri: String,
+        http: reqwest::Client,
+        tenant_claim: String,
+    ) -> Result<Self, OidcError> {
+        if issuer.trim().is_empty() || tenant_claim.trim().is_empty() {
+            return Err(OidcError::Config(
+                "Cognito access requires an issuer and tenant claim".into(),
+            ));
+        }
+        let mut verifier = Self::with_jwks_uri(issuer, String::new(), jwks_uri, http);
+        verifier.cognito_access = true;
+        Ok(verifier.with_tenant_claim(tenant_claim))
+    }
+
     /// Enable per-request tenant routing. `claim_name` is the name of
     /// the JWT claim that carries the tenant identifier. Callers
-    /// without that claim (or with an empty value) route to the
-    /// default IcebergContext.
+    /// without a usable claim must be refused by request boundaries; they
+    /// must never fall back to a default tenant.
     pub fn with_tenant_claim(mut self, claim_name: impl Into<String>) -> Self {
         let name = claim_name.into();
         self.tenant_claim = if name.is_empty() { None } else { Some(name) };
@@ -136,18 +172,80 @@ impl OidcVerifier {
             .kid
             .ok_or_else(|| OidcError::Malformed("JWT header missing `kid`".into()))?;
         let alg = header.alg;
+        if self.cognito_access && (alg != Algorithm::RS256 || !self.has_tenant_claim()) {
+            return Err(OidcError::Verify(
+                "Cognito access requires RS256 and tenant routing".into(),
+            ));
+        }
 
         let key = self.get_or_refresh(&kid).await?;
 
         let mut validation = Validation::new(alg);
         validation.set_issuer(&[&self.issuer]);
-        validation.set_audience(&[&self.audience]);
+        if self.cognito_access {
+            // Cognito access tokens identify clients via signed client_id, not
+            // the human client's audience (nor an optional resource audience).
+            validation.validate_aud = false;
+            validation.set_required_spec_claims(&["iss", "exp", "sub"]);
+            validation.validate_nbf = true;
+        } else {
+            validation.set_audience(&[&self.audience]);
+            // set_issuer/set_audience alone only check claims if present.
+            validation.set_required_spec_claims(&["iss", "aud", "exp"]);
+        }
         validation.validate_exp = true;
         validation.leeway = 30;
 
-        decode::<Claims>(token, &key, &validation)
-            .map(|d| d.claims)
-            .map_err(|e| OidcError::Verify(e.to_string()))
+        let mut claims = decode::<Claims>(token, &key, &validation)
+            .map_err(|e| OidcError::Verify(e.to_string()))?
+            .claims;
+        if self.cognito_access {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| OidcError::Verify("system clock before epoch".into()))?
+                .as_secs();
+            // jsonwebtoken does not enforce iat via required_spec_claims.
+            let iat = claims.extra.get("iat").and_then(serde_json::Value::as_u64);
+            if iat.is_none_or(|iat| iat > now.saturating_add(30)) || claims.sub.is_empty() {
+                return Err(OidcError::Verify(
+                    "invalid access token issue time or subject".into(),
+                ));
+            }
+            if claims.string_claim("iss") != Some(self.issuer.as_str()) {
+                return Err(OidcError::Verify(
+                    "expected the configured issuer string".into(),
+                ));
+            }
+            if claims
+                .extra
+                .get("nbf")
+                .is_some_and(|nbf| nbf.as_u64().is_none())
+            {
+                return Err(OidcError::Verify(
+                    "invalid access token not-before time".into(),
+                ));
+            }
+            if claims.string_claim("token_use") != Some("access") {
+                return Err(OidcError::Verify("expected an access token".into()));
+            }
+            let client_id = claims
+                .string_claim("client_id")
+                .filter(|id| !id.trim().is_empty() && id.len() <= 128)
+                .ok_or_else(|| OidcError::Verify("invalid access token client_id".into()))?;
+            // Keep tenant refusals at the existing request boundary (403),
+            // but never expose provider attribution for an unusable tenant.
+            if self
+                .extract_tenant(&claims)
+                .and_then(|tenant| crate::tenant::sanitize_tenant(&tenant))
+                .is_some()
+            {
+                claims.provider_principal = Some(VerifiedProviderPrincipal {
+                    issuer: self.issuer.clone(),
+                    client_id: client_id.to_string(),
+                });
+            }
+        }
+        Ok(claims)
     }
 
     async fn get_or_refresh(&self, kid: &str) -> Result<DecodingKey, OidcError> {
@@ -183,7 +281,7 @@ impl OidcVerifier {
             .await
             .map_err(|e| OidcError::Jwks(format!("parse JWKS: {e}")))?;
 
-        let keys = jwks_to_keys(&jwks)?;
+        let keys = jwks_to_keys(&jwks, self.cognito_access)?;
         let mut cache = self.cache.write().await;
         cache.keys = keys;
         cache.expires_at = Instant::now() + JWKS_CACHE_TTL;
@@ -191,13 +289,40 @@ impl OidcVerifier {
     }
 }
 
-fn jwks_to_keys(jwks: &JwkSet) -> Result<HashMap<String, DecodingKey>, OidcError> {
+fn jwks_to_keys(
+    jwks: &JwkSet,
+    cognito_access: bool,
+) -> Result<HashMap<String, DecodingKey>, OidcError> {
     let mut out = HashMap::new();
     for jwk in &jwks.keys {
         // Skip keys that aren't usable for verification or don't carry a kid.
         let Some(kid) = jwk.common.key_id.clone() else {
             continue;
         };
+        if cognito_access {
+            if !matches!(jwk.algorithm, AlgorithmParameters::RSA(_))
+                || jwk
+                    .common
+                    .key_algorithm
+                    .is_some_and(|alg| alg != KeyAlgorithm::RS256)
+                || jwk
+                    .common
+                    .public_key_use
+                    .as_ref()
+                    .is_some_and(|usage| *usage != PublicKeyUse::Signature)
+                || jwk
+                    .common
+                    .key_operations
+                    .as_ref()
+                    .is_some_and(|ops| !ops.contains(&KeyOperations::Verify))
+                || kid.is_empty()
+            {
+                continue;
+            }
+            if out.contains_key(&kid) {
+                return Err(OidcError::Jwks("ambiguous signing kid".into()));
+            }
+        }
         match &jwk.algorithm {
             AlgorithmParameters::RSA(_) | AlgorithmParameters::EllipticCurve(_) => {
                 let key =
@@ -229,9 +354,23 @@ pub struct Claims {
     pub scope: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+    // Never populated by deserialization, including a signed lookalike claim.
+    #[serde(skip)]
+    provider_principal: Option<VerifiedProviderPrincipal>,
+}
+
+/// Provider identity established by the explicit access-token contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedProviderPrincipal {
+    pub issuer: String,
+    pub client_id: String,
 }
 
 impl Claims {
+    pub fn provider_principal(&self) -> Option<&VerifiedProviderPrincipal> {
+        self.provider_principal.as_ref()
+    }
+
     /// Pull a string-valued claim out of either the named fields or
     /// the `extra` map. Used to look up the configured "tenant claim"
     /// (`tenant`, `tid`, `org_id`, …) on a per-deployment basis.
@@ -252,6 +391,8 @@ struct OidcMetadata {
 
 #[derive(Debug, Error)]
 pub enum OidcError {
+    #[error("invalid OIDC configuration: {0}")]
+    Config(String),
     #[error("malformed JWT: {0}")]
     Malformed(String),
     #[error("token verification failed: {0}")]
@@ -264,4 +405,64 @@ pub enum OidcError {
     UnknownKid(String),
     #[error("JWK conversion failed: {0}")]
     KeyConv(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rsa_jwk() -> serde_json::Value {
+        json!({"kty":"RSA", "kid":"test", "alg":"RS256", "use":"sig", "n":"AQAB", "e":"AQAB"})
+    }
+
+    #[test]
+    fn cognito_key_selection_rejects_incompatible_and_ambiguous_keys() {
+        let parse = |keys| serde_json::from_value::<JwkSet>(json!({"keys": keys})).unwrap();
+        assert!(jwks_to_keys(&parse(vec![rsa_jwk()]), true).is_ok());
+        for (field, value) in [
+            ("alg", json!("RS512")),
+            ("use", json!("enc")),
+            ("key_ops", json!(["sign"])),
+            ("kid", json!("")),
+        ] {
+            let mut key = rsa_jwk();
+            key[field] = value;
+            assert!(jwks_to_keys(&parse(vec![key.clone()]), true).is_err());
+            // Legacy constructors retain their existing generic key behavior.
+            assert!(jwks_to_keys(&parse(vec![key]), false).is_ok());
+        }
+        assert!(jwks_to_keys(&parse(vec![rsa_jwk(), rsa_jwk()]), true).is_err());
+        let mut key = rsa_jwk();
+        key["key_ops"] = json!(["verify"]);
+        assert!(jwks_to_keys(&parse(vec![key]), true).is_ok());
+    }
+
+    #[test]
+    fn deserialized_claims_cannot_fabricate_a_verified_principal() {
+        let claims: Claims = serde_json::from_value(json!({
+            "sub":"test", "client_id":"forged", "iss":"https://untrusted.invalid",
+            "provider_principal":{"issuer":"forged", "client_id":"forged"}
+        }))
+        .unwrap();
+        assert!(claims.provider_principal().is_none());
+    }
+
+    #[test]
+    fn access_constructor_requires_issuer_and_tenant_configuration() {
+        assert!(OidcVerifier::with_cognito_access_jwks_uri(
+            "https://issuer.invalid".into(),
+            "https://issuer.invalid/jwks".into(),
+            reqwest::Client::new(),
+            " ".into()
+        )
+        .is_err());
+        assert!(OidcVerifier::with_cognito_access_jwks_uri(
+            " ".into(),
+            "https://issuer.invalid/jwks".into(),
+            reqwest::Client::new(),
+            "org".into()
+        )
+        .is_err());
+    }
 }

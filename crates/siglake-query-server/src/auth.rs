@@ -20,7 +20,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
-use crate::oidc::{Claims, OidcVerifier};
+use crate::oidc::{Claims, OidcVerifier, VerifiedProviderPrincipal};
 use crate::AppState;
 
 /// Authentication configuration. Cheap to clone — internal state
@@ -108,6 +108,9 @@ pub struct CallerIdentity {
     /// a service account rather than the person who asked, and the handler needs
     /// to know it may take the tenant from the request body instead.
     pub coordinator: bool,
+    /// Available only for verified Cognito access tokens after tenant validation.
+    /// Headers, generic OIDC, static tokens and internal callers cannot set it.
+    pub provider_principal: Option<VerifiedProviderPrincipal>,
 }
 
 impl CallerIdentity {
@@ -117,15 +120,18 @@ impl CallerIdentity {
             email: None,
             tenant: None,
             coordinator: false,
+            provider_principal: None,
         }
     }
 
     fn from_claims(claims: Claims, tenant: Option<String>) -> Self {
+        let provider_principal = claims.provider_principal().cloned();
         Self {
             subject: claims.sub,
             email: claims.email,
             tenant,
             coordinator: false,
+            provider_principal,
         }
     }
 
@@ -139,6 +145,7 @@ impl CallerIdentity {
             email: None,
             tenant: None,
             coordinator: true,
+            provider_principal: None,
         }
     }
 
@@ -148,6 +155,7 @@ impl CallerIdentity {
             email: None,
             tenant: None,
             coordinator: false,
+            provider_principal: None,
         }
     }
 }
@@ -305,5 +313,16 @@ mod tests {
     fn labels() {
         assert_eq!(AuthConfig::open().label(), "open");
         assert_eq!(AuthConfig::from_tokens(["a"]).label(), "bearer");
+    }
+
+    #[test]
+    fn non_provider_credentials_never_fabricate_a_principal() {
+        for identity in [
+            CallerIdentity::anonymous(),
+            CallerIdentity::from_token("opaque"),
+            CallerIdentity::coordinator(),
+        ] {
+            assert!(identity.provider_principal.is_none());
+        }
     }
 }

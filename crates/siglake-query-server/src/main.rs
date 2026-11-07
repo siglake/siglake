@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use siglake_query_server::discovery::{self, PeerSource};
 use siglake_query_server::{
@@ -40,6 +40,13 @@ fn configure_server_query_scan_tuning(query_scan: QueryScanConfig) {
         file_cache_max_entries: query_scan.file_cache_max_entries,
         ordered_drain_buffer_bytes: query_scan.ordered_drain_buffer_bytes,
     }));
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum OidcProfile {
+    #[default]
+    Generic,
+    CognitoAccess,
 }
 
 #[derive(Parser, Debug)]
@@ -90,13 +97,23 @@ struct Cli {
     /// OIDC issuer URL. When set, the server discovers the JWKS via
     /// `<issuer>/.well-known/openid-configuration` and verifies every
     /// `Authorization: Bearer <jwt>` against it. Requires
-    /// `--oidc-audience`.
+    /// `--oidc-audience` in the default generic profile.
     #[arg(long, env = "SIGLAKE_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
-    /// Expected `aud` claim. Required when `--oidc-issuer` is set.
+    /// Expected `aud` claim for generic OIDC. Not used by cognito-access.
     #[arg(long, env = "SIGLAKE_OIDC_AUDIENCE")]
     oidc_audience: Option<String>,
+
+    /// Token contract: generic enforces audience; cognito-access requires
+    /// signed access-token client_id and a configured signed tenant claim.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "generic",
+        env = "SIGLAKE_QUERY_OIDC_PROFILE"
+    )]
+    oidc_profile: OidcProfile,
 
     /// Name of the JWT claim that carries the per-request tenant
     /// identifier. Setting it enables per-request multi-tenancy and
@@ -410,7 +427,8 @@ async fn run() -> Result<()> {
     let oidc_tenant_claim = oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref());
     let allowed_tenants = allowed_tenants_from(cli.allowed_tenants.as_deref())
         .map_err(|message| anyhow::anyhow!(message))?;
-    if let Some(message) = query_tenant_config_error(
+    if let Some(message) = query_oidc_config_error(
+        cli.oidc_profile,
         cli.oidc_issuer.as_deref(),
         cli.oidc_audience.as_deref(),
         oidc_tenant_claim,
@@ -468,28 +486,38 @@ async fn run() -> Result<()> {
     )
     .await?;
 
-    let auth = match (cli.oidc_issuer.as_deref(), cli.oidc_audience.as_deref()) {
-        (Some(issuer), Some(audience)) => {
-            let mut verifier = OidcVerifier::from_issuer(issuer.to_string(), audience.to_string())
+    let auth = if let Some(issuer) = cli.oidc_issuer.as_deref() {
+        let mut verifier = match cli.oidc_profile {
+            OidcProfile::Generic => {
+                OidcVerifier::from_issuer(
+                    issuer.to_string(),
+                    cli.oidc_audience
+                        .clone()
+                        .expect("validated generic audience"),
+                )
                 .await
-                .with_context(|| format!("oidc discovery for {issuer}"))?;
-            if let Some(claim) = oidc_tenant_claim {
-                verifier = verifier.with_tenant_claim(claim);
-                tracing::info!(claim, "per-request tenant routing enabled");
             }
-            AuthConfig::from_oidc(verifier)
+            OidcProfile::CognitoAccess => {
+                OidcVerifier::from_cognito_access_issuer(
+                    issuer.to_string(),
+                    oidc_tenant_claim
+                        .expect("validated access tenant claim")
+                        .to_string(),
+                )
+                .await
+            }
         }
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!("--oidc-issuer and --oidc-audience must both be set (or both unset)");
+        .with_context(|| format!("oidc discovery for {issuer}"))?;
+        if let Some(claim) = oidc_tenant_claim {
+            verifier = verifier.with_tenant_claim(claim);
+            tracing::info!(claim, "per-request tenant routing enabled");
         }
-        (None, None) => {
-            if oidc_tenant_claim.is_some() {
-                anyhow::bail!("--oidc-tenant-claim requires --oidc-issuer + --oidc-audience");
-            }
-            match cli.tokens.as_deref() {
-                Some(s) => AuthConfig::from_tokens(s.split(',')),
-                None => AuthConfig::open(),
-            }
+        tracing::info!(profile = ?cli.oidc_profile, "query OIDC token contract enabled");
+        AuthConfig::from_oidc(verifier)
+    } else {
+        match cli.tokens.as_deref() {
+            Some(s) => AuthConfig::from_tokens(s.split(',')),
+            None => AuthConfig::open(),
         }
     };
     if auth.is_open() {
@@ -802,6 +830,26 @@ fn allowed_tenants_from(
         allowed.insert(tenant);
     }
     Ok((!allowed.is_empty()).then_some(allowed))
+}
+
+/// Validate the explicit query-only access profile before any I/O.
+fn query_oidc_config_error(
+    profile: OidcProfile,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    tenant_claim: Option<&str>,
+    has_allowed_tenants: bool,
+) -> Option<&'static str> {
+    if profile == OidcProfile::Generic {
+        return query_tenant_config_error(issuer, audience, tenant_claim, has_allowed_tenants);
+    }
+    if issuer.is_none_or(|issuer| issuer.trim().is_empty()) {
+        return Some("--oidc-profile cognito-access requires --oidc-issuer");
+    }
+    if tenant_claim.is_none() {
+        return Some("--oidc-profile cognito-access requires --oidc-tenant-claim");
+    }
+    None
 }
 
 /// Report a query tenancy configuration the server cannot enforce.
@@ -1139,5 +1187,56 @@ mod tests {
         assert_eq!(missing_entries.file_cache_max_entries, None);
         assert_eq!(zero_bytes.file_cache_max_bytes, None);
         assert_eq!(zero_bytes.file_cache_max_entries, None);
+    }
+    #[test]
+    fn cognito_profile_is_explicit_and_requires_signed_tenancy() {
+        use super::{query_oidc_config_error, OidcProfile};
+        let cli = Cli::try_parse_from(["siglake-query-server"]).unwrap();
+        assert_eq!(cli.oidc_profile, OidcProfile::Generic);
+        assert!(
+            Cli::try_parse_from(["siglake-query-server", "--oidc-profile", "unknown"]).is_err()
+        );
+        for (issuer, claim) in [
+            (None, None),
+            (Some(""), Some("org")),
+            (Some("issuer"), None),
+        ] {
+            assert!(query_oidc_config_error(
+                OidcProfile::CognitoAccess,
+                issuer,
+                None,
+                claim,
+                false
+            )
+            .is_some());
+        }
+        assert_eq!(
+            query_oidc_config_error(
+                OidcProfile::CognitoAccess,
+                Some("issuer"),
+                None,
+                Some("org"),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            query_oidc_config_error(
+                OidcProfile::CognitoAccess,
+                Some("issuer"),
+                Some("human"),
+                Some("org"),
+                false
+            ),
+            None
+        );
+        assert!(query_oidc_config_error(
+            OidcProfile::Generic,
+            Some("issuer"),
+            None,
+            Some("org"),
+            false
+        )
+        .is_some());
     }
 }

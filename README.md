@@ -89,6 +89,7 @@ scripts/down.sh --keep-volumes
   [Kubernetes operator](https://docs.siglake.dev/operations/operator/)
 - [AWS deployment](deploy/aws/README.md)
 - [HTTP API](https://docs.siglake.dev/reference/http-api/)
+- [Cognito access-token verification and tenant identity](docs/COGNITO_ACCESS_AUTH.md)
 - [Claude and Codex via MCP](integrations/mcp/README.md)
 - [Grafana and Prometheus monitoring](https://docs.siglake.dev/operations/monitoring/)
 
