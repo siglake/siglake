@@ -157,7 +157,7 @@ where
 
 /// Scope includes observational history waits and fully buffered response
 /// rendering and independently owned body production. Native CPU work remains
-/// cooperative, not OS-preempted. Fanout/shards remain gated.
+/// cooperative, not OS-preempted. Fanout/coordinator shards remain gated.
 pub(crate) async fn run<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
@@ -168,7 +168,16 @@ pub(crate) async fn run<F>(
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
-    run_inner(authority, identity, caller, priority, false, false, future).await
+    run_inner(
+        authority,
+        identity,
+        caller,
+        priority,
+        false,
+        NativeResponse::Sql,
+        future,
+    )
+    .await
 }
 pub(crate) async fn run_handoff<F>(
     authority: Option<Arc<ControlsAuthority>>,
@@ -180,7 +189,16 @@ pub(crate) async fn run_handoff<F>(
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
-    run_inner(authority, identity, caller, priority, true, false, future).await
+    run_inner(
+        authority,
+        identity,
+        caller,
+        priority,
+        true,
+        NativeResponse::Sql,
+        future,
+    )
+    .await
 }
 /// Jaeger keeps native JSON, with fixed typed response-only metadata.
 pub(crate) async fn run_jaeger<F>(
@@ -197,10 +215,64 @@ where
         RequestLimits::default(),
         Priority::Interactive,
         false,
-        true,
+        NativeResponse::Jaeger,
         future,
     )
     .await
+}
+
+/// Direct external shards resolve their own identity. Coordinator forwarding is
+/// deliberately unsupported until the separately reviewed controlled wire exists.
+pub(crate) async fn run_shard<F>(
+    authority: Option<Arc<ControlsAuthority>>,
+    identity: CallerIdentity,
+    priority: Priority,
+    future: F,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+{
+    if authority.is_some() && identity.coordinator {
+        return Err(unsupported());
+    }
+    run_inner(
+        authority,
+        identity,
+        RequestLimits::default(),
+        priority,
+        false,
+        NativeResponse::Shard,
+        future,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum NativeResponse {
+    Sql,
+    Jaeger,
+    Shard,
+}
+impl NativeResponse {
+    fn timeout(
+        self,
+        error: ApiError,
+        budget: Duration,
+        started: Instant,
+        priority: Priority,
+    ) -> ApiError {
+        if matches!(self, Self::Shard)
+            && error.status == axum::http::StatusCode::GATEWAY_TIMEOUT
+            && error.msg == "query deadline exceeded"
+            && error.context.is_none()
+        {
+            let mut native = crate::sql::shard_timeout_error(budget, priority);
+            native.headers = error.headers;
+            native
+        } else {
+            jaeger_timeout(error, matches!(self, Self::Jaeger), budget, started)
+        }
+    }
 }
 
 async fn run_inner<F>(
@@ -209,7 +281,7 @@ async fn run_inner<F>(
     caller: RequestLimits,
     priority: Priority,
     handoff: bool,
-    jaeger: bool,
+    native: NativeResponse,
     future: F,
 ) -> Result<Response, ApiError>
 where
@@ -253,7 +325,7 @@ where
         }),
     )
     .await
-    .map_err(|error| jaeger_timeout(error, jaeger, initial_timeout, started))?;
+    .map_err(|error| native.timeout(error, initial_timeout, started, priority))?;
     let timeout = timeout(tier, &caller, policy);
     let controls = RequestControls {
         started,
@@ -276,14 +348,14 @@ where
         },
         timeout_opt_out_ignored: caller.circuit_breakers == Some(false),
     };
-    let headers = if jaeger {
-        Some(jaeger_headers(controls)?)
-    } else {
-        None
+    let headers = match native {
+        NativeResponse::Sql => None,
+        NativeResponse::Jaeger => Some(jaeger_headers(controls)?),
+        NativeResponse::Shard => Some(unestimated_headers(controls, priority)?),
     };
     if tokio::time::Instant::now() >= controls.deadline {
         return Err(with_headers(
-            jaeger_timeout(expired(), jaeger, timeout, started),
+            native.timeout(expired(), timeout, started, priority),
             &headers,
         ));
     }
@@ -321,7 +393,7 @@ where
                 Ok(response)
             }
             Err(error) => {
-                let mut error = jaeger_timeout(error, true, timeout, started);
+                let mut error = native.timeout(error, timeout, started, priority);
                 error.headers.extend(headers);
                 Err(error)
             }
@@ -366,9 +438,18 @@ fn with_headers(
 fn jaeger_headers(
     c: RequestControls,
 ) -> Result<Vec<(axum::http::HeaderName, axum::http::HeaderValue)>, ApiError> {
+    unestimated_headers(c, Priority::Interactive)
+}
+fn unestimated_headers(
+    c: RequestControls,
+    priority: Priority,
+) -> Result<Vec<(axum::http::HeaderName, axum::http::HeaderValue)>, ApiError> {
     use super::dto::*;
     let invalid = || ApiError::service_unavailable("query_controls_metadata_unavailable");
     let mut warnings = WarningSet::default();
+    if c.timeout_opt_out_ignored {
+        warnings.insert(WarningCode::TimeoutOptOutIgnored);
+    }
     warnings.insert(WarningCode::ScanEstimateUnavailable);
     if c.scan_warning.is_some() {
         warnings.insert(WarningCode::ScanThresholdNotEvaluated);
@@ -377,7 +458,10 @@ fn jaeger_headers(
         state: c.state,
         policy_revision: c.revision,
         operator_generation: c.generation,
-        priority: ControlPriority::Interactive,
+        priority: match priority {
+            Priority::Interactive => ControlPriority::Interactive,
+            Priority::Batch => ControlPriority::Batch,
+        },
         mode: SelectedMode::Request,
         scope: ControlScope::Request,
         mandatory_timeout: true,

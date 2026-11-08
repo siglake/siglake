@@ -592,16 +592,16 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
         status(&dist.base, &token, route, json!({"query":"SELECT sum(length(raw)) AS total FROM events", "dry_run":route.ends_with("distributed")}), StatusCode::SERVICE_UNAVAILABLE).await;
     }
     assert_eq!(dispatches.load(Ordering::SeqCst), 0);
-    for credential in [&token, "synthetic-coordinator"] {
-        status(
-            &dist.base,
-            credential,
-            "/api/v1/sql/shard",
-            json!({"query":"SELECT raw FROM events", "tenant":"foreign"}),
-            StatusCode::SERVICE_UNAVAILABLE,
-        )
-        .await;
-    }
+    // Controlled coordinator shards still refuse before work; ordinary direct
+    // shards now resolve their own identity (covered by shard_controls).
+    status(
+        &dist.base,
+        "synthetic-coordinator",
+        "/api/v1/sql/shard",
+        json!({"query":"SELECT raw FROM events", "tenant":"foreign"}),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
     // Unsafe checkout must deny before cache/execution for both named and open
     // callers. No stale health latch, role bypass or policy-negative caching.
     let generic = serve(
@@ -920,3 +920,5 @@ async fn real_signed_explicit_distributed_batch_refuses_before_work_not_handoff(
 
 #[path = "jaeger_controls.rs"]
 mod jaeger_controls;
+#[path = "shard_controls.rs"]
+mod shard_controls;

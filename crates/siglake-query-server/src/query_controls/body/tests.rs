@@ -476,3 +476,113 @@ async fn terminal_arbiter_checks_original_deadline_and_preserves_first_committed
     tokio::time::advance(Duration::from_secs(1)).await;
     assert_eq!(delivered.finish(TIMEOUT), DELIVERED);
 }
+
+#[tokio::test]
+async fn buffered_arrow_never_polled_slow_and_dropped_bodies_release_backing_and_join_without_suffix(
+) {
+    struct Backing {
+        bytes: Vec<u8>,
+        live: Arc<AtomicUsize>,
+    }
+    impl AsRef<[u8]> for Backing {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    impl Drop for Backing {
+        fn drop(&mut self) {
+            self.live.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    let payload = "x".repeat(CHUNK_BYTES * 12);
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(vec![payload.as_str()])) as ArrayRef],
+    )
+    .unwrap();
+    let native = crate::format::batches_to_arrow_ipc(&[batch]).unwrap();
+    assert!(native.len() > CHUNK_BYTES * 4);
+    for mode in ["never", "slow", "drop", "success"] {
+        let tasks = BodyTasks::default();
+        let live = Arc::new(AtomicUsize::new(1));
+        let budget = if mode == "success" {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(100)
+        };
+        let controls = test_controls(budget);
+        let started = std::time::Instant::now();
+        // Preparation spends the same original clock before buffered delivery.
+        if mode != "success" {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let mut response = Response::new(Body::from(Bytes::from_owner(Backing {
+            bytes: native.clone(),
+            live: live.clone(),
+        })));
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            "application/vnd.apache.arrow.stream".parse().unwrap(),
+        );
+        let response = tasks
+            .reserve()
+            .unwrap()
+            .start(response, controls, None)
+            .unwrap();
+        assert_eq!(
+            response.headers()[CONTENT_TYPE],
+            "application/vnd.apache.arrow.stream"
+        );
+        let mut body = response.into_body().into_data_stream();
+        if mode == "success" {
+            let mut actual = Vec::new();
+            while let Some(chunk) = body.next().await {
+                actual.extend_from_slice(&chunk.unwrap());
+            }
+            assert_eq!(
+                actual, native,
+                "no Arrow JSON suffix/marker or batching change"
+            );
+        } else if mode == "drop" {
+            drop(body);
+            body = Body::empty().into_data_stream();
+        } else {
+            if mode == "slow" {
+                assert_eq!(
+                    &body.next().await.unwrap().unwrap()[..],
+                    &native[..CHUNK_BYTES]
+                );
+            }
+            tokio::time::timeout(Duration::from_millis(600), async {
+                while live.load(Ordering::SeqCst) != 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                body.next().await.unwrap().is_err(),
+                "Arrow expiry terminates transport, never appends JSON"
+            );
+            assert!(body.next().await.is_none());
+        }
+        // Shutdown is the confirmation boundary, not an assumed Drop join.
+        tokio::time::timeout(Duration::from_millis(600), tasks.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert_eq!(registered(&tasks), 0);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        eprintln!(
+            "buffered Arrow {mode} backing release and join observed at {:?}",
+            started.elapsed()
+        );
+        drop(body);
+    }
+}

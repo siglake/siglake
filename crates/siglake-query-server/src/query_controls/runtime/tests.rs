@@ -607,3 +607,239 @@ async fn jaeger_timeout_adapter_preserves_native_budget_and_generic_errors() {
     assert_eq!(unavailable.msg, "query_policy_unavailable");
     assert!(unavailable.context.is_none());
 }
+
+#[tokio::test]
+async fn shard_timeout_adapter_preserves_exact_native_body_and_does_not_change_sql_or_jaeger() {
+    for budget in [
+        Duration::ZERO,
+        Duration::from_millis(10),
+        Duration::from_secs(1),
+    ] {
+        for priority in [Priority::Interactive, Priority::Batch] {
+            let expected = crate::sql::shard_timeout_error(budget, priority);
+            for scenario in 0..3 {
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(5);
+                if scenario == 0 {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let error = until(deadline, async {
+                    if scenario == 1 {
+                        std::thread::sleep(Duration::from_millis(10));
+                        return Err::<(), _>(ApiError::internal("late-native-error"));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+                let native = NativeResponse::Shard.timeout(error, budget, Instant::now(), priority);
+                assert_eq!(native.status, expected.status);
+                assert_eq!(native.msg, expected.msg);
+                assert_eq!(native.context, expected.context);
+                assert!(
+                    native.context.is_none(),
+                    "shard must not gain SQL/Jaeger cost"
+                );
+            }
+        }
+    }
+    let native = NativeResponse::Shard.timeout(
+        crate::sql::shard_timeout_error(Duration::from_secs(1), Priority::Interactive),
+        Duration::from_secs(3),
+        Instant::now(),
+        Priority::Interactive,
+    );
+    assert_eq!(native.msg, "shard exceeded its wall-clock budget of 1s");
+    for error in [ApiError::bad_request("native-invalid-sql"), unavailable()] {
+        let status = error.status;
+        let msg = error.msg.clone();
+        let result = NativeResponse::Shard.timeout(
+            error,
+            Duration::from_secs(1),
+            Instant::now(),
+            Priority::Interactive,
+        );
+        assert_eq!(result.status, status);
+        assert_eq!(result.msg, msg);
+    }
+    assert_eq!(
+        NativeResponse::Sql
+            .timeout(
+                expired(),
+                Duration::from_secs(1),
+                Instant::now(),
+                Priority::Interactive
+            )
+            .msg,
+        "query deadline exceeded"
+    );
+}
+#[test]
+fn shard_headers_exact_order_unavailable_estimate_false_optout_and_encoding_failure() {
+    let c = RequestControls {
+        revision: Some(8),
+        state: PolicyState::Applied,
+        scan_warning: Some(1),
+        timeout_opt_out_ignored: true,
+        ..snapshot(Duration::from_secs(1))
+    };
+    let h = unestimated_headers(c, Priority::Batch).unwrap();
+    assert_eq!(h[0].1, "v=1;state=applied;rev=8;gen=1;priority=batch;mode=request;scope=request;mandatory=1;timeout_ms=1000;output_rows=na;output_enforced=0;scan_warning=1;estimate=unavailable;exact=na;estimated_bytes=na");
+    assert_eq!(
+        h[1].1,
+        "timeout_opt_out_ignored,scan_estimate_unavailable,scan_threshold_not_evaluated"
+    );
+    assert_eq!(
+        unestimated_headers(RequestControls { generation: 0, ..c }, Priority::Batch)
+            .unwrap_err()
+            .msg,
+        "query_controls_metadata_unavailable"
+    );
+}
+
+#[tokio::test]
+#[ignore = "owned primary fixture; check-query-policy.sh"]
+async fn shard_primary_precedes_work_original_clock_zero_false_and_coordinator_guard() {
+    use crate::query_controls::{ConnectionBounds, PolicyConfig};
+    let socket = std::path::PathBuf::from(
+        std::env::var("SIGLAKE_POLICY_FIXTURE_DIR").expect("use check-query-policy.sh"),
+    );
+    assert!(
+        socket.starts_with("/tmp")
+            && socket
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("siglake-policy-")
+    );
+    assert_eq!(
+        std::fs::read_to_string(socket.join("fixture-marker")).unwrap(),
+        "new-owned-policy-fixture-v1\n"
+    );
+    let reader = Arc::new(
+        PolicyReader::connect(
+            PolicyConfig::reader(
+                &format!(
+                    "postgres://qp_reader:@{}:5432/qh_fixture?sslmode=disable",
+                    socket.to_str().unwrap().replace('/', "%2F")
+                ),
+                ConnectionBounds {
+                    max_connections: 1,
+                    operation_timeout: Duration::from_secs(2),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let limits = ServerLimits::default();
+    let authority = Arc::new(ControlsAuthority::new(reader.clone(), &limits, 1).unwrap());
+    for caller in [
+        RequestLimits {
+            timeout_seconds: Some(0),
+            circuit_breakers: Some(false),
+            ..Default::default()
+        },
+        RequestLimits::default(),
+    ] {
+        let start = if caller.timeout_seconds == Some(0) {
+            Instant::now()
+        } else {
+            Instant::now() - limits.interactive.default_timeout
+        };
+        let error = ingress(
+            start,
+            run_inner(
+                Some(authority.clone()),
+                CallerIdentity::default(),
+                caller,
+                Priority::Interactive,
+                false,
+                NativeResponse::Shard,
+                async { panic!("expired before primary/work") },
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, 504);
+        assert!(error
+            .msg
+            .starts_with("shard exceeded its wall-clock budget of "));
+        assert!(error.context.is_none());
+    }
+    let error = ingress(
+        Instant::now(),
+        run_inner(
+            Some(authority.clone()),
+            CallerIdentity::default(),
+            RequestLimits {
+                circuit_breakers: Some(false),
+                ..Default::default()
+            },
+            Priority::Interactive,
+            false,
+            NativeResponse::Shard,
+            async {
+                let c = current().unwrap();
+                assert!(c.timeout_opt_out_ignored);
+                // Immediately-ready empty work that crosses the original clock cannot
+                // commit success, even if optional breakers are off.
+                let mut short = c;
+                short.deadline = tokio::time::Instant::now();
+                body_scope(
+                    short,
+                    phase(async { Ok(Response::new(axum::body::Body::empty())) }),
+                )
+                .await
+            },
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.status, 504);
+    assert!(error
+        .headers
+        .iter()
+        .any(|(n, v)| n == "x-siglake-query-warnings"
+            && v.to_str().unwrap().starts_with("timeout_opt_out_ignored,")));
+    reader.close();
+    let error = ingress(
+        Instant::now(),
+        run_shard(
+            Some(authority.clone()),
+            CallerIdentity::default(),
+            Priority::Interactive,
+            async { panic!("closed primary before work") },
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.msg, "query_policy_unavailable");
+    let error = run_shard(
+        Some(authority.clone()),
+        CallerIdentity {
+            coordinator: true,
+            ..Default::default()
+        },
+        Priority::Interactive,
+        async { panic!("unsupported coordinator before policy/work") },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.msg, "query_controls_path_unavailable");
+    let response = run_shard(
+        None,
+        CallerIdentity {
+            coordinator: true,
+            ..Default::default()
+        },
+        Priority::Interactive,
+        async { Ok(Response::new(axum::body::Body::empty())) },
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), 200);
+    authority.shutdown().await;
+}

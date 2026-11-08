@@ -63,6 +63,14 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   refused and takes the ordinary plan. The qualification protocol is in
   [`DESIGN_numeric_topk.md`](DESIGN_numeric_topk.md) and `SIGLAKE_NUMERIC_TOPK=0`
   turns the route off at process startup.
+- **Query controls remain injection-only and incomplete.** Ordinary external
+  SQL shards now resolve their own fresh primary controls and retain the original
+  deadline through Arrow/body production. Configured coordinator-authenticated
+  shards still refuse before work: trusted controlled wire/fanout/expiry/skew is
+  not implemented. No production activation or global Arrow output/scan-byte cap
+  is implied. Native library work is cooperative, not OS-preempted; synchronous
+  Drop is abort-only, not joined cleanup. See
+  [the bounded slice 4A contract](query-controls-shard-arrow.md).
 - **The persistent ingest lane cap has no timed reclamation.** Once
   `ingester.maxLanes` admits a `(tenant, index)` lane, an empty queue does not
   release its slot; only process shutdown drains the map. A novel key past the

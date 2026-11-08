@@ -1,5 +1,10 @@
 # Query controls: injection-only buffered/body Slices 2A–2B
 
+This is the historical 2A–2B slice boundary. Later accepted jobs/Jaeger work
+supersedes its corresponding temporary guards; ordinary direct shard coverage
+and the remaining coordinator refusal are documented in
+[query-controls-shard-arrow.md](query-controls-shard-arrow.md).
+
 **Not production enablement or complete enforcement.** There is no env/CLI/main
 activation, customer UI, effective endpoint or successful applied/enforced response
 metadata. `AppState::new` has no authority and preserves legacy behavior, including

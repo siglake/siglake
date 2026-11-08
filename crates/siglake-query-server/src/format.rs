@@ -47,18 +47,25 @@ pub enum QueryFormat {
 /// needs a schema, so callers pass batches that share one; an empty slice
 /// yields empty bytes (the reader then produces no batches).
 pub fn batches_to_arrow_ipc(batches: &[RecordBatch]) -> Result<Vec<u8>> {
+    crate::query_controls::runtime::render_check()?;
     let Some(schema) = batches.first().map(|b| b.schema()) else {
         return Ok(Vec::new());
     };
     let mut buf = Vec::new();
     {
-        let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &schema)
+        // Preserve IPC batches and bytes. Checks surround each existing batch
+        // and bounded sink fragment, not an invented wire-level row chunking.
+        // Native Arrow conversion/allocation within a call is not preemptible.
+        let mut w = arrow::ipc::writer::StreamWriter::try_new(CheckedWriter(&mut buf), &schema)
             .context("arrow ipc writer")?;
         for b in batches {
+            crate::query_controls::runtime::render_check()?;
             w.write(b).context("arrow ipc write")?;
+            crate::query_controls::runtime::render_check()?;
         }
         w.finish().context("arrow ipc finish")?;
     }
+    crate::query_controls::runtime::render_check()?;
     Ok(buf)
 }
 
@@ -1896,5 +1903,75 @@ mod controlled_render_tests {
             assert!(checked_json(&Late).is_err());
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod controlled_arrow_tests {
+    use super::*;
+    use crate::query_controls::runtime::{body_scope, test_controls};
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::{sync::Arc, time::Duration};
+    #[tokio::test]
+    async fn arrow_checked_writer_preserves_exact_ipc_batches_schema_values_and_refuses_expired_empty(
+    ) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, true),
+            Field::new("v", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("x"), Some("y")])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let batches = vec![batch.clone(), batch];
+        let mut baseline = Vec::new();
+        {
+            let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut baseline, &schema).unwrap();
+            for b in &batches {
+                w.write(b).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        let actual = body_scope(test_controls(Duration::from_secs(1)), async {
+            batches_to_arrow_ipc(&batches).unwrap()
+        })
+        .await;
+        assert_eq!(actual, baseline);
+        assert_eq!(arrow_ipc_to_batches(&actual).unwrap(), batches);
+        body_scope(test_controls(Duration::ZERO), async {
+            assert!(batches_to_arrow_ipc(&[]).is_err());
+            assert!(batches_to_arrow_ipc(&batches).is_err());
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn arrow_native_writer_late_ready_sink_is_refused_at_next_fragment_without_preemption() {
+        struct Late;
+        impl Write for Late {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let schema = Schema::new(vec![Field::new("v", DataType::Utf8, true)]);
+        let started = std::time::Instant::now();
+        body_scope(test_controls(Duration::from_millis(5)), async {
+            let result = arrow::ipc::writer::StreamWriter::try_new(CheckedWriter(Late), &schema);
+            assert!(
+                result.is_err(),
+                "late-ready native write cannot produce success"
+            );
+        })
+        .await;
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

@@ -12005,20 +12005,20 @@ pub(crate) fn request_timeout_error(
 ///
 /// Separate from [`request_timeout_error`] on purpose: the shard answers a bare
 /// 504 rather than the cost-carrying `ApiError::timeout` body, because it has no
-/// `CostReport` (`estimate()` is deliberately not run per shard) and its caller
-/// is the coordinator, which reads the status, not the body.
-fn shard_timeout_error(resolved: &ResolvedLimits) -> ApiError {
+/// `CostReport` (`estimate()` is deliberately not run per shard). Direct callers
+/// retain this same native body; coordinator callers primarily read the status.
+pub(crate) fn shard_timeout_error(timeout: std::time::Duration, priority: Priority) -> ApiError {
     metrics::counter!(
         "siglake_query_breaker_trips_total",
         "breaker" => "shard_timeout",
-        "priority" => resolved.priority.label()
+        "priority" => priority.label()
     )
     .increment(1);
     ApiError::new_status(
         axum::http::StatusCode::GATEWAY_TIMEOUT,
         format!(
             "shard exceeded its wall-clock budget of {}s",
-            resolved.timeout.as_secs()
+            timeout.as_secs()
         ),
     )
 }
@@ -18900,15 +18900,22 @@ pub async fn shard(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<ShardQueryRequest>,
 ) -> Result<Response, ApiError> {
-    if state.query_controls.is_some() {
-        return Err(crate::query_controls::runtime::unsupported());
-    }
-    let execution_id = siglake_storage::QueryExecutionId::next();
-    siglake_storage::with_query_execution_id(
-        execution_id,
-        history_buffered::observe_shard(state, identity, req, |state, identity, req| {
-            Box::pin(shard_scoped(state, identity, req))
-        }),
+    crate::query_controls::runtime::run_shard(
+        state.query_controls.clone(),
+        identity.clone(),
+        req.priority,
+        async move {
+            let execution_id = siglake_storage::QueryExecutionId::next();
+            siglake_storage::with_query_execution_id(
+                execution_id,
+                history_buffered::observe_shard(state, identity, req, |state, identity, req| {
+                    Box::pin(crate::query_controls::runtime::phase(shard_scoped(
+                        state, identity, req,
+                    )))
+                }),
+            )
+            .await
+        },
     )
     .await
 }
@@ -18930,7 +18937,8 @@ async fn shard_scoped(
     // governs total cost. Workers only serve interactive shards (the transparent
     // path skips coordination for Batch), so the interactive tier is correct.
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&RequestLimits::default(), req.priority, &tier);
+    let resolved =
+        crate::query_controls::runtime::resolve(&RequestLimits::default(), req.priority, &tier);
     // WALL-CLOCK BUDGET, ANCHORED AT REQUEST ARRIVAL.
     //
     // The 504 this endpoint's OpenAPI list documents used to be armed only
@@ -18941,21 +18949,37 @@ async fn shard_scoped(
     // collect, outliving the coordinator waiting on it and holding pool bytes
     // the whole way. Same defect as #1526 on the local path, different endpoint.
     //
-    // One instant, taken here, covers every phase below. Unconditional: the
-    // shard path resolves from `RequestLimits::default()`, so `circuit_breakers`
-    // is always on and the collect timeout was unconditional too.
-    let deadline = tokio::time::Instant::now() + resolved.timeout;
+    // Configured controls retain the original authenticated ingress, including
+    // policy/history waits. Absent authority preserves the legacy worker clock.
+    // Time is unconditional, independent of optional scan circuit breakers.
+    let deadline = crate::query_controls::runtime::current()
+        .map(|c| c.deadline)
+        .unwrap_or_else(|| tokio::time::Instant::now() + resolved.timeout);
     macro_rules! under_shard_deadline {
+        ($point:ident, $future:expr) => {
+            under_shard_deadline!(async {
+                #[cfg(test)]
+                shard_controls_tests::checkpoint(shard_controls_tests::Point::$point).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(shard_timeout_error(resolved.timeout, resolved.priority));
+                }
+                $future.await
+            })
+        };
         ($future:expr) => {{
             // Pre-poll check, like `apply_timeout`: `timeout_at` polls once
             // before consulting the clock, so an already-ready metadata path
             // would otherwise turn an exhausted budget into a success.
             if tokio::time::Instant::now() >= deadline {
-                return Err(shard_timeout_error(&resolved));
+                return Err(shard_timeout_error(resolved.timeout, resolved.priority));
             }
-            match tokio::time::timeout_at(deadline, $future).await {
+            let result = tokio::time::timeout_at(deadline, $future).await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(shard_timeout_error(resolved.timeout, resolved.priority));
+            }
+            match result {
                 Ok(res) => res?,
-                Err(_) => return Err(shard_timeout_error(&resolved)),
+                Err(_) => return Err(shard_timeout_error(resolved.timeout, resolved.priority)),
             }
         }};
     }
@@ -19004,7 +19028,7 @@ async fn shard_scoped(
     // Resolving the tenant context can create and open a catalog; the `SEARCH`
     // rewrite reads the index config behind it. Catalog work, on this request's
     // clock like everything else.
-    let ice = under_shard_deadline!(async {
+    let ice = under_shard_deadline!(Catalog, async {
         state
             .resolve_ice(&identity)
             .await
@@ -19012,7 +19036,9 @@ async fn shard_scoped(
     });
     history_buffered::phase(HistoryErrorCode::InvalidSql);
     let query = under_shard_deadline!(rewrite_search_if_needed(&ice, &req.query));
-    let preferred_scan_order = preferred_scan_order_for_sql(&ice, &query).await;
+    let preferred_scan_order = under_shard_deadline!(PreferredOrder, async {
+        Ok::<_, ApiError>(preferred_scan_order_for_sql(&ice, &query).await)
+    });
     // PER-REQUEST CANCELLATION, which this path never had. On the default chart
     // config (`query.replicas: 2`, distributed on) every user query executes
     // here, so every coordinator timeout or client disconnect left a worker
@@ -19062,7 +19088,7 @@ async fn shard_scoped(
     // Registration reads table metadata from the catalog and object store — the
     // phase a slow backend stretches furthest past the budget. The
     // half-registered session context dies with the request.
-    under_shard_deadline!(register_tables_for_query(&ice, &ctx, &query));
+    under_shard_deadline!(Register, register_tables_for_query(&ice, &ctx, &query));
     // #89: pin the shard read to the coordinator's serving snapshot.
     //
     // #1525: a pin that is STILL unresolvable after `pinned_table_provider`'s
@@ -19096,18 +19122,17 @@ async fn shard_scoped(
                 // Without a pinned schema id (an older coordinator) the
                 // worker's own registered schema is what it always was.
                 let schema = match pin.schema_id {
-                    None => ctx
-                        .table_provider(&pin.table)
-                        .await
-                        .map_err(|e| {
+                    None => under_shard_deadline!(Schema, async {
+                        ctx.table_provider(&pin.table).await.map_err(|e| {
                             ApiError::internal(anyhow::anyhow!(
                                 "resolving schema for empty pin on `{}`: {e}",
                                 pin.table
                             ))
-                        })?
-                        .schema(),
+                        })
+                    })
+                    .schema(),
                     Some(schema_id) => {
-                        match under_shard_deadline!(async {
+                        match under_shard_deadline!(Pin, async {
                             ice.pinned_empty_schema(
                                 &pin.table,
                                 schema_id,
@@ -19164,7 +19189,7 @@ async fn shard_scoped(
             (Some(snapshot_id), false) => {
                 // A pin miss triggers a metadata refresh inside `pinned_table_provider`,
                 // so this is another catalog round trip on the budget.
-                match under_shard_deadline!(async {
+                match under_shard_deadline!(Pin, async {
                     ice.pinned_table_provider(
                         &pin.table,
                         snapshot_id,
@@ -19339,8 +19364,10 @@ async fn shard_scoped(
     // `_cancel_guard` fires as the macro's `return` unwinds this frame, so the
     // scan stops rather than running on unobserved — which is the whole point of
     // arming it: a timeout that only stops WAITING leaves the work running.
-    let batches = under_shard_deadline!(collect);
-    let bytes = crate::format::batches_to_arrow_ipc(&batches).map_err(ApiError::internal)?;
+    let batches = under_shard_deadline!(Collect, collect);
+    let bytes = under_shard_deadline!(Render, async {
+        crate::format::batches_to_arrow_ipc(&batches).map_err(ApiError::internal)
+    });
     let mut resp = Response::new(Body::from(bytes));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -19378,6 +19405,9 @@ async fn shard_scoped(
         (runtime.unsettled_partitions == 0 && runtime.scan_bytes_measured)
             .then_some(runtime.bytes_scanned),
     );
+    if tokio::time::Instant::now() >= deadline {
+        return Err(shard_timeout_error(resolved.timeout, resolved.priority));
+    }
     Ok(resp)
 }
 
@@ -23274,3 +23304,7 @@ mod history_scan_availability_tests {
         assert_eq!(value(zero.counters.measured_bytes_scanned.unwrap()), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "sql/shard_controls_tests.rs"]
+mod shard_controls_tests;
