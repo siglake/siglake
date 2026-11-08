@@ -31,6 +31,7 @@ enum OidcProfile {
     #[default]
     Generic,
     CognitoAccess,
+    CognitoMixed,
 }
 
 #[derive(Parser, Debug)]
@@ -222,11 +223,13 @@ enum Command {
         /// over `--auth-tokens`.
         #[arg(long, env = "SIGLAKE_OIDC_ISSUER")]
         oidc_issuer: Option<String>,
-        /// Expected generic OIDC `aud` claim. Not used by cognito-access.
+        /// Expected generic `aud`, or exact scalar human API audience for cognito-mixed.
+        /// Not used by cognito-access.
         #[arg(long, env = "SIGLAKE_OIDC_AUDIENCE")]
         oidc_audience: Option<String>,
         /// Explicit token contract; cognito-access requires a signed tenant
         /// and client_id instead of the human app client's audience.
+        /// cognito-mixed also accepts ID tokens for the exact human API audience.
         #[arg(
             long,
             value_enum,
@@ -1354,6 +1357,25 @@ mod allocator_memory_readout_tests {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Explicit mixed must fail before telemetry or run's data-directory setup.
+    // Existing profiles retain their established startup validation path.
+    if let Command::IngestServer {
+        oidc_profile: OidcProfile::CognitoMixed,
+        oidc_issuer,
+        oidc_audience,
+        oidc_tenant_claim,
+        ..
+    } = &cli.command
+    {
+        if let Some(message) = ingest_profile_config_error(
+            OidcProfile::CognitoMixed,
+            oidc_issuer.as_deref(),
+            oidc_audience.as_deref(),
+            oidc_tenant_claim.as_deref(),
+        ) {
+            bail!(message);
+        }
+    }
 
     // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
     // console layer always stays on. It stays on stderr, so the `println!`
@@ -3157,6 +3179,16 @@ async fn run_ingest_server(
                     issuer.to_string(),
                     oidc_tenant_claim
                         .expect("validated access tenant claim")
+                        .to_string(),
+                )
+                .await
+            }
+            OidcProfile::CognitoMixed => {
+                siglake_core::oidc::OidcVerifier::from_cognito_mixed_issuer(
+                    issuer.to_string(),
+                    oidc_audience.expect("validated mixed audience").to_string(),
+                    oidc_tenant_claim
+                        .expect("validated mixed tenant claim")
                         .to_string(),
                 )
                 .await
@@ -5589,6 +5621,18 @@ fn ingest_profile_config_error(
     if profile == OidcProfile::Generic {
         return ingest_oidc_config_error(issuer, audience, tenant_claim);
     }
+    if profile == OidcProfile::CognitoMixed {
+        if issuer.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-issuer");
+        }
+        if audience.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-audience");
+        }
+        if tenant_claim.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-tenant-claim");
+        }
+        return None;
+    }
     if issuer.is_none_or(|issuer| issuer.trim().is_empty()) {
         return Some("--oidc-profile cognito-access requires --oidc-issuer");
     }
@@ -7193,5 +7237,49 @@ mod cognito_profile_tests {
             Some("org")
         )
         .is_some());
+    }
+    #[test]
+    fn mixed_profile_requires_nonblank_issuer_human_audience_and_tenant() {
+        let valid = [Some("issuer"), Some("human-api"), Some("tenant")];
+        for index in 0..3 {
+            for blank in [None, Some(""), Some(" "), Some("\t\n")] {
+                let mut inputs = valid;
+                inputs[index] = blank;
+                assert!(ingest_profile_config_error(
+                    OidcProfile::CognitoMixed,
+                    inputs[0],
+                    inputs[1],
+                    inputs[2]
+                )
+                .is_some());
+            }
+        }
+        assert_eq!(
+            ingest_profile_config_error(OidcProfile::CognitoMixed, valid[0], valid[1], valid[2]),
+            None
+        );
+        let cli = Cli::try_parse_from([
+            "siglake",
+            "ingest-server",
+            "--oidc-profile",
+            "cognito-mixed",
+            "--oidc-issuer",
+            "issuer",
+            "--oidc-audience",
+            "human-api",
+            "--oidc-tenant-claim",
+            "tenant",
+        ])
+        .unwrap();
+        let Command::IngestServer {
+            oidc_profile,
+            oidc_audience,
+            ..
+        } = cli.command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(oidc_profile, OidcProfile::CognitoMixed);
+        assert_eq!(oidc_audience.as_deref(), Some("human-api"));
     }
 }

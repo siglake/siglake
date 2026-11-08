@@ -747,3 +747,119 @@ async fn routed_boundary_count_reads_files_without_claiming_measured_zero() {
     service.shutdown().await;
     issuer_task.abort();
 }
+
+#[tokio::test]
+#[ignore = "real disposable PostgreSQL; scripts/check-query-history-buffered.sh"]
+async fn cognito_mixed_real_history_id_unknown_and_access_stable_tuple_after_tenant_gates() {
+    let f = fixture().await;
+    let mut service = HistoryService::new(f.writer);
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(IcebergContext::open(tmp.path()).await.unwrap());
+    let (issuer, idp) = spawn_fake_idp().await;
+    let verifier = OidcVerifier::from_cognito_mixed_issuer(
+        issuer.clone(),
+        "human-audience".into(),
+        "custom:org_id".into(),
+    )
+    .await
+    .unwrap();
+    let state = AppState::new(ice.clone(), AuthConfig::from_oidc(verifier))
+        .with_tenants(TenantRegistry::new(ice))
+        .with_allowed_tenants(["acme"])
+        .with_history(service.observer());
+    let s = server(state).await;
+    let mut id = super::cognito_mixed::id_claims(&issuer);
+    id["sub"] = json!("client-one");
+    id["client_id"] = json!("client-one");
+    id["provider_principal"] = json!({"issuer":issuer,"client_id":"client-one"});
+    id["name"] = json!("same-label");
+    id["email"] = json!("synthetic@example.invalid");
+    let signed = |claims: &Value| sign_claims(claims, Algorithm::RS256, Some(TEST_KID));
+    let query = json!({"query":"SELECT 1", "tenant":"foreign", "client_id":"client-one"});
+    let unknown = observed(
+        &s,
+        &signed(&id),
+        &f.admin,
+        "/api/v1/sql",
+        query.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(unknown["principal_kind"], "unknown");
+    assert!(unknown["issuer"].is_null() && unknown["client_id"].is_null());
+    assert_eq!(unknown["tenant"], "acme");
+    let mut access = access_claims(&issuer);
+    access["name"] = json!("same-label");
+    let original = observed(
+        &s,
+        &signed(&access),
+        &f.admin,
+        "/api/v1/sql",
+        query.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    access["sub"] = json!("renewed-human-or-machine-subject");
+    access["name"] = json!("changed-label");
+    access["exp"] = json!(access["exp"].as_u64().unwrap() + 60);
+    let renewed = observed(
+        &s,
+        &signed(&access),
+        &f.admin,
+        "/api/v1/sql",
+        query.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    for row in [&original, &renewed] {
+        assert_eq!(row["principal_kind"], "provider");
+        assert_eq!(row["issuer"], issuer);
+        assert_eq!(row["client_id"], "client-one");
+        assert_eq!(row["tenant"], "acme");
+    }
+    access["client_id"] = json!("client-two");
+    access["name"] = json!("same-label");
+    let changed = observed(
+        &s,
+        &signed(&access),
+        &f.admin,
+        "/api/v1/sql",
+        query.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(changed["client_id"], "client-two");
+    for mut claims in [id, access] {
+        for tenant in [
+            json!(null),
+            json!(0),
+            json!(""),
+            json!("bad.tenant"),
+            json!("active"),
+            json!("foreign"),
+        ] {
+            claims["custom:org_id"] = tenant;
+            unobserved(
+                &s,
+                &signed(&claims),
+                &f.admin,
+                "/api/v1/sql",
+                query.clone(),
+                StatusCode::FORBIDDEN,
+            )
+            .await;
+        }
+        claims.as_object_mut().unwrap().remove("custom:org_id");
+        unobserved(
+            &s,
+            &signed(&claims),
+            &f.admin,
+            "/api/v1/sql",
+            query.clone(),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    }
+    service.shutdown().await;
+    idp.abort();
+}

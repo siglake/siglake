@@ -48,6 +48,7 @@ enum OidcProfile {
     #[default]
     Generic,
     CognitoAccess,
+    CognitoMixed,
 }
 
 #[derive(Parser, Debug)]
@@ -103,12 +104,14 @@ struct Cli {
     #[arg(long, env = "SIGLAKE_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
-    /// Expected `aud` claim for generic OIDC. Not used by cognito-access.
+    /// Expected generic `aud`, or exact scalar human API audience for cognito-mixed.
+    /// Not used by cognito-access.
     #[arg(long, env = "SIGLAKE_OIDC_AUDIENCE")]
     oidc_audience: Option<String>,
 
     /// Token contract: generic enforces audience; cognito-access requires
     /// signed access-token client_id and a configured signed tenant claim.
+    /// cognito-mixed also accepts ID tokens for the exact human API audience.
     #[arg(
         long,
         value_enum,
@@ -406,6 +409,20 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Explicit mixed must fail before telemetry, storage or trusted discovery.
+    // Existing profiles keep their later validation path in run.
+    if cli.oidc_profile == OidcProfile::CognitoMixed {
+        if let Some(message) = query_oidc_config_error(
+            cli.oidc_profile,
+            cli.oidc_issuer.as_deref(),
+            cli.oidc_audience.as_deref(),
+            oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref()),
+            false,
+        ) {
+            anyhow::bail!(message);
+        }
+    }
     // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
     // console layer always stays on, and stays on stderr, matching the siglake
     // CLI and the rest of the workspace's binaries.
@@ -414,13 +431,12 @@ async fn main() -> Result<()> {
     // startup error, a bad flag — so the flush happens once, here, on all of
     // them. The providers live in a `OnceLock` that never drops, so nothing
     // else would flush them. No-op when OTel is off.
-    let result = run().await;
+    let result = run(cli).await;
     siglake_core::telemetry::shutdown();
     result
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<()> {
     // Dedicated env-only resolver: absent is disabled; invalid syntax or an
     // enabled legacy raw audit rejects before any catalog/OIDC/listener work.
     let history_config = HistoryConfig::from_env(cli.audit_disabled)?;
@@ -507,6 +523,16 @@ async fn run() -> Result<()> {
                     issuer.to_string(),
                     oidc_tenant_claim
                         .expect("validated access tenant claim")
+                        .to_string(),
+                )
+                .await
+            }
+            OidcProfile::CognitoMixed => {
+                OidcVerifier::from_cognito_mixed_issuer(
+                    issuer.to_string(),
+                    cli.oidc_audience.clone().expect("validated mixed audience"),
+                    oidc_tenant_claim
+                        .expect("validated mixed tenant claim")
                         .to_string(),
                 )
                 .await
@@ -857,6 +883,18 @@ fn query_oidc_config_error(
 ) -> Option<&'static str> {
     if profile == OidcProfile::Generic {
         return query_tenant_config_error(issuer, audience, tenant_claim, has_allowed_tenants);
+    }
+    if profile == OidcProfile::CognitoMixed {
+        if issuer.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-issuer");
+        }
+        if audience.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-audience");
+        }
+        if tenant_claim.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-tenant-claim");
+        }
+        return None;
     }
     if issuer.is_none_or(|issuer| issuer.trim().is_empty()) {
         return Some("--oidc-profile cognito-access requires --oidc-issuer");
@@ -1253,5 +1291,49 @@ mod tests {
             false
         )
         .is_some());
+    }
+    #[test]
+    fn mixed_profile_requires_nonblank_issuer_human_audience_and_tenant() {
+        let valid = [Some("issuer"), Some("human-api"), Some("tenant")];
+        for index in 0..3 {
+            for blank in [None, Some(""), Some(" "), Some("\t\n")] {
+                let mut inputs = valid;
+                inputs[index] = blank;
+                assert!(super::query_oidc_config_error(
+                    super::OidcProfile::CognitoMixed,
+                    inputs[0],
+                    inputs[1],
+                    inputs[2],
+                    false
+                )
+                .is_some());
+            }
+        }
+        assert_eq!(
+            super::query_oidc_config_error(
+                super::OidcProfile::CognitoMixed,
+                valid[0],
+                valid[1],
+                valid[2],
+                true
+            ),
+            None
+        );
+        let cli = Cli::try_parse_from([
+            "siglake-query-server",
+            "--oidc-profile",
+            "cognito-mixed",
+            "--oidc-issuer",
+            "issuer",
+            "--oidc-audience",
+            "human-api",
+            "--oidc-tenant-claim",
+            "tenant",
+        ])
+        .unwrap();
+        let oidc_profile = cli.oidc_profile;
+        let oidc_audience = cli.oidc_audience;
+        assert_eq!(oidc_profile, super::OidcProfile::CognitoMixed);
+        assert_eq!(oidc_audience.as_deref(), Some("human-api"));
     }
 }

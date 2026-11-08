@@ -7,7 +7,7 @@
 //! verifier refreshes the JWKS once and retries.
 //!
 //! Generic algorithms: RS256/RS384/RS512 + ES256/ES384. The explicit
-//! Cognito access-token profile pins RS256. HMAC algorithms are intentionally not
+//! Cognito profiles pin RS256. HMAC algorithms are intentionally not
 //! accepted — they'd require a shared secret with the IDP which
 //! doesn't fit the BYOC story.
 
@@ -33,7 +33,7 @@ pub const JWKS_CACHE_TTL: Duration = Duration::from_secs(900); // 15 min
 pub struct OidcVerifier {
     issuer: String,
     audience: String,
-    cognito_access: bool,
+    contract: TokenContract,
     jwks_uri: String,
     http: reqwest::Client,
     cache: Arc<RwLock<JwksCache>>,
@@ -42,6 +42,13 @@ pub struct OidcVerifier {
     /// (the v0 behavior; every caller routes to the default
     /// IcebergContext namespace).
     tenant_claim: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenContract {
+    Generic,
+    CognitoAccess,
+    CognitoMixed,
 }
 
 struct JwksCache {
@@ -86,7 +93,7 @@ impl OidcVerifier {
         Self {
             issuer,
             audience,
-            cognito_access: false,
+            contract: TokenContract::Generic,
             jwks_uri,
             http,
             cache: Arc::new(RwLock::new(JwksCache {
@@ -111,7 +118,7 @@ impl OidcVerifier {
             ));
         }
         let mut verifier = Self::from_issuer(issuer, String::new()).await?;
-        verifier.cognito_access = true;
+        verifier.contract = TokenContract::CognitoAccess;
         Ok(verifier.with_tenant_claim(tenant_claim))
     }
 
@@ -128,8 +135,52 @@ impl OidcVerifier {
             ));
         }
         let mut verifier = Self::with_jwks_uri(issuer, String::new(), jwks_uri, http);
-        verifier.cognito_access = true;
+        verifier.contract = TokenContract::CognitoAccess;
         Ok(verifier.with_tenant_claim(tenant_claim))
+    }
+
+    /// Explicit Cognito ID/access union. The audience is the single exact
+    /// human API client audience, checked only after signed `token_use = id`.
+    pub async fn from_cognito_mixed_issuer(
+        issuer: String,
+        audience: String,
+        tenant_claim: String,
+    ) -> Result<Self, OidcError> {
+        Self::validate_mixed_config(&issuer, &audience, &tenant_claim)?;
+        let mut verifier = Self::from_issuer(issuer.clone(), audience).await?;
+        verifier.issuer = issuer;
+        verifier.contract = TokenContract::CognitoMixed;
+        Ok(verifier.with_tenant_claim(tenant_claim))
+    }
+
+    /// Explicit mixed-token constructor for an operator-pinned JWKS endpoint.
+    pub fn with_cognito_mixed_jwks_uri(
+        issuer: String,
+        audience: String,
+        jwks_uri: String,
+        http: reqwest::Client,
+        tenant_claim: String,
+    ) -> Result<Self, OidcError> {
+        Self::validate_mixed_config(&issuer, &audience, &tenant_claim)?;
+        let mut verifier = Self::with_jwks_uri(issuer, audience, jwks_uri, http);
+        verifier.contract = TokenContract::CognitoMixed;
+        Ok(verifier.with_tenant_claim(tenant_claim))
+    }
+
+    fn validate_mixed_config(
+        issuer: &str,
+        audience: &str,
+        tenant_claim: &str,
+    ) -> Result<(), OidcError> {
+        if [issuer, audience, tenant_claim]
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err(OidcError::Config(
+                "Cognito mixed requires an issuer, human API audience and tenant claim".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Enable per-request tenant routing. `claim_name` is the name of
@@ -172,9 +223,11 @@ impl OidcVerifier {
             .kid
             .ok_or_else(|| OidcError::Malformed("JWT header missing `kid`".into()))?;
         let alg = header.alg;
-        if self.cognito_access && (alg != Algorithm::RS256 || !self.has_tenant_claim()) {
+        if self.contract != TokenContract::Generic
+            && (alg != Algorithm::RS256 || !self.has_tenant_claim())
+        {
             return Err(OidcError::Verify(
-                "Cognito access requires RS256 and tenant routing".into(),
+                "Cognito requires RS256 and tenant routing".into(),
             ));
         }
 
@@ -182,7 +235,7 @@ impl OidcVerifier {
 
         let mut validation = Validation::new(alg);
         validation.set_issuer(&[&self.issuer]);
-        if self.cognito_access {
+        if self.contract != TokenContract::Generic {
             // Cognito access tokens identify clients via signed client_id, not
             // the human client's audience (nor an optional resource audience).
             validation.validate_aud = false;
@@ -199,7 +252,7 @@ impl OidcVerifier {
         let mut claims = decode::<Claims>(token, &key, &validation)
             .map_err(|e| OidcError::Verify(e.to_string()))?
             .claims;
-        if self.cognito_access {
+        if self.contract != TokenContract::Generic {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_err(|_| OidcError::Verify("system clock before epoch".into()))?
@@ -225,8 +278,21 @@ impl OidcVerifier {
                     "invalid access token not-before time".into(),
                 ));
             }
-            if claims.string_claim("token_use") != Some("access") {
-                return Err(OidcError::Verify("expected an access token".into()));
+            // Dispatch only on authenticated claims, after the common strict
+            // envelope. No retry with a different profile on any failure.
+            match claims.string_claim("token_use") {
+                Some("id") if self.contract == TokenContract::CognitoMixed => {
+                    if claims.string_claim("aud") != Some(self.audience.as_str()) {
+                        return Err(OidcError::Verify(
+                            "expected the human API audience string".into(),
+                        ));
+                    }
+                    // Even signed client/principal/name hints on an ID token
+                    // cannot establish provider attribution.
+                    return Ok(claims);
+                }
+                Some("access") => {}
+                _ => return Err(OidcError::Verify("unexpected token use".into())),
             }
             let client_id = claims
                 .string_claim("client_id")
@@ -281,7 +347,7 @@ impl OidcVerifier {
             .await
             .map_err(|e| OidcError::Jwks(format!("parse JWKS: {e}")))?;
 
-        let keys = jwks_to_keys(&jwks, self.cognito_access)?;
+        let keys = jwks_to_keys(&jwks, self.contract != TokenContract::Generic)?;
         let mut cache = self.cache.write().await;
         cache.keys = keys;
         cache.expires_at = Instant::now() + JWKS_CACHE_TTL;
@@ -291,7 +357,7 @@ impl OidcVerifier {
 
 fn jwks_to_keys(
     jwks: &JwkSet,
-    cognito_access: bool,
+    strict_cognito: bool,
 ) -> Result<HashMap<String, DecodingKey>, OidcError> {
     let mut out = HashMap::new();
     for jwk in &jwks.keys {
@@ -299,7 +365,7 @@ fn jwks_to_keys(
         let Some(kid) = jwk.common.key_id.clone() else {
             continue;
         };
-        if cognito_access {
+        if strict_cognito {
             if !matches!(jwk.algorithm, AlgorithmParameters::RSA(_))
                 || jwk
                     .common
@@ -464,5 +530,99 @@ mod tests {
             "org".into()
         )
         .is_err());
+    }
+    #[tokio::test]
+    async fn mixed_constructors_require_all_inputs_before_discovery() {
+        for blank in ["", " ", "\t\n"] {
+            for index in 0..3 {
+                let mut values = ["https://issuer.invalid", "human-api", "tenant"];
+                values[index] = blank;
+                assert!(matches!(
+                    OidcVerifier::from_cognito_mixed_issuer(
+                        values[0].into(),
+                        values[1].into(),
+                        values[2].into()
+                    )
+                    .await,
+                    Err(OidcError::Config(_))
+                ));
+                assert!(matches!(
+                    OidcVerifier::with_cognito_mixed_jwks_uri(
+                        values[0].into(),
+                        values[1].into(),
+                        "https://issuer.invalid/jwks".into(),
+                        reqwest::Client::new(),
+                        values[2].into()
+                    ),
+                    Err(OidcError::Config(_))
+                ));
+            }
+        }
+        let verifier = OidcVerifier::with_cognito_mixed_jwks_uri(
+            "https://issuer.invalid/".into(),
+            "human-api".into(),
+            "https://issuer.invalid/jwks".into(),
+            reqwest::Client::new(),
+            "tenant".into(),
+        )
+        .unwrap();
+        assert!(verifier.has_tenant_claim());
+        assert_eq!(verifier.issuer, "https://issuer.invalid/");
+        assert!(verifier.contract == TokenContract::CognitoMixed);
+    }
+
+    #[tokio::test]
+    async fn mixed_cache_hit_expiry_refresh_replacement_and_unavailable_fail_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}/jwks", listener.local_addr().unwrap());
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = count.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 4096);
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let body = json!({"keys":[rsa_jwk()]}).to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let verifier = OidcVerifier::with_cognito_mixed_jwks_uri(
+            "https://issuer.invalid".into(),
+            "human-api".into(),
+            uri,
+            reqwest::Client::new(),
+            "tenant".into(),
+        )
+        .unwrap();
+        verifier.get_or_refresh("test").await.unwrap();
+        verifier.get_or_refresh("test").await.unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        verifier.cache.write().await.expires_at = Instant::now();
+        verifier.get_or_refresh("test").await.unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(matches!(
+            verifier.get_or_refresh("missing").await,
+            Err(OidcError::UnknownKid(_))
+        ));
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+        task.abort();
+        let _ = task.await;
+        assert!(matches!(
+            verifier.get_or_refresh("missing").await,
+            Err(OidcError::Jwks(_))
+        ));
+        // A valid cached key remains usable until its existing TTL expires.
+        verifier.get_or_refresh("test").await.unwrap();
+        verifier.cache.write().await.expires_at = Instant::now();
+        assert!(matches!(
+            verifier.get_or_refresh("test").await,
+            Err(OidcError::Jwks(_))
+        ));
     }
 }

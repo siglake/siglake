@@ -7,3 +7,5 @@ mod role_cache_budget_cli;
 mod wal_recover_cli;
 mod wal_recover_root_identity;
 mod wal_requeue_cli;
+
+mod cognito_mixed;

@@ -315,3 +315,211 @@ async fn generic_primary_preflight_has_no_named_revision_and_closed_is_not_absen
     .await;
     authority.shutdown().await;
 }
+
+// Reference the existing test fixture rather than duplicating private key bytes.
+#[allow(dead_code)]
+#[path = "../../../../siglake-ingest/tests/ingest/fake_idp.rs"]
+mod mixed_signing_fixture;
+
+#[tokio::test]
+#[ignore = "owned primary fixture; scripts/check-query-policy.sh"]
+async fn cognito_mixed_real_middleware_controls_id_has_no_named_revision_access_uses_stable_tuple()
+{
+    use crate::query_controls::{
+        ConnectionBounds, ManagementBinding, PolicyConfig, PolicyManager, SaveRequest,
+        SavedSettings, VerifiedHumanActor,
+    };
+    use crate::{AppState, AuthConfig, OidcVerifier, TenantRegistry};
+    use axum::{body::Body, http::Request, routing::get, Extension, Json, Router};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde_json::{json, Value};
+    use siglake_storage::iceberg::IcebergContext;
+    use tower::ServiceExt;
+    let socket = std::path::PathBuf::from(
+        std::env::var("SIGLAKE_POLICY_FIXTURE_DIR").expect("use check-query-policy.sh"),
+    );
+    assert!(
+        socket.starts_with("/tmp")
+            && socket
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("siglake-policy-")
+    );
+    assert_eq!(
+        std::fs::read_to_string(socket.join("fixture-marker")).unwrap(),
+        "new-owned-policy-fixture-v1\n"
+    );
+    let encoded = socket.to_str().unwrap().replace('/', "%2F");
+    let bounds = ConnectionBounds {
+        max_connections: 1,
+        operation_timeout: Duration::from_secs(2),
+    };
+    let manager = PolicyManager::connect(
+        PolicyConfig::manager(
+            &format!("postgres://qp_manager:@{encoded}:5432/qh_fixture?sslmode=disable"),
+            bounds,
+        )
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    let reader = Arc::new(
+        PolicyReader::connect(
+            PolicyConfig::reader(
+                &format!("postgres://qp_reader:@{encoded}:5432/qh_fixture?sslmode=disable"),
+                bounds,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let (issuer, idp) = mixed_signing_fixture::spawn_fake_idp().await;
+    let client = "mixed-controlled-client";
+    let binding = ManagementBinding::from_trusted_metadata(
+        RuntimeKey::from_trusted_metadata("acme", &issuer, client).unwrap(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    )
+    .unwrap();
+    let actor = VerifiedHumanActor::from_trusted_metadata("synthetic-human").unwrap();
+    let saved = manager
+        .save(
+            &binding,
+            &actor,
+            SaveRequest::new(0, SavedSettings::new(Some(1), None).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(IcebergContext::open(tmp.path()).await.unwrap());
+    let verifier = OidcVerifier::from_cognito_mixed_issuer(
+        issuer.clone(),
+        "human-api".into(),
+        "tenant".into(),
+    )
+    .await
+    .unwrap();
+    let state = AppState::new(ice.clone(), AuthConfig::from_oidc(verifier))
+        .with_tenants(TenantRegistry::new(ice))
+        .with_allowed_tenants(["acme"])
+        .with_query_controls(reader.clone(), 1)
+        .unwrap();
+    let authority = state.query_controls.clone();
+    let probe = Router::new().route("/probe", get(move |Extension(identity): Extension<CallerIdentity>| {
+        let authority = authority.clone();
+        async move {
+            run(authority, identity, RequestLimits::default(), Priority::Interactive, async {
+                use axum::response::IntoResponse;
+                let controls = current().unwrap();
+                Ok(Json(json!({"revision":controls.revision,"timeout_ms":controls.timeout.as_millis()})).into_response())
+            }).await
+        }
+    })).route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::middleware));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut claims = json!({"iss":issuer,"sub":client,"exp":now+600,"iat":now,"token_use":"id","aud":"human-api","tenant":"acme", "client_id":client,"name":"same-label", "email":"synthetic@example.invalid", "provider_principal":{"issuer":issuer,"client_id":client}});
+    let sign = |claims: &Value| {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(mixed_signing_fixture::TEST_KID.into());
+        encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_pem(mixed_signing_fixture::TEST_PRIVATE_KEY_PEM).unwrap(),
+        )
+        .unwrap()
+    };
+    let request = |claims: &Value| {
+        Request::builder()
+            .uri("/probe")
+            .header("Authorization", format!("Bearer {}", sign(claims)))
+            .header("X-Client-Id", client)
+            .header("X-Scope-OrgID", "foreign")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = probe.clone().oneshot(request(&claims)).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body["revision"], Value::Null);
+    assert_eq!(
+        body["timeout_ms"].as_u64().unwrap(),
+        state.limits.interactive.default_timeout.as_millis() as u64
+    );
+    claims["token_use"] = json!("access");
+    claims.as_object_mut().unwrap().remove("aud");
+    for renewal in [false, true] {
+        if renewal {
+            claims["sub"] = json!("renewed-subject");
+            claims["name"] = json!("changed-label");
+            claims["exp"] = json!(now + 660);
+        }
+        let response = probe.clone().oneshot(request(&claims)).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["revision"], saved.revision());
+        assert_eq!(body["timeout_ms"], 1000);
+    }
+    claims["client_id"] = json!("different-id-same-label");
+    claims["name"] = json!("same-label");
+    let response = probe.clone().oneshot(request(&claims)).await.unwrap();
+    let body: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(body["revision"].is_null());
+    // Tenant refusals precede the primary/named-policy consumer entirely: even
+    // a closed reader must not turn these into policy-unavailable responses.
+    reader.close();
+    for use_ in ["id", "access"] {
+        claims["token_use"] = json!(use_);
+        claims["aud"] = json!("human-api");
+        for tenant in [
+            json!(null),
+            json!(12),
+            json!(""),
+            json!("bad.tenant"),
+            json!("active"),
+            json!("foreign"),
+        ] {
+            claims["tenant"] = tenant;
+            assert_eq!(
+                probe
+                    .clone()
+                    .oneshot(request(&claims))
+                    .await
+                    .unwrap()
+                    .status(),
+                403
+            );
+        }
+        claims.as_object_mut().unwrap().remove("tenant");
+        assert_eq!(
+            probe
+                .clone()
+                .oneshot(request(&claims))
+                .await
+                .unwrap()
+                .status(),
+            403
+        );
+    }
+    state.shutdown_query_controls().await;
+    idp.abort();
+}

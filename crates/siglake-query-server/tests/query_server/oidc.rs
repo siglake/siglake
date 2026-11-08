@@ -734,10 +734,30 @@ async fn generic_oidc_requires_issuer_audience_and_expiry_claims() {
 
 #[tokio::test]
 async fn cognito_access_external_shard_body_cannot_override_signed_tenant() {
+    external_shard_body_cannot_override_signed_tenant(false).await;
+}
+
+#[tokio::test]
+async fn cognito_mixed_external_shard_body_cannot_override_signed_tenant() {
+    external_shard_body_cannot_override_signed_tenant(true).await;
+}
+
+async fn external_shard_body_cannot_override_signed_tenant(mixed: bool) {
     require_loopback!();
     use siglake_core::{events_to_record_batch, Event};
     let (issuer, idp) = spawn_fake_idp().await;
-    let server = spawn_profile_server(&issuer, true).await;
+    let server = if mixed {
+        let verifier = OidcVerifier::from_cognito_mixed_issuer(
+            issuer.clone(),
+            "human-audience".into(),
+            "custom:org_id".into(),
+        )
+        .await
+        .unwrap();
+        spawn_auth_server(AuthConfig::from_oidc(verifier)).await
+    } else {
+        spawn_profile_server(&issuer, true).await
+    };
     let ice = IcebergContext::open(&server._tmp.path().join("warehouse"))
         .await
         .unwrap();
@@ -774,25 +794,35 @@ async fn cognito_access_external_shard_body_cannot_override_signed_tenant() {
             response.bytes().await.unwrap()
         }
     };
-    let mut claims = access_claims(&issuer);
-    let acme = sign_claims(&claims, Algorithm::RS256, Some(TEST_KID));
-    let own = shard(acme.clone(), "acme").await;
-    assert_eq!(shard(acme, "foreign").await, own);
-    claims["custom:org_id"] = json!("foreign");
-    let foreign = shard(
-        sign_claims(&claims, Algorithm::RS256, Some(TEST_KID)),
-        "foreign",
-    )
-    .await;
-    assert_ne!(own, foreign);
-    assert_eq!(
-        shard("synthetic-coordinator".into(), "foreign").await,
-        foreign
-    );
-    assert_eq!(
-        post_sql(&server, "synthetic-coordinator").await.status(),
-        401
-    );
+    for use_ in if mixed {
+        vec!["access", "id"]
+    } else {
+        vec!["access"]
+    } {
+        let mut claims = access_claims(&issuer);
+        claims["token_use"] = json!(use_);
+        claims["aud"] = json!("human-audience");
+        claims["provider_principal"] = json!({"issuer":issuer,"client_id":"forged"});
+
+        let acme = sign_claims(&claims, Algorithm::RS256, Some(TEST_KID));
+        let own = shard(acme.clone(), "acme").await;
+        assert_eq!(shard(acme, "foreign").await, own);
+        claims["custom:org_id"] = json!("foreign");
+        let foreign = shard(
+            sign_claims(&claims, Algorithm::RS256, Some(TEST_KID)),
+            "foreign",
+        )
+        .await;
+        assert_ne!(own, foreign);
+        assert_eq!(
+            shard("synthetic-coordinator".into(), "foreign").await,
+            foreign
+        );
+        assert_eq!(
+            post_sql(&server, "synthetic-coordinator").await.status(),
+            401
+        );
+    }
     idp.abort();
 }
 
@@ -803,3 +833,6 @@ mod buffered_history;
 
 #[path = "startup_history.rs"]
 mod startup_history;
+
+#[path = "cognito_mixed.rs"]
+mod cognito_mixed;
