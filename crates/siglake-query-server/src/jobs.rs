@@ -526,13 +526,109 @@ pub struct ReconcileOutcome {
 struct InMemoryRow {
     info: JobInfo,
     owner: String,
+    history_execution_id: Option<Uuid>,
     result: Option<RecordsResponse>,
     expires_at: Option<Instant>,
+}
+
+/// Only safe in-process lifecycle ownership; the durable row stores one UUID.
+#[derive(Default)]
+struct JobHistory {
+    observer: Mutex<Option<crate::history::HistoryObserver>>,
+    active: Mutex<HashMap<JobId, std::sync::Weak<crate::history::batch::BatchObservation>>>,
+}
+struct JobHistoryContext {
+    history_execution_id: Option<Uuid>,
+    tenant: Option<String>,
+    recovered: bool,
+}
+
+impl JobHistory {
+    async fn recovered(&self, pool: &PgPool, ids: &[String]) {
+        if self.observer.lock().unwrap().is_none() {
+            return;
+        }
+        // Best-effort bounded telemetry, not a second recovery policy or outbox.
+        // Unvisited rows retain the independent history owner's lease recovery.
+        let _ = tokio::time::timeout(crate::history::WRITE_BUDGET, async {
+            let backend = Backend::Postgres(pool.clone());
+            for id in ids.iter().take(32).filter_map(|id| JobId::parse(id).ok()) {
+                self.observe(
+                    &backend,
+                    id,
+                    CompletionOutcome::Superseded {
+                        status: JobStatus::Failed,
+                        owned_by_us: false,
+                        recovered: true,
+                    },
+                )
+                .await;
+            }
+        })
+        .await;
+    }
+
+    async fn observe(&self, backend: &Backend, id: JobId, outcome: CompletionOutcome) {
+        let (status, recovered) = match outcome {
+            CompletionOutcome::Applied { status } => (status, false),
+            CompletionOutcome::Superseded {
+                status, recovered, ..
+            } => (status, recovered),
+            CompletionOutcome::Vanished => return,
+        };
+        if !status.is_terminal() {
+            return;
+        }
+        let active = self
+            .active
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(active) = active {
+            active.finish(status, recovered);
+            return;
+        }
+        let observer = self.observer.lock().unwrap().clone();
+        let Some(observer) = observer else {
+            return;
+        };
+        // The whole fallback (job projection + history context verification) is
+        // telemetry-only and bounded. Failure never changes the job answer.
+        let _ = tokio::time::timeout(crate::history::WRITE_BUDGET, async {
+            let context: Result<Option<JobHistoryContext>> = match backend {
+                Backend::InMemory(map) => Ok(map.read().await.get(&id).map(|row| JobHistoryContext {
+                    history_execution_id: row.history_execution_id,
+                    tenant: row.info.tenant.clone(),
+                    recovered: false,
+                })),
+                Backend::Postgres(pool) => {
+                    async {
+                        let row = sqlx::query("SELECT history_execution_id, tenant, recovered_at IS NOT NULL AS recovered FROM siglake_query_jobs WHERE job_id=$1 AND status=$2")
+                            .bind(id.to_string()).bind(status.label()).fetch_optional(pool).await?;
+                        row.map(|row| Ok(JobHistoryContext {
+                            history_execution_id: row.try_get("history_execution_id")?,
+                            tenant: row.try_get("tenant")?,
+                            recovered: row.try_get("recovered")?,
+                        })).transpose()
+                    }.await
+                }
+            };
+            if let Ok(Some(JobHistoryContext { history_execution_id: Some(execution), tenant: Some(tenant), recovered: was_recovered })) = context {
+                if let Some(original) = observer.resume_job(execution, id.0, &tenant).await {
+                    original.finish(status, recovered || was_recovered);
+                    // Drop preserves indeterminate when original admission is
+                    // unknown or the job transition was only lease recovery.
+                }
+            }
+        }).await;
+    }
 }
 
 /// In-process job registry + batch-runtime owner.
 pub struct JobStore {
     backend: Backend,
+    history: Arc<JobHistory>,
     batch_runtime: Arc<BatchRuntime>,
     aborts: Arc<Mutex<HashMap<JobId, futures::future::AbortHandle>>>,
     /// The heartbeat/recovery loop is the one background task that must be
@@ -780,6 +876,7 @@ impl JobStore {
     pub fn new(batch_runtime_threads: usize, ttl: Duration) -> Self {
         let store = Self {
             backend: Backend::InMemory(Arc::new(RwLock::new(HashMap::new()))),
+            history: Arc::new(JobHistory::default()),
             batch_runtime: Arc::new(BatchRuntime::new(batch_runtime_threads)),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             owner_upkeep: Mutex::new(None),
@@ -838,6 +935,7 @@ impl JobStore {
 
         let store = Self {
             backend: Backend::Postgres(pool),
+            history: Arc::new(JobHistory::default()),
             batch_runtime: Arc::new(BatchRuntime::new(batch_runtime_threads)),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             owner_upkeep: Mutex::new(None),
@@ -885,6 +983,7 @@ impl JobStore {
         };
         let store = Self {
             backend: Backend::InMemory(map.clone()),
+            history: Arc::new(JobHistory::default()),
             batch_runtime: Arc::new(BatchRuntime::new(batch_runtime_threads)),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             owner_upkeep: Mutex::new(None),
@@ -900,6 +999,64 @@ impl JobStore {
         store.spawn_gc();
         store.spawn_reconcile();
         Some(store)
+    }
+
+    pub(crate) fn set_history_observer(&self, observer: crate::history::HistoryObserver) {
+        *self.history.observer.lock().unwrap() = Some(observer);
+    }
+
+    pub(crate) fn track_history(
+        &self,
+        id: JobId,
+        observation: Arc<crate::history::batch::BatchObservation>,
+    ) {
+        self.history
+            .active
+            .lock()
+            .unwrap()
+            .insert(id, Arc::downgrade(&observation));
+    }
+
+    pub(crate) fn history_observation(
+        &self,
+        id: JobId,
+    ) -> Option<Arc<crate::history::batch::BatchObservation>> {
+        self.history
+            .active
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Called after Abortable has returned and dropped the execution future.
+    /// Cancellation is authoritative in the store, but a queued cancellation
+    /// cannot claim non-execution until this owner has stopped polling work.
+    pub(crate) async fn observe_history_after_run(&self, id: JobId) {
+        if self.history_observation(id).is_none() {
+            return;
+        }
+        let _ = tokio::time::timeout(crate::history::WRITE_BUDGET, async {
+            let outcome = match &self.backend {
+                Backend::InMemory(map) => {
+                    map.read()
+                        .await
+                        .get(&id)
+                        .map(|row| CompletionOutcome::Superseded {
+                            status: row.info.status,
+                            owned_by_us: row.owner == self.owner,
+                            recovered: false,
+                        })
+                }
+                Backend::Postgres(pool) => lost_conditional_write(pool, id, &self.owner, false)
+                    .await
+                    .ok(),
+            };
+            if let Some(outcome) = outcome {
+                self.history.observe(&self.backend, id, outcome).await;
+            }
+        })
+        .await;
     }
 
     /// This process incarnation's execution-owner id.
@@ -918,6 +1075,7 @@ impl JobStore {
         let owner = self.owner.clone();
         let policy = self.recovery;
         let ttl = self.ttl;
+        let history = self.history.clone();
         let interval = policy.heartbeat_interval();
         let upkeep = self.batch_runtime.spawn(async move {
             loop {
@@ -929,7 +1087,7 @@ impl JobStore {
                     tracing::warn!(error = %e, "job owner heartbeat failed");
                     continue;
                 }
-                match recover_orphans(&pool, &owner, &policy, ttl).await {
+                match recover_orphans(&pool, &owner, &policy, ttl, &history).await {
                     Ok(outcome) => {
                         if outcome.recovered > 0 {
                             log_recovery(&outcome);
@@ -1069,7 +1227,7 @@ impl JobStore {
         match &self.backend {
             Backend::InMemory(_) => Ok(RecoveryOutcome::default()),
             Backend::Postgres(pool) => {
-                recover_orphans(pool, &self.owner, &self.recovery, self.ttl).await
+                recover_orphans(pool, &self.owner, &self.recovery, self.ttl, &self.history).await
             }
         }
     }
@@ -1140,6 +1298,7 @@ impl JobStore {
     /// when a cancellation sweep already took it.
     pub fn clear_abort(&self, id: JobId) {
         self.aborts.lock().unwrap().remove(&id);
+        self.history.active.lock().unwrap().remove(&id);
     }
 
     /// Submit a new job. Returns the assigned `JobId`. The caller is
@@ -1153,6 +1312,17 @@ impl JobStore {
         query: String,
         priority: Priority,
         tenant: Option<String>,
+    ) -> Result<JobId> {
+        self.submit_observed(query, priority, tenant, None).await
+    }
+
+    /// Internal controller-only correlation. Never extracted from an HTTP DTO.
+    pub(crate) async fn submit_observed(
+        &self,
+        query: String,
+        priority: Priority,
+        tenant: Option<String>,
+        history_execution_id: Option<Uuid>,
     ) -> Result<JobId> {
         let id = JobId::new();
         let info = JobInfo {
@@ -1174,6 +1344,7 @@ impl JobStore {
                     InMemoryRow {
                         info,
                         owner: self.owner.clone(),
+                        history_execution_id,
                         result: None,
                         expires_at: None,
                     },
@@ -1182,8 +1353,8 @@ impl JobStore {
             Backend::Postgres(pool) => {
                 sqlx::query(
                     "INSERT INTO siglake_query_jobs
-                       (job_id, status, priority, submitted_at, query, tenant, owner)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                       (job_id, status, priority, submitted_at, query, tenant, owner, history_execution_id)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                 )
                 .bind(info.job_id)
                 .bind(JobStatus::Pending.label())
@@ -1192,6 +1363,7 @@ impl JobStore {
                 .bind(info.query)
                 .bind(info.tenant)
                 .bind(&self.owner)
+                .bind(history_execution_id)
                 .execute(pool)
                 .await
                 .context("INSERT job row")?;
@@ -1319,7 +1491,11 @@ impl JobStore {
             )
             .await;
         }
-        install_succeeded(&self.backend, &self.owner, self.ttl, id, result).await
+        let answer = install_succeeded(&self.backend, &self.owner, self.ttl, id, result).await;
+        if let Ok(outcome) = answer {
+            self.history.observe(&self.backend, id, outcome).await;
+        }
+        answer
     }
 
     /// Record failure or timeout. Same contract as
@@ -1339,7 +1515,12 @@ impl JobStore {
             )
             .await;
         }
-        install_failed(&self.backend, &self.owner, self.ttl, id, error, is_timeout).await
+        let answer =
+            install_failed(&self.backend, &self.owner, self.ttl, id, error, is_timeout).await;
+        if let Ok(outcome) = answer {
+            self.history.observe(&self.backend, id, outcome).await;
+        }
+        answer
     }
 
     /// Queue `count` injected failures of `fault` for the next terminal
@@ -1412,6 +1593,7 @@ impl JobStore {
             owner: self.owner.clone(),
             ttl: self.ttl,
             finished_unpersisted: self.finished_unpersisted.clone(),
+            history: self.history.clone(),
         }
     }
 
@@ -1551,6 +1733,20 @@ impl JobStore {
         if cancelled {
             if let Some(abort) = self.aborts.lock().unwrap().remove(&id) {
                 abort.abort();
+            }
+            // A local owner reports after Abortable drops its run, so admission
+            // cannot race a premature queued-cancel terminal. Other replicas
+            // resume only authoritative original history admission evidence.
+            if self.history_observation(id).is_none() {
+                self.history
+                    .observe(
+                        &self.backend,
+                        id,
+                        CompletionOutcome::Applied {
+                            status: JobStatus::Cancelled,
+                        },
+                    )
+                    .await;
             }
         }
         Ok(cancelled)
@@ -1740,6 +1936,7 @@ struct Reconciler {
     owner: String,
     ttl: Duration,
     finished_unpersisted: Arc<Mutex<FinishedUnpersisted>>,
+    history: Arc<JobHistory>,
 }
 
 /// Per-write bound inside a reconciliation pass. A store that accepts the
@@ -1795,6 +1992,7 @@ impl Reconciler {
                 outcome.retained += 1;
                 continue;
             };
+            self.history.observe(&self.backend, id, installed).await;
             // Settled either way: the row is terminal now, and nothing this
             // process knows will change it.
             self.settle(id);
@@ -1951,6 +2149,7 @@ async fn recover_orphans(
     owner: &str,
     policy: &JobRecoveryPolicy,
     ttl: Duration,
+    history: &JobHistory,
 ) -> Result<RecoveryOutcome> {
     let candidates = read_ownership_candidates(pool).await?;
     let mut outcome = RecoveryOutcome::default();
@@ -1967,6 +2166,7 @@ async fn recover_orphans(
                 .push(row.job_id.clone()),
         }
     }
+    let mut history_ids = Vec::new();
     for (reason, ids) in condemned.into_values() {
         let condemned = ids.len();
         let rows_affected = apply_recovery_update(pool, reason, &ids, policy, ttl).await?;
@@ -1986,7 +2186,11 @@ async fn recover_orphans(
             );
         }
         outcome.recovered += rows_affected as usize;
+        if rows_affected > 0 {
+            history_ids.extend(ids.into_iter().take(32 - history_ids.len()));
+        }
     }
+    history.recovered(pool, &history_ids).await;
     Ok(outcome)
 }
 
@@ -2340,6 +2544,8 @@ const SCHEMA_SQL_STATEMENTS: &[&str] = &[
     // Existing installs: the column post-dates the table. NULL is the default
     // context, which is what rows written before this change belonged to.
     "ALTER TABLE siglake_query_jobs ADD COLUMN IF NOT EXISTS tenant TEXT",
+    // Optional internal pointer only. Legacy rows remain explicitly unobserved.
+    "ALTER TABLE siglake_query_jobs ADD COLUMN IF NOT EXISTS history_execution_id UUID",
     // Execution ownership. NULL on rows written before ownership existed;
     // `JobRecoveryPolicy::ownerless_grace` says what recovery does with those.
     // This is not an authorization key -- `tenant` is.

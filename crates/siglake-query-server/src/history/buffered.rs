@@ -120,7 +120,11 @@ where
     F: Future<Output = Result<Response, ApiError>>,
     W: FnOnce(AppState, CallerIdentity, SqlRequest) -> F,
 {
-    let Some(observer) = state.history.as_ref().filter(|_| eligible) else {
+    let Some(observer) = state
+        .history
+        .as_ref()
+        .filter(|_| eligible && !identity.coordinator)
+    else {
         return work(state, identity, req).await;
     };
     let Some(principal) = state
@@ -135,6 +139,7 @@ where
             RequestMetadata {
                 operation,
                 format: if operation != Operation::Explain
+                    && req.priority != crate::limits::Priority::Batch
                     && !req.dry_run
                     && req.format == Some(crate::format::QueryFormat::Ndjson)
                 {
@@ -214,9 +219,43 @@ where
 }
 
 pub(crate) fn eligible(req: &SqlRequest) -> bool {
-    (req.priority != crate::limits::Priority::Batch
-        || (req.dry_run && req.format.unwrap_or_default() == crate::format::QueryFormat::Records))
-        && req.shard.is_none()
+    req.shard.is_none()
+        && !(req.priority == crate::limits::Priority::Batch
+            && req.dry_run
+            && req.format.unwrap_or_default() != crate::format::QueryFormat::Records)
+}
+
+pub(crate) fn batch_execution_id() -> Option<Uuid> {
+    EVIDENCE
+        .try_with(|e| {
+            e.borrow()
+                .observation
+                .as_ref()
+                .and_then(|h| h.receipt())
+                .map(|r| r.execution_id())
+        })
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn transfer_batch(job: Uuid) -> Option<std::sync::Arc<super::batch::BatchObservation>> {
+    EVIDENCE
+        .try_with(|e| {
+            let mut e = e.borrow_mut();
+            if e.transferred {
+                return None;
+            }
+            let handle = e.observation.take()?;
+            e.transferred = true;
+            Some(std::sync::Arc::new(super::batch::BatchObservation::new(
+                handle,
+                e.started,
+                job,
+                Some(false),
+            )))
+        })
+        .ok()
+        .flatten()
 }
 
 /// Move the sole lifecycle owner into the source/body, not a task-local clone

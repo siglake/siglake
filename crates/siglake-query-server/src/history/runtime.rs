@@ -482,6 +482,51 @@ pub struct HistoryObserver {
     inner: Arc<Inner>,
 }
 impl HistoryObserver {
+    /// Bind only the actual external observation to its newly persisted job.
+    /// A failed association cannot be guessed during recovery.
+    pub(crate) async fn associate_job(&self, execution: Uuid, job: Uuid) {
+        let result = bounded(self.inner.writer.associate_job(execution, job)).await;
+        self.inner.write_result(&result);
+    }
+
+    /// Trusted internal job-store pointer only, never a request UUID. Reads the
+    /// original context without minting a receipt or heartbeating its old owner.
+    pub(crate) async fn resume_job(
+        &self,
+        execution: Uuid,
+        job: Uuid,
+        tenant: &str,
+    ) -> Option<Arc<super::batch::BatchObservation>> {
+        if self.inner.closed() {
+            return None;
+        }
+        let result = bounded(self.inner.writer.resume_job(execution, job, tenant)).await;
+        match result {
+            Ok(Some((event, admitted))) => {
+                let handle = Arc::new(ObservationHandle {
+                    inner: self.inner.clone(),
+                    observation: Mutex::new(Some(Observation {
+                        event,
+                        admitted: admitted == Some(true),
+                        terminal: None,
+                        abandoned: false,
+                    })),
+                    initial_delivery: Delivery::Unobserved,
+                });
+                Some(Arc::new(super::batch::BatchObservation::new(
+                    handle, None, job, admitted,
+                )))
+            }
+            // Missing, expired, mismatched and already-terminal rows are not
+            // interchangeable evidence for a measured loss reason.
+            Ok(None) => None,
+            Err(error) => {
+                self.inner.signal(error.reason());
+                None
+            }
+        }
+    }
+
     /// One 100ms budget for BOTH receipt and initial persistence. A missing DB
     /// receipt yields a disabled handle, never a local-time/recovery receipt.
     /// Failure does not reject or delay SQL beyond this budget. Caller must not

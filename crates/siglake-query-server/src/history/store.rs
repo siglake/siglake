@@ -182,6 +182,55 @@ impl HistoryWriter {
         })
     }
 
+    /// Internal association, conditional on the original row and no conflicting
+    /// job link. Existing schema/role contract already permits these columns.
+    pub(super) async fn associate_job(
+        &self,
+        execution: Uuid,
+        job: Uuid,
+    ) -> Result<(), HistoryError> {
+        let changed = sqlx::query("UPDATE query_history.executions SET job_id=$2 WHERE execution_id=$1 AND expires_at>clock_timestamp() AND observation_state<>'terminal' AND (job_id IS NULL OR job_id=$2) AND operation='sql' AND priority='batch' AND NOT dry_run")
+            .bind(execution).bind(job).execute(&self.pool).await.map_err(unavailable)?.rows_affected();
+        self.classify(execution, changed).await?;
+        Ok(())
+    }
+
+    pub(super) async fn resume_job(
+        &self,
+        execution: Uuid,
+        job: Uuid,
+        tenant: &str,
+    ) -> Result<Option<(PendingExecution, Option<bool>)>, HistoryError> {
+        let row = sqlx::query("SELECT * FROM query_history.executions WHERE execution_id=$1 AND job_id=$2 AND tenant=$3 AND operation='sql' AND priority='batch' AND format='records' AND NOT dry_run AND observation_state<>'terminal' AND expires_at>clock_timestamp()")
+            .bind(execution).bind(job).bind(tenant).fetch_optional(&self.pool).await.map_err(unavailable)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let original = stored(row)?;
+        // Do not deserialize job payloads or raw SQL. Only this original safe
+        // row can supply the immutable receipt, attribution and request class.
+        if original.execution_id.is_nil()
+            || original.owner_uuid.is_nil()
+            || original.expires_at - original.received_at != chrono::Duration::hours(720)
+            || original.redacted_sql.is_some()
+            || original.redaction_version != 1
+        {
+            return Err(HistoryError::InvalidValue);
+        }
+        let event = PendingExecution::new(
+            Receipt {
+                execution_id: original.execution_id,
+                received_at: original.received_at,
+                expires_at: original.expires_at,
+            },
+            original.principal,
+            original.owner_uuid,
+            original.request,
+            RedactedSql::restore_omitted(original.redaction_status),
+        )?;
+        Ok(Some((event, original.execution_admitted)))
+    }
+
     /// Allocates a fresh UUID and trusted DB receipt BEFORE building the event.
     /// No caller-provided UUID/timestamp re-admission API exists.
     pub async fn receipt(&self) -> Result<Receipt, HistoryError> {

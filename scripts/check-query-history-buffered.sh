@@ -59,5 +59,8 @@ export SIGLAKE_HISTORY_FIXTURE_DIR="$work"
 cargo --version
 rustc --version
 cargo clippy --version
-timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test query_server oidc::buffered_history:: -- --include-ignored --test-threads=1
+# Preserve ALL prior buffered/NDJSON selections. The newly nested batch tests
+# require the separate v2 + job-role fixture in check-query-history-batch.sh;
+# this explicit skip excludes no previously accepted test name.
+timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test query_server oidc::buffered_history:: -- --include-ignored --skip oidc::buffered_history::batch_history:: --test-threads=1
 ISOLATED_FIXTURE

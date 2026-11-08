@@ -1,12 +1,13 @@
-# Optional buffered / local NDJSON query-history integration (PARTIAL coverage)
+# Optional buffered / local NDJSON / local batch query-history integration (PARTIAL coverage)
 
 `AppState::with_history(HistoryService::observer())` is an explicit production
 state/router seam. The default is **None**, and no standalone binary startup,
 CLI flag, URL/environment resolver or migration enables collection. The caller
 must explicitly supply a trusted, preflighted writer and retain the sole service
 owner. Tests inject that application state; this is not deployed collection.
-See [the unchanged storage/role contract](query-history-store.md). Reader schema,
-RLS, column ACL, literal `pg_` contract and original 30-day expiry are unchanged.
+See [the storage/role contract](query-history-store.md) and the explicit v2 batch
+owner-migration dependency below. Reader fields, RLS, column ACL, literal `pg_`
+contract and original 30-day expiry are unchanged; v1 is preserved byte-for-byte.
 
 ## Buffered route boundary and attribution
 
@@ -44,7 +45,8 @@ validation failure disables observation, not the query.
 | `/api/v1/sql` NDJSON with no configured peer source, nonbatch | Same external parent transferred into the actual typed source/body lifetime |
 | `/api/v1/sql/local` NDJSON, nonbatch | Same, independent of configured peers; real EOF/error/truncation or server-observed body abandonment |
 | Explicit distributed NDJSON, configured transparent coordinator/fallback, shard, other formats | Deferred; no stream/job lifecycle inferred |
-| Batch submit/run/cancel/restart (202) | Deferred; submission is not terminal success |
+| Local non-coordinator batch submit/run/cancel/controller recovery | One external UUID; 202 is queued, not execution admission or terminal success; v2 association required for verified durable resume |
+| Configured transparent peers, explicit distributed batch, shard/internal batch | Deferred/unobserved, including configured transparent local fallback |
 | Auth/tenant middleware or JSON extractor rejection | No execution observation |
 | Missing/ambiguous effective tenant, no observer, stopped service/no DB receipt | No durable execution row promised; never a fabricated correlation ID |
 | Jaeger/search/warmers, direct engine APIs, MCP subprocess, console chain | Not observed/proved by this slice |
@@ -156,9 +158,8 @@ not exact original event/completion times. Retries retain original receipt/expir
 Records wrappers own early `?` exits and finalize typed execution/render results
 before returning; this is not proof of network delivery. Local NDJSON transfers
 the same owner through source completion/error/truncation and body abandonment
-as described below. Other formats and configured distributed sources remain
-unobserved. Batch wrappers must persist/transfer the
-same execution UUID through job submission, run, cancellation and recovery;
+as described below. Configured distributed sources remain unobserved. Local
+batch now transfers the same execution UUID through the separate lifecycle below;
 202/queued is not terminal success. Coordinator fanout must not produce duplicate
 public parents or trust client-provided parent IDs. These changes require branch
 and cancellation tests, and an explicitly reviewed legacy raw-audit/log cutover.
@@ -172,8 +173,8 @@ complete-roadmap, MCP-subprocess or console-chain claim is made.
 Only positively selected named-tenant, nonbatch, nonshard requests are included.
 Transparent `/sql` requires **no configured peer source**; explicit `/sql/local`
 remains local even with peers configured. Auth/extractor/default/shared paths,
-configured coordinator/fallback, explicit distributed NDJSON and jobs remain
-deferred/unobserved. No startup activation or URI resolution was added.
+configured coordinator/fallback and explicit distributed NDJSON remain
+deferred/unobserved. Batch always renders records and has separate ownership below. No startup activation or URI resolution was added.
 
 The existing admission hook and verified principal create one external parent;
 `render_ndjson` transfers that same handle and original monotonic start into
@@ -383,3 +384,115 @@ cancellation and formatter/pool-marker regressions remain separate checks. There
 is no new mid-body timeout/cancellation acknowledgement, real provider test,
 full CI, complete metrics/coverage, full erasure, console/MCP-chain or production
 activation claim.
+
+
+## Local non-coordinator batch/job ownership (v2, explicit opt-in only)
+
+The external observer starts before existing validation/admission and transfers
+its sole handle after successful job INSERT. The batch reservation remains in
+its existing place before enqueue and is **not** execution-admission evidence.
+Admission is recorded only when the actual run future is first polled, after
+its existing running-publication decision. A zero-budget run or a queued cancel
+that never polls SQL stays not admitted. Existing syntax/read-only validation
+may reject before queue; semantic planning remains on the dedicated runtime and
+can fail after actual run admission. No planning or job behavior was moved.
+Requested batch NDJSON still executes/renders records, as it always did; history
+records the actual format. Transparent `/sql` with any configured peer source,
+explicit distributed batch, shards, coordinator identities and ambiguous/default
+routing remain unobserved; explicit `/sql/local` is positively local even with
+configured peers. Auth/extractor rejection remains outside observation.
+
+The job store adds only nullable internal `history_execution_id UUID` through
+its existing additive job migration seam. Old jobs remain NULL and unobserved,
+with no backfill or recovery-time receipt. The field is absent from all public
+request/response DTOs and no receipt type gains Deserialize. Only the controller
+passes the newly minted observation UUID; headers/extra request fields never
+supply it. Existing job raw query/result/error payloads and raw logging remain
+**unsanitized and outside the new-history guarantee**; none are deleted, copied
+into new history, or claimed sanitized. Existing job tenant authorization,
+execution-owner leases, conditional writes, limits, scope and idempotence stay
+unchanged. The job store's existing auto-migration privilege assumptions are not
+history-role isolation proof or production rollout authorization.
+
+**Separately reviewed OWNER provisioning dependency:** apply the unchanged v1
+`history/schema.sql`, then `history/schema-v2-batch.sql` once. This manual atomic
+v2 migration requires the exact validated v1 nonterminal-evidence constraint,
+relaxes ONLY its `job_id IS NULL` clause, and preserves every numeric/terminal
+invariant. A non-NULL job association requires SQL/records/batch/non-dry-run,
+is unique per job, and cannot be rebound or cleared. Incompatible data/schema
+or a repeated migration fails atomically without backfill/deletion/relabeling.
+No runtime writer DDL, new history table, reader field or role/grant widening
+was added. No production migration was executed. Existing console/buffered
+immutable evidence remains **v1** proof, not retroactive v2 acceptance.
+Missing-v2 association failure does not change 202 or local execution; durable
+resume cannot guess an association that never bound.
+
+Association is two trusted, non-atomic stores: job INSERT with its pointer,
+then owned-task spawn before the handler's next await. Bounded history association
+runs inside that task before engine polling. A 202 does not guarantee a history
+binding while the owned task is still unpolled. A crash/outage between the two
+stores can leave a partial link; it is not a durable outbox or exactly-once delivery.
+Internal resume uses one bounded original-row SELECT and verifies both UUIDs,
+exact original job tenant, SQL/records/batch semantics, original owner/receipt,
+original 720-hour expiry and omission metadata. It never reconstructs context
+from raw job SQL/results/errors or the current canceller, never resets expiry,
+and never heartbeats an old history owner. Missing, expired, mismatched or
+already-terminal rows do not mint replacements. Unknown admission after restart
+stays unknown, not inferred from `started_at`, 202, or a reservation.
+
+History terminals are selected only **after** authoritative persisted job
+transitions, using the winning state (including an inline-body-cap failure),
+never the executor's wished-for result. A local queued cancellation waits for
+Abortable to drop the execution before claiming non-admission, closing the
+admit/cancel race without changing abort/resource ownership. Repeated cancellation
+retains its existing 409. Genuine remote cancellation can reconcile known original
+admission; unknown original admission remains indeterminate. Failed job-store
+terminal persistence drops into uncertainty; existing owner-local reconciliation
+can later report the state it actually installed, not a discarded success.
+Job-owner lease recovery may call the job failed but is **only indeterminate**
+history evidence. Notifications share a bounded 100ms best-effort pass (at most
+32 selected recovered links); omitted/lost evidence retains independent history
+owner lease uncertainty. Startup job recovery before observer injection likewise
+relies on that independent lease, not a fabricated failure. Genuine late terminal
+evidence can reconcile before the original expiry.
+
+Returned rows/truncation are copied only from the actual successful records
+result; estimates require `estimate_complete`. Batch collection has no complete
+settled scan-instrumentation snapshot, so measured rows/bytes stay NULL. Cache is
+bypass. Original monotonic duration includes validation/queue/run to terminal
+selection; resumed durations stay NULL (no recovery-time clock). Original event
+wall times stay NULL. History terminal queuing never awaits DB inside the job's
+conditional terminal transition; remote verification and association retain the
+100ms budget. Existing 1000-entry/8MiB/30s volatile retry limits and safe Drop,
+shutdown and observer/service split remain unchanged.
+
+### Batch verification and explicit limits
+
+`scripts/check-query-history-batch.sh` uses the same corrected private environment,
+pinned native Rust1.95/PG16.14, offline locked two-job cache, socket-only disposable
+PG and local RS256 issuer. The extra `qh_jobs` role and advisory/trigger gates
+exist only in that disposable fixture, with no production test knobs. Actual
+router tests cover pending 202, original UUID/pointer/header injection, renewed
+and cross-tenant identity/access, original rather than canceller attribution,
+prequeue syntax/admission rejection, actual run success/semantic-plan failure,
+pre-run and in-run timeout, queued/running/repeated cancellation and persisted
+cancel/completion ordering, history-lock/no-receipt faults, job-store privilege
+refusal with unchanged response policy, original-UUID controller recreation,
+lease uncertainty, legacy NULL pointers and genuine late terminal reconciliation.
+The fixture gates use PostgreSQL advisory/row-lock queue evidence and explicit
+worker release, not arbitrary sleeps. Existing memory and PostgreSQL ownership,
+conditional-cancel/race/resource/finished-reconciliation regressions remain
+separate required selections. v1->v2 migration is tested on real router-created
+rows, including missing-v2 safe behavior and immutable/unique binding.
+
+The additional internal PG resume/expiry test begins a real observation (no
+seeded execution row) and uses the established privileged fixture-only clock
+rewrite of its original row **and opaque DTO**, then purge/retry/recreation to
+check no resurrection. This is not a real 30-day wait or exact microsecond-boundary
+proof. Wrong job/tenant/pointer resume fails closed. Controller/service recreation
+and lease recovery are **not SIGKILL/process-restart or commit-packet fault proof**.
+The job-store privilege-refusal test is not a transport outage; the real history
+lock and disconnected history-login tests are separately identified. No complete
+history, production startup activation, distributed coverage, legacy logging
+cutover, physical erasure, full CI, deploy, console/MCP chain or roadmap completion
+is claimed. All prior rollout/TLS/backup/erasure gates remain unchanged.

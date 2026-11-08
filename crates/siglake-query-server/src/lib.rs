@@ -400,12 +400,16 @@ impl AppState {
     }
 
     pub fn with_jobs(mut self, jobs: JobStore) -> Self {
+        if let Some(observer) = &self.history {
+            jobs.set_history_observer(observer.clone());
+        }
         self.jobs = Arc::new(jobs);
         self
     }
 
     /// Inject a trusted observer without transferring service/task ownership.
     pub fn with_history(mut self, observer: history::HistoryObserver) -> Self {
+        self.jobs.set_history_observer(observer.clone());
         self.history = Some(observer);
         self
     }

@@ -43,6 +43,13 @@ pub struct RedactedSql {
 }
 
 impl RedactedSql {
+    pub(super) fn restore_omitted(status: RedactionStatus) -> Self {
+        Self {
+            sql: None,
+            status,
+            version: 1,
+        }
+    }
     /// Conservative omit-on-uncertainty fallback for ALL inputs, including valid
     /// SQL. This API name does not imply parsing or canonical rendering occurs.
     pub fn parse(original: &str) -> Self {

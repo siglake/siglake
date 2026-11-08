@@ -218,3 +218,14 @@ for previously supported input, unsupported valid input and tokenizable parse
 errors. Compile-fail tests protect constructor/Deserialize/Debug boundaries.
 These are storage tests, not executed-query lifecycle/E2E coverage or production
 provider validation.
+
+## Optional v2 queued-job association (manual owner migration)
+
+`src/history/schema.sql` remains the immutable v1 baseline. The separately
+reviewed `schema-v2-batch.sql` owner migration permits a nonterminal `job_id`,
+while preserving all other nonterminal evidence restrictions. It constrains
+non-NULL associations to SQL/records/batch/non-dry-run, makes each job association
+unique and immutable, and fails atomically on incompatible v1 constraints/data.
+It changes no reader fields, RLS or grants. No history runtime runs this DDL and
+no production provisioning/rollout is authorized. See the runtime document for
+two-store partial-link, original-receipt recovery and verification limitations.

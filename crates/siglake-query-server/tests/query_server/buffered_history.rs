@@ -19,6 +19,8 @@ use std::{
 };
 use uuid::Uuid;
 const CORRELATION: &str = "x-siglake-history-id";
+#[path = "batch_history.rs"]
+mod batch_history;
 #[path = "ndjson_history.rs"]
 mod ndjson_history;
 
@@ -403,15 +405,19 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
     let streamed_id = correlation(&streamed);
     let _ = streamed.bytes().await.unwrap();
     assert_eq!(row(&f.admin, streamed_id).await["outcome"], "success");
-    unobserved(
+    let batch = post(
         &s,
         &t,
-        &f.admin,
         "/api/v1/sql",
         json!({"query":"SELECT 1", "priority":"batch"}),
-        StatusCode::ACCEPTED,
     )
     .await;
+    assert_eq!(batch.status(), StatusCode::ACCEPTED);
+    let batch_id = correlation(&batch);
+    let batch = batch.json::<Value>().await.unwrap();
+    let batch_row = row(&f.admin, batch_id).await;
+    assert_eq!(batch_row["outcome"], "success");
+    assert_eq!(batch_row["job_id"], batch["job_id"]);
     // Configured coordinator fallback is explicitly deferred, even if it would
     // execute locally. No nested wrapper may create a phantom parent.
     let coordinator = server(
@@ -500,7 +506,10 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
     // Admin inspection of EVERY collected execution, without dumping row data.
     let facts = sqlx::query("SELECT count(*) AS n, count(DISTINCT execution_id) AS ids, count(DISTINCT owner_uuid) AS owners, bool_and(redacted_sql IS NULL AND redaction_status='omitted' AND expires_at-received_at=interval '720 hours' AND admitted_at IS NULL AND finished_at IS NULL AND finished_observed_at IS NOT NULL AND duration_ms IS NOT NULL AND observation_state='terminal') AS safe FROM query_history.executions").fetch_one(&f.admin).await.unwrap();
     let n: i64 = facts.get("n");
-    assert_eq!(n, 18);
+    assert_eq!(
+        n, 19,
+        "the formerly deferred batch now adds one external parent"
+    );
     assert_eq!(n, facts.get::<i64, _>("ids"));
     assert_eq!(facts.get::<i64, _>("owners"), 1);
     assert!(facts.get::<bool, _>("safe"));

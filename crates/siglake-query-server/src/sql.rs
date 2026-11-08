@@ -5880,13 +5880,19 @@ async fn submit_batch(
     .await?;
     let id = state
         .jobs
-        .submit(
+        .submit_observed(
             effective_query.sql.clone(),
             Priority::Batch,
             state.job_owner(&identity),
+            history_buffered::batch_execution_id(),
         )
         .await
         .map_err(ApiError::internal)?;
+    let history = history_buffered::transfer_batch(id.0);
+    if let Some(observation) = &history {
+        state.jobs.track_history(id, observation.clone());
+    }
+    let observer = state.history.clone();
     let audit = state.audit.clone();
     let identity = identity.clone();
     // Passed WHOLE. `max_rows_scanned` had never been copied across, so
@@ -5905,9 +5911,25 @@ async fn submit_batch(
     jobs.register_abort(id, abort);
 
     state.jobs.batch_runtime().spawn(async move {
+        // The run is the sole strong lifecycle owner, including while queued
+        // and during post-abort acknowledgement. The registry is only weak:
+        // dropping/panicking this future must retain uncertainty, not strand
+        // a live observation in the job store.
+        let _history = history;
         // The reservation lives in the spawned future, not in the short HTTP
         // request. Dropping this future on DELETE also drops the reservation.
         let _admission = admission;
+        // No await after the durable INSERT until this task owns the job,
+        // reservation and observation: cancelling HTTP must not orphan a live
+        // owner's pending job. Association is bounded metadata work, before
+        // engine polling and outside Abortable so DELETE during the bind still
+        // retains the original receipt and authoritative cancellation outcome.
+        // A queued/unpolled task (and its 202) does not promise a completed bind.
+        if let Some(observation) = &_history {
+            if let (Some(observer), Some(execution)) = (&observer, observation.execution_id()) {
+                observer.associate_job(execution, id.0).await;
+            }
+        }
         let lifecycle = JobLifecycle {
             jobs: jobs.clone(),
             id,
@@ -5937,6 +5959,7 @@ async fn submit_batch(
             ),
         );
         let _ = futures::future::Abortable::new(execution, abort_registration).await;
+        jobs.observe_history_after_run(id).await;
         jobs.clear_abort(id);
     });
 
@@ -6114,6 +6137,18 @@ async fn drive_batch_job_after_running_publication(
     // disagreeing with itself: the metric says the job produced an
     // answer, the audit trail says a query ran to completion, and
     // `GET /api/v1/jobs/<id>` says it was cancelled.
+    if let Some(observation) = jobs.history_observation(id) {
+        match &outcome {
+            BatchOutcome::Ok(body, cost) => {
+                observation.cost(cost);
+                observation.records(body.row_count, body.truncated);
+            }
+            BatchOutcome::Timeout(Some(cost)) | BatchOutcome::Failed(_, Some(cost)) => {
+                observation.cost(cost)
+            }
+            _ => {}
+        }
+    }
     let (terminal, persisted) = match outcome {
         BatchOutcome::Ok(body, cost) => {
             let dropped_rows = body.row_count;
@@ -6864,6 +6899,9 @@ async fn run_batch_query(
     // The run's budget, started by the caller before it published `running`.
     deadline: BatchDeadline,
 ) -> BatchOutcome {
+    if let Some(observation) = lifecycle.and_then(|l| l.jobs.history_observation(l.id)) {
+        observation.admit();
+    }
     // Dropping the batch future (timeout or DELETE) must stop the scan pumps,
     // not just their parent future. The scan captures this extension while it
     // is planned; CancelOnDrop flips it on every return path.
@@ -19218,6 +19256,7 @@ pub async fn distributed(
     // `/api/v1/sql` falls back to local instead (see `handle`).
     let Some(peers) = state.peers.as_ref().and_then(|source| source.capture()) else {
         let eligible = history_buffered::eligible(&req)
+            && (req.priority != Priority::Batch || req.dry_run)
             && req.format.unwrap_or_default() == QueryFormat::Records;
         return history_buffered::observe(
             state,

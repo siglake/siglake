@@ -1,5 +1,6 @@
 //! History primitives and opt-in buffered / local NDJSON observation. No startup
 //! wiring, audit cutover, environment configuration or runtime DDL.
+pub(crate) mod batch;
 pub(crate) mod buffered;
 pub mod redaction;
 mod runtime;

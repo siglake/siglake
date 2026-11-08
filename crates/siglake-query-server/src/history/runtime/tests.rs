@@ -1038,3 +1038,113 @@ async fn postgres_stream_queue_terminal_contention_duplicates_and_shutdown() {
         expires
     );
 }
+
+#[tokio::test]
+#[ignore = "requires own disposable Postgres runner"]
+async fn postgres_batch_resume_requires_original_binding_and_expiry_never_resurrects() {
+    let f = fixture().await;
+    let v2: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_constraint WHERE conrelid='query_history.executions'::regclass AND conname='executions_batch_job_v2')").fetch_one(&f.admin).await.unwrap();
+    if !v2 {
+        sqlx::raw_sql(include_str!("../schema-v2-batch.sql"))
+            .execute(&f.admin)
+            .await
+            .unwrap();
+    }
+    let mut service = ready_service(&f).await;
+    let observer = service.observer();
+    let mut batch_request = request();
+    batch_request.priority = Priority::Batch;
+    let handle = Arc::new(
+        observer
+            .begin(
+                principal(),
+                batch_request,
+                RedactedSql::parse("SELECT 'SECRET_SQL'"),
+            )
+            .await,
+    );
+    let execution = handle.receipt().unwrap().execution_id();
+    let jobs = crate::jobs::JobStore::new(1, Duration::from_secs(600));
+    let job = jobs
+        .submit_observed(
+            "SELECT 'legacy raw payload outside history guarantee'".into(),
+            crate::limits::Priority::Batch,
+            Some("runtime-fixture".into()),
+            Some(execution),
+        )
+        .await
+        .unwrap();
+    observer.associate_job(execution, job.0).await;
+    assert!(observer
+        .resume_job(execution, Uuid::new_v4(), "runtime-fixture")
+        .await
+        .is_none());
+    assert!(observer
+        .resume_job(execution, job.0, "foreign")
+        .await
+        .is_none());
+    assert!(observer
+        .resume_job(Uuid::new_v4(), job.0, "runtime-fixture")
+        .await
+        .is_none());
+    let resumed = observer
+        .resume_job(execution, job.0, "runtime-fixture")
+        .await
+        .unwrap();
+    assert_eq!(resumed.execution_id(), Some(execution));
+    drop(resumed); // Unknown admission remains indeterminate, not guessed false.
+    wait_row(&f, execution, "indeterminate").await;
+    wait_ready(&service).await;
+
+    // Privileged fixture-only clock rewrite of the ACTUAL begin-created row
+    // and its original opaque DTO, as in the established runtime expiry tests.
+    // No execution row is seeded and no production clock/receipt API is added.
+    let mut event = handle
+        .observation
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .event
+        .clone();
+    expire(&f, &mut event).await;
+    handle.observation.lock().unwrap().as_mut().unwrap().event = event;
+    let original_receipt = handle.receipt().unwrap();
+    assert!(observer
+        .resume_job(execution, job.0, "runtime-fixture")
+        .await
+        .is_none());
+    f.writer.purge_expired(1000).await.unwrap();
+    assert!(jobs.cancel(job).await.unwrap());
+    let observation =
+        super::super::batch::BatchObservation::new(handle.clone(), None, job.0, Some(false));
+    observation.finish(crate::jobs::JobStatus::Cancelled, false);
+    wait_ready(&service).await;
+    assert_eq!(
+        handle.receipt().unwrap().execution_id(),
+        original_receipt.execution_id()
+    );
+    assert_eq!(
+        handle.receipt().unwrap().expires_at(),
+        original_receipt.expires_at()
+    );
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM query_history.executions WHERE execution_id=$1)",
+    )
+    .bind(execution)
+    .fetch_one(&f.admin)
+    .await
+    .unwrap();
+    assert!(
+        !exists,
+        "expired queued terminal must never reinsert its parent"
+    );
+    let _ = service.shutdown().await;
+    let mut replacement = ready_service(&f).await;
+    assert!(replacement
+        .observer()
+        .resume_job(execution, job.0, "runtime-fixture")
+        .await
+        .is_none());
+    assert!(replacement.shutdown().await);
+}
