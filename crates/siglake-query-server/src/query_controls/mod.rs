@@ -1,6 +1,7 @@
 //! Policy store and injection-only buffered request authority. No env/main
 //! activation or public enforcement metadata. Supplied metadata constructors
 //! are NOT authentication proof; runtime derives keys from verified identity.
+pub(crate) mod body;
 mod config;
 mod dto;
 mod owned;

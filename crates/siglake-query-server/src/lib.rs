@@ -405,7 +405,7 @@ impl AppState {
 
     /// Local/test server-side injection only. Captures validated operator timeout
     /// settings; configure limits before calling. Unsupported lifetimes fail
-    /// closed until body/job/Jaeger/shard gates are implemented and reviewed.
+    /// closed until job/Jaeger/shard gates are implemented and reviewed.
     /// No env/CLI/main activation or successful enforcement labels are provided.
     pub fn with_query_controls(
         mut self,
@@ -418,6 +418,14 @@ impl AppState {
             operator_generation,
         )?));
         Ok(self)
+    }
+
+    /// Local/test service lifecycle: retain the state/authority until this
+    /// completes. Cancelling the wait does not discard producer ownership.
+    pub async fn shutdown_query_controls(&self) {
+        if let Some(authority) = &self.query_controls {
+            authority.shutdown().await;
+        }
     }
 
     pub fn with_jobs(mut self, jobs: JobStore) -> Self {

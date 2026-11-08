@@ -11,7 +11,8 @@
 //!   stream emits a final `{ "_meta": "truncated", … }` marker line
 //!   and ends. An execution failure after the 200 response has started
 //!   similarly becomes a final `{ "_meta": "error", … }` line so the
-//!   body remains parseable. Constant memory regardless of result size.
+//!   body remains parseable. Configured controlled production bounds channel
+//!   bytes, not native values, encoded rows or retained Arrow backing memory.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -647,6 +648,133 @@ pub fn batches_to_records_with_schema(
     })
 }
 
+/// Cooperative adapter: checks before/after each <=16KiB sink fragment.
+/// Native Arrow/serde conversion, one encoded row and Arrow backing allocations
+/// are NOT bounded by this size and are not OS-preempted. No total-memory or
+/// maximum elapsed-time claim follows from these fragment checkpoints.
+struct CheckedWriter<W>(W);
+impl<W: Write> Write for CheckedWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        for part in bytes.chunks(crate::query_controls::body::CHUNK_BYTES) {
+            crate::query_controls::runtime::render_check()?;
+            self.0.write_all(part)?;
+            crate::query_controls::runtime::render_check()?;
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+fn checked_json(value: &(impl Serialize + ?Sized)) -> io::Result<Bytes> {
+    let mut writer = CheckedWriter(Vec::new());
+    serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
+    crate::query_controls::runtime::render_check()?;
+    Ok(Bytes::from(writer.0))
+}
+/// Same envelope/ordering as serde's RecordsResponse, without encoding a second
+/// whole-query copy. Only one row/field encoding is live in addition to the
+/// admitted buffered records representation. Native single values remain sized
+/// by existing query semantics, NOT a new hard value/output policy.
+pub(crate) fn records_response(
+    status: axum::http::StatusCode,
+    body: std::sync::Arc<RecordsResponse>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if crate::query_controls::runtime::current().is_none() {
+        return (status, axum::Json(body.as_ref())).into_response();
+    }
+    let stream = async_stream::try_stream! {
+        yield Bytes::from_static(b"{\"columns\":");
+        yield checked_json(&body.columns)?;
+        yield Bytes::from(format!(",\"row_count\":{},\"rows\":[", body.row_count));
+        let rows = body.rows.as_array().ok_or_else(|| io::Error::other("records rows are not an array"))?;
+        for (i, row) in rows.iter().enumerate() {
+            tokio::task::yield_now().await;
+            crate::query_controls::runtime::render_check()?;
+            if i != 0 { yield Bytes::from_static(b","); }
+            yield checked_json(row)?;
+        }
+        yield Bytes::from_static(b"]");
+        if body.truncated { yield Bytes::from_static(b",\"truncated\":true"); }
+        if let Some(cap) = body.max_rows { yield Bytes::from(format!(",\"max_rows\":{cap}")); }
+        if let Some(cost) = &body.cost { yield Bytes::from_static(b",\"cost\":"); yield checked_json(cost)?; }
+        if let Some(stats) = &body.stats { yield Bytes::from_static(b",\"stats\":"); yield checked_json(stats)?; }
+        if let Some(approximation) = &body.approximation { yield Bytes::from_static(b",\"approximation\":"); yield checked_json(approximation)?; }
+        crate::query_controls::runtime::render_check()?;
+        yield Bytes::from_static(b"}");
+    };
+    (
+        status,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::from_stream(
+            Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>
+        ),
+    )
+        .into_response()
+}
+/// Already-buffered nonfanout metadata rows, encoded one at a time. History
+/// success stays deferred until the OUTER body consumes EOF.
+pub(crate) fn records_ndjson_body(body: RecordsResponse, no_data_scan: bool) -> axum::body::Body {
+    let mut observation = crate::history::streaming::rendered_observation(no_data_scan);
+    let stream = async_stream::try_stream! {
+        let rows = body.rows.as_array().ok_or_else(|| io::Error::other("records rows are not an array"))?;
+        for row in rows {
+            tokio::task::yield_now().await;
+            crate::query_controls::runtime::render_check()?;
+            yield checked_json(row)?;
+            yield Bytes::from_static(b"\n");
+        }
+        if let Some(o) = &mut observation { o.complete(rows.len(), false, None, None); }
+    };
+    axum::body::Body::from_stream(
+        Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>
+    )
+}
+/// Cooperative buffered conversion: one Arrow row per step, retaining the
+/// existing final Value representation, not a full JSON encoding copy.
+pub(crate) async fn batches_to_records_cooperative(
+    batches: &[RecordBatch],
+    max_rows: Option<usize>,
+) -> Result<RecordsResponse> {
+    if crate::query_controls::runtime::current().is_none() {
+        return batches_to_records(batches, max_rows);
+    }
+    let mut body = batches_to_records(&[], max_rows)?;
+    body.columns = batches
+        .first()
+        .map(|b| {
+            b.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    body.row_count = total.min(max_rows.unwrap_or(total));
+    body.truncated = total > body.row_count;
+    body.max_rows = body.truncated.then_some(body.row_count);
+    let mut collector = JsonRowCollector::with_capacity(body.row_count);
+    let mut remaining = body.row_count;
+    for batch in batches {
+        for row in 0..batch.num_rows().min(remaining) {
+            tokio::task::yield_now().await;
+            crate::query_controls::runtime::render_check()?;
+            let mut writer = LineDelimitedWriter::new(CheckedWriter(&mut collector));
+            writer.write(&batch.slice(row, 1))?;
+            writer.finish()?;
+            crate::query_controls::runtime::render_check()?;
+        }
+        remaining = remaining.saturating_sub(batch.num_rows());
+        if remaining == 0 {
+            break;
+        }
+    }
+    body.rows = serde_json::Value::Array(collector.finish()?);
+    Ok(body)
+}
+
 /// A `Write` sink that turns Arrow's NDJSON output directly into JSON values.
 ///
 /// `LineDelimitedWriter` may split a large row across writes, hence `pending`.
@@ -721,10 +849,11 @@ impl Write for JsonRowCollector {
 }
 
 fn collect_record_rows(batches: &[RecordBatch], row_count: usize) -> Result<JsonRowCollector> {
-    let mut writer = LineDelimitedWriter::new(JsonRowCollector::with_capacity(row_count));
+    let mut writer =
+        LineDelimitedWriter::new(CheckedWriter(JsonRowCollector::with_capacity(row_count)));
     write_all(&mut writer, batches)?;
     writer.finish().context("finish arrow JSON writer")?;
-    Ok(writer.into_inner())
+    Ok(writer.into_inner().0)
 }
 
 /// A `Write` sink that keeps the length of what was written to it and nothing
@@ -741,6 +870,9 @@ struct ByteCounter {
 
 impl Write for ByteCounter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Cache-size serialization is rendering work too, even though it does
+        // not retain bytes. Never traverse an entire result past expiry.
+        crate::query_controls::runtime::render_check()?;
         self.len += buf.len();
         #[cfg(test)]
         {
@@ -789,9 +921,17 @@ where
     F: arrow_json::writer::JsonFormat,
 {
     for b in batches {
-        writer
-            .write(b)
-            .with_context(|| format!("write arrow JSON batch ({} rows)", b.num_rows()))?;
+        if crate::query_controls::runtime::current().is_some() {
+            for row in 0..b.num_rows() {
+                crate::query_controls::runtime::render_check()?;
+                writer.write(&b.slice(row, 1))?;
+                crate::query_controls::runtime::render_check()?;
+            }
+        } else {
+            writer
+                .write(b)
+                .with_context(|| format!("write arrow JSON batch ({} rows)", b.num_rows()))?;
+        }
     }
     Ok(())
 }
@@ -877,6 +1017,7 @@ pub struct NdjsonStream {
     priority: crate::limits::Priority,
     finished: bool,
     trailer: Option<Bytes>,
+    pending_batch: Option<(DfRecordBatch, usize, bool)>,
     history: Option<(
         crate::history::streaming::StreamObservation,
         std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
@@ -895,6 +1036,7 @@ impl NdjsonStream {
             finished: false,
             trailer: None,
             history: None,
+            pending_batch: None,
         }
     }
 
@@ -950,6 +1092,9 @@ impl Stream for NdjsonStream {
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.pending_batch.is_some() {
+            return self.next_row(cx);
+        }
         // Emit a queued trailer (the truncation marker) if we have one.
         if let Some(trailer) = self.trailer.take() {
             self.finished = true;
@@ -974,6 +1119,10 @@ impl Stream for NdjsonStream {
             }
             Some(Ok(batch)) => {
                 let (effective, exhausted) = self.clip_batch(&batch);
+                if crate::query_controls::runtime::current().is_some() && effective.num_rows() > 0 {
+                    self.pending_batch = Some((effective, 0, exhausted));
+                    return self.next_row(cx);
+                }
                 let bytes = match render_batch_ndjson(&effective) {
                     Ok(b) => b,
                     Err(e) => {
@@ -985,38 +1134,60 @@ impl Stream for NdjsonStream {
                     }
                 };
                 self.rows_emitted += effective.num_rows();
-                if exhausted {
-                    self.trailer = Some(make_truncation_marker(
-                        self.rows_emitted,
-                        self.max_rows.unwrap_or(self.rows_emitted),
-                    ));
-                }
-                // Mid-flight rows-scanned check: poll the underlying
-                // plan's leaf output_rows. When the metric isn't
-                // populated by the table provider, fall back to the
-                // cumulative emitted-row count so the breaker still
-                // trips on raw `SELECT *` traffic.
-                if self.trailer.is_none() {
-                    if let (Some(plan), Some(cap)) = (&self.plan, self.max_rows_scanned) {
-                        let leaf = crate::midflight::sum_leaf_output_rows(plan);
-                        let scanned = (leaf as usize).max(self.rows_emitted);
-                        if scanned > cap {
-                            metrics::counter!(
-                                "siglake_query_breaker_trips_total",
-                                "breaker" => "midflight_rows_scanned_ndjson",
-                                "priority" => self.priority.label(),
-                            )
-                            .increment(1);
-                            self.trailer = Some(make_midflight_marker(scanned, cap));
-                        }
-                    }
-                }
+                self.finish_batch(exhausted);
                 Poll::Ready(Some(Ok(bytes)))
             }
         }
     }
 }
 
+impl NdjsonStream {
+    fn finish_batch(&mut self, exhausted: bool) {
+        if exhausted {
+            self.trailer = Some(make_truncation_marker(
+                self.rows_emitted,
+                self.max_rows.unwrap_or(self.rows_emitted),
+            ));
+        }
+        // Mid-flight rows-scanned check: poll the underlying
+        // plan's leaf output_rows. When the metric isn't
+        // populated by the table provider, fall back to the
+        // cumulative emitted-row count so the breaker still
+        // trips on raw `SELECT *` traffic.
+        if self.trailer.is_none() {
+            if let (Some(plan), Some(cap)) = (&self.plan, self.max_rows_scanned) {
+                let leaf = crate::midflight::sum_leaf_output_rows(plan);
+                let scanned = (leaf as usize).max(self.rows_emitted);
+                if scanned > cap {
+                    metrics::counter!(
+                        "siglake_query_breaker_trips_total",
+                        "breaker" => "midflight_rows_scanned_ndjson",
+                        "priority" => self.priority.label(),
+                    )
+                    .increment(1);
+                    self.trailer = Some(make_midflight_marker(scanned, cap));
+                }
+            }
+        }
+    }
+    fn next_row(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<Bytes>>> {
+        if let Err(error) = crate::query_controls::runtime::render_check() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        let (batch, row, exhausted) = self.pending_batch.take().unwrap();
+        let bytes = render_batch_ndjson(&batch.slice(row, 1)).map_err(io::Error::other);
+        if bytes.is_ok() {
+            self.rows_emitted += 1;
+        }
+        if row + 1 < batch.num_rows() {
+            self.pending_batch = Some((batch, row + 1, exhausted));
+        } else {
+            self.finish_batch(exhausted);
+        }
+        cx.waker().wake_by_ref();
+        Poll::Ready(Some(bytes))
+    }
+}
 impl NdjsonStream {
     /// Returns `(batch_to_emit, true_if_cap_exhausted)`. The returned
     /// batch may be a prefix of `batch` when the cap is hit mid-batch.
@@ -1038,7 +1209,7 @@ impl NdjsonStream {
 fn render_batch_ndjson(batch: &DfRecordBatch) -> Result<Bytes> {
     let mut buf = Vec::with_capacity(batch.num_rows() * 64);
     {
-        let mut writer = LineDelimitedWriter::new(&mut buf);
+        let mut writer = LineDelimitedWriter::new(CheckedWriter(&mut buf));
         writer.write(batch)?;
         writer.finish()?;
     }
@@ -1576,5 +1747,154 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("MemoryConsumer[TopK]"));
+    }
+}
+
+#[cfg(test)]
+mod controlled_render_tests {
+    use super::*;
+    use crate::query_controls::runtime::{body_scope, test_controls};
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn records_and_fast_ndjson_preserve_values_order_and_row_clipping() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "v",
+            std::sync::Arc::new(arrow_array::StringArray::from(vec![
+                Some("quoted\"\\\n"),
+                None,
+                Some("é"),
+            ])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let expected = batches_to_records(std::slice::from_ref(&batch), Some(2)).unwrap();
+        body_scope(test_controls(Duration::from_secs(1)), async {
+            let actual = batches_to_records_cooperative(&[batch], Some(2))
+                .await
+                .unwrap();
+            let expected_bytes = serde_json::to_vec(&expected).unwrap();
+            let response = records_response(
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                std::sync::Arc::new(actual),
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(bytes, expected_bytes);
+            let expected_ndjson = b"{\"v\":\"quoted\\\"\\\\\\n\"}\n{}\n";
+            let bytes = axum::body::to_bytes(records_ndjson_body(expected, false), 1024)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..], expected_ndjson);
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn controlled_arrow_ndjson_preserves_original_clipping_markers_and_float_tokens() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "v",
+            std::sync::Arc::new(arrow_array::Float64Array::from(vec![
+                Some(-0.0),
+                Some(1.25),
+                None,
+            ])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let plan = datafusion::prelude::SessionContext::new()
+            .sql("SELECT 1")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        for cap in [0, 1, 3] {
+            for scan_cap in [None, Some(0)] {
+                let make = || {
+                    let source = datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                        batch.schema(),
+                        futures::stream::iter([Ok(batch.clone())]),
+                    );
+                    let mut stream = NdjsonStream::new(Box::pin(source), Some(cap));
+                    if let Some(scan_cap) = scan_cap {
+                        stream = stream.with_rows_scanned_cap(
+                            plan.clone(),
+                            scan_cap,
+                            crate::limits::Priority::Interactive,
+                        );
+                    }
+                    stream
+                };
+                let mut expected = Vec::new();
+                let mut baseline = make();
+                while let Some(chunk) = baseline.next().await {
+                    expected.extend_from_slice(&chunk.unwrap());
+                }
+                let actual = body_scope(test_controls(Duration::from_secs(1)), async {
+                    let mut stream = make();
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = stream.next().await {
+                        bytes.extend_from_slice(&chunk.unwrap());
+                    }
+                    bytes
+                })
+                .await;
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn fragment_and_inter_row_deadline_checks_reject_late_native_steps() {
+        struct Advance;
+        impl Write for Advance {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                // Stand-in for a late-ready native sink step: direct clock
+                // advancement is driven separately below, not OS preemption.
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let controls = test_controls(Duration::from_secs(1));
+        body_scope(controls, async {
+            let mut checked = CheckedWriter(Advance);
+            checked
+                .write_all(&vec![b'x'; 3 * crate::query_controls::body::CHUNK_BYTES])
+                .unwrap();
+            let body = RecordsResponse {
+                columns: vec!["v".into()],
+                rows: serde_json::json!([{"v":1},{"v":2}]),
+                row_count: 2,
+                truncated: false,
+                max_rows: None,
+                cost: None,
+                stats: None,
+                approximation: None,
+            };
+            let mut stream = records_ndjson_body(body, false).into_data_stream();
+            assert!(stream.next().await.unwrap().is_ok());
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(checked.write_all(b"late").is_err());
+            assert!(stream.next().await.unwrap().is_ok()); // existing row newline only
+            assert!(stream.next().await.unwrap().is_err()); // no next-row success
+            assert!(checked_json(&"x".repeat(128 * 1024)).is_err());
+            assert!(serialized_json_len(&"late-size-count").is_none());
+        })
+        .await;
+    }
+    #[tokio::test]
+    async fn oversized_native_serde_step_detects_expiry_before_success() {
+        struct Late;
+        impl Serialize for Late {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                std::thread::sleep(Duration::from_millis(20));
+                serializer.serialize_str("late-native-value")
+            }
+        }
+        body_scope(test_controls(Duration::from_millis(5)), async {
+            assert!(checked_json(&Late).is_err());
+        })
+        .await;
     }
 }

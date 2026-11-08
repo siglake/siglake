@@ -17,6 +17,7 @@ pub struct ControlsAuthority {
     interactive: TierLimits,
     batch: TierLimits,
     generation: i64,
+    bodies: super::body::BodyTasks,
 }
 impl ControlsAuthority {
     pub(crate) fn new(
@@ -34,7 +35,13 @@ impl ControlsAuthority {
             interactive: limits.interactive.clone(),
             batch: limits.batch.clone(),
             generation,
+            bodies: super::body::BodyTasks::default(),
         })
+    }
+    /// Close the body generation and observe all producer joins. Cancelling
+    /// this wait preserves handles; await it again before service teardown.
+    pub async fn shutdown(&self) {
+        self.bodies.shutdown().await;
     }
     fn tier(&self, priority: Priority) -> &TierLimits {
         match priority {
@@ -91,6 +98,7 @@ pub(crate) struct RequestControls {
 tokio::task_local! {
     static INGRESS: Instant;
     static CONTROLS: RequestControls;
+    static BODY_HISTORY: std::cell::RefCell<Option<crate::history::streaming::DeliveryObservation>>;
 }
 pub(crate) async fn ingress<F: Future>(started: Instant, future: F) -> F::Output {
     INGRESS.scope(started, future).await
@@ -98,13 +106,27 @@ pub(crate) async fn ingress<F: Future>(started: Instant, future: F) -> F::Output
 pub(crate) fn current() -> Option<RequestControls> {
     CONTROLS.try_with(|c| *c).ok()
 }
+/// Transfer observation delivery ownership without making history an authority.
+pub(crate) fn defer_history(observation: &mut crate::history::streaming::StreamObservation) {
+    let _ = BODY_HISTORY.try_with(|slot| *slot.borrow_mut() = Some(observation.defer_delivery()));
+}
+/// Checked from synchronous Arrow/serde sinks as well as async row boundaries.
+/// A single native conversion/escape step is NOT preempted or size bounded.
+pub(crate) fn render_check() -> std::io::Result<()> {
+    super::body::check_cancel()?;
+    if current().is_some_and(|c| tokio::time::Instant::now() >= c.deadline) {
+        Err(std::io::Error::other("query deadline exceeded"))
+    } else {
+        Ok(())
+    }
+}
 fn unavailable() -> ApiError {
     ApiError::service_unavailable("query_policy_unavailable")
 }
 pub(crate) fn unsupported() -> ApiError {
     ApiError::service_unavailable("query_controls_path_unavailable")
 }
-fn expired() -> ApiError {
+pub(super) fn expired() -> ApiError {
     ApiError {
         status: axum::http::StatusCode::GATEWAY_TIMEOUT,
         msg: "query deadline exceeded".into(),
@@ -131,8 +153,8 @@ where
 }
 
 /// Scope includes observational history waits and fully buffered response
-/// rendering. Dropping cancels owned futures; native CPU work remains cooperative,
-/// not OS-preempted. No streaming body is permitted in this partial mode.
+/// rendering and independently owned body production. Native CPU work remains
+/// cooperative, not OS-preempted. Jobs/fanout/shards/Jaeger remain gated.
 pub(crate) async fn run<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
@@ -193,9 +215,31 @@ where
         },
         timeout_opt_out_ignored: caller.circuit_breakers == Some(false),
     };
-    CONTROLS
-        .scope(controls, until(controls.deadline, future))
-        .await
+    if tokio::time::Instant::now() >= controls.deadline {
+        return Err(expired());
+    }
+    let body_slot = authority.bodies.reserve()?;
+    let (result, history) = BODY_HISTORY
+        .scope(std::cell::RefCell::new(None), async {
+            let result = CONTROLS
+                .scope(controls, until(controls.deadline, future))
+                .await;
+            (result, BODY_HISTORY.with(|h| h.take()))
+        })
+        .await;
+    match result {
+        Ok(response) => body_slot.start(response, controls, history),
+        Err(error) => {
+            if let Some(h) = history {
+                if tokio::time::Instant::now() >= controls.deadline {
+                    h.timed_out();
+                } else {
+                    h.failed();
+                }
+            }
+            Err(error)
+        }
+    }
 }
 fn runtime_key(identity: &CallerIdentity) -> Result<Option<RuntimeKey>, PolicyError> {
     if identity.coordinator {
@@ -263,3 +307,21 @@ pub(crate) fn cache_discriminator(limits: &ResolvedLimits) -> Option<String> {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) async fn body_scope<F: Future>(controls: RequestControls, future: F) -> F::Output {
+    CONTROLS.scope(controls, future).await
+}
+
+#[cfg(test)]
+pub(crate) fn test_controls(budget: Duration) -> RequestControls {
+    RequestControls {
+        started: Instant::now(),
+        deadline: tokio::time::Instant::now() + budget,
+        timeout: budget,
+        state: PolicyState::Inherited,
+        revision: None,
+        generation: 1,
+        scan_warning: None,
+        timeout_opt_out_ignored: false,
+    }
+}

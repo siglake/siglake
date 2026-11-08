@@ -3592,7 +3592,7 @@ async fn render_fast_path_records(
     } else {
         "off"
     };
-    let mut response = (status, Json(body.as_ref())).into_response();
+    let mut response = crate::format::records_response(status, Arc::clone(&body));
     set_result_cache_header(&mut response, outcome);
     response
 }
@@ -4860,9 +4860,7 @@ async fn handle_local_inner(
     let allow_approximate = AllowApproximate::for_request(&req);
     let unknown_cost = CostReport::unknown_after_timeout();
     let batch_submission = req.priority == Priority::Batch && !req.dry_run;
-    if state.query_controls.is_some()
-        && (batch_submission || (!req.dry_run && format == QueryFormat::Ndjson))
-    {
+    if state.query_controls.is_some() && batch_submission {
         return Err(crate::query_controls::runtime::unsupported());
     }
     let resolve_started = Instant::now();
@@ -5046,7 +5044,7 @@ async fn handle_local_inner(
             } else {
                 StatusCode::OK
             };
-            let mut response = (status, Json(body.as_ref())).into_response();
+            let mut response = crate::format::records_response(status, Arc::clone(&body));
             set_result_cache_header(&mut response, "hit");
             let result_meta: Result<Response, ApiError> = Ok(response);
             if let Some(cost) = cost.as_ref() {
@@ -7606,9 +7604,31 @@ fn try_count_fast_path_response(
                 stats: Some(crate::format::ScanStats::default()),
                 approximation: None,
             };
-            Ok(Some((StatusCode::OK, Json(body)).into_response()))
+            Ok(Some(crate::format::records_response(
+                StatusCode::OK,
+                Arc::new(body),
+            )))
         }
         QueryFormat::Ndjson => {
+            if crate::query_controls::runtime::current().is_some() {
+                let body = crate::format::RecordsResponse {
+                    columns: vec![fp.output_column],
+                    rows: serde_json::Value::Array(vec![row]),
+                    row_count: 1,
+                    truncated: false,
+                    max_rows: None,
+                    cost: None,
+                    stats: None,
+                    approximation: None,
+                };
+                return Ok(Some(
+                    (
+                        [(header::CONTENT_TYPE, "application/x-ndjson")],
+                        crate::format::records_ndjson_body(body, true),
+                    )
+                        .into_response(),
+                ));
+            }
             let line = serde_json::to_vec(&row).map_err(ApiError::internal)?;
             let mut resp = Response::new(crate::format::rendered_ndjson_body(
                 [line, b"\n".to_vec()].concat(),
@@ -8789,8 +8809,20 @@ async fn try_group_count_fast_path_response_with_bindings(
         return Ok(None);
     };
     match format {
-        QueryFormat::Records => Ok(Some((StatusCode::OK, Json(body)).into_response())),
+        QueryFormat::Records => Ok(Some(crate::format::records_response(
+            StatusCode::OK,
+            Arc::new(body),
+        ))),
         QueryFormat::Ndjson => {
+            if crate::query_controls::runtime::current().is_some() {
+                return Ok(Some(
+                    (
+                        [(header::CONTENT_TYPE, "application/x-ndjson")],
+                        crate::format::records_ndjson_body(body, false),
+                    )
+                        .into_response(),
+                ));
+            }
             let rows = body.rows.as_array().ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!("group fast path rows must be an array"))
             })?;
@@ -9440,7 +9472,9 @@ async fn try_date_histogram_fast_path_records(
     )
     .map_err(|e| ApiError::internal(anyhow::anyhow!("build date_histogram batch: {e}")))?;
 
-    let mut body = crate::format::batches_to_records(&[batch], None).map_err(ApiError::internal)?;
+    let mut body = crate::format::batches_to_records_cooperative(&[batch], None)
+        .await
+        .map_err(ApiError::internal)?;
     body.cost = Some(cost);
     Ok(Some(body))
 }
@@ -9458,8 +9492,20 @@ async fn try_date_histogram_fast_path_response(
         return Ok(None);
     };
     match format {
-        QueryFormat::Records => Ok(Some((StatusCode::OK, Json(body)).into_response())),
+        QueryFormat::Records => Ok(Some(crate::format::records_response(
+            StatusCode::OK,
+            Arc::new(body),
+        ))),
         QueryFormat::Ndjson => {
+            if crate::query_controls::runtime::current().is_some() {
+                return Ok(Some(
+                    (
+                        [(header::CONTENT_TYPE, "application/x-ndjson")],
+                        crate::format::records_ndjson_body(body, false),
+                    )
+                        .into_response(),
+                ));
+            }
             let rows = body.rows.as_array().ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!(
                     "date_histogram fast path rows must be an array"
@@ -11824,7 +11870,7 @@ async fn execute_with_limits(
     let inner = async move {
         match format {
             QueryFormat::Records => {
-                render_records(
+                let response = render_records(
                     df,
                     &resolved_inner,
                     Some(cost),
@@ -11835,7 +11881,20 @@ async fn execute_with_limits(
                     numeric_probe,
                     started,
                 )
-                .await
+                .await?;
+                if crate::query_controls::runtime::current().is_some() {
+                    let (parts, body) = response.into_parts();
+                    Ok(Response::from_parts(
+                        parts,
+                        Body::from_stream(GuardedStream {
+                            inner: body.into_data_stream(),
+                            _cancel: cancel,
+                            _guard: admission,
+                        }),
+                    ))
+                } else {
+                    Ok(response)
+                }
             }
             // Ndjson hands the guard to the body; Records keeps it in this
             // scope, where it covers the collect and fires on the timeout.
@@ -11846,14 +11905,14 @@ async fn execute_with_limits(
 }
 
 struct GuardedStream<S> {
-    _guard: Option<crate::admission::AdmissionGuard>,
+    inner: S,
     /// Cancels the query's scans when this BODY is dropped. It has to live here
     /// rather than in the handler: an NDJSON response streams after the handler
     /// returns, so a handler-scoped guard cancelled healthy requests (3 e2e
     /// tests went 3 rows -> 0). Here it fires on exactly the right event --
     /// the body finishing, or the client hanging up mid-stream.
     _cancel: Option<siglake_storage::CancelOnDrop>,
-    inner: S,
+    _guard: Option<crate::admission::AdmissionGuard>,
 }
 
 impl<S> futures::Stream for GuardedStream<S>
@@ -12087,15 +12146,23 @@ async fn render_records(
     let stats_elapsed = stats_started.elapsed();
 
     let render_started = Instant::now();
-    // #7420: the executed plan's schema is what the caller asked for (aliases,
-    // projection order). It only takes effect when the collect returned no
-    // batches at all; otherwise the batch schema answers, as before.
-    let mut body = crate::format::batches_to_records_with_schema(
+    // Keep upstream's empty-result schema and controlled cooperative conversion.
+    let mut body = if crate::query_controls::runtime::current().is_some() {
+        let mut body = crate::format::batches_to_records_cooperative(
+            &batches, Some(resolved.max_rows_returned),
+        ).await.map_err(ApiError::internal)?;
+        if batches.is_empty() {
+            body.columns = plan.schema().fields().iter().map(|f| f.name().clone()).collect();
+        }
+        body
+    } else {
+        crate::format::batches_to_records_with_schema(
         &batches,
         Some(resolved.max_rows_returned),
         Some(plan.schema().as_ref()),
     )
-    .map_err(ApiError::internal)?;
+    .map_err(ApiError::internal)?
+    };
     let render_elapsed = render_started.elapsed();
     record_phase_metric("sql", "render_records", render_elapsed);
     body.cost = cost;
@@ -12186,7 +12253,7 @@ async fn render_records(
     // encodes the body eagerly, so its cost is inside the handler's `total_ms`
     // and has to be named here to be named at all (#7456).
     let serialize_started = Instant::now();
-    let mut response = (status, Json(body.as_ref())).into_response();
+    let mut response = crate::format::records_response(status, Arc::clone(&body));
     set_result_cache_header(&mut response, cache_outcome);
     let serialize_elapsed = serialize_started.elapsed();
     tracing::info!(
@@ -19743,8 +19810,10 @@ async fn distributed_inner(
             );
             metrics::counter!("siglake_query_coordinator_total", "mode" => "tier1_local")
                 .increment(1);
-            let result: Result<Response, ApiError> =
-                Ok((StatusCode::OK, Json(body)).into_response());
+            let result: Result<Response, ApiError> = Ok(crate::format::records_response(
+                StatusCode::OK,
+                Arc::new(body),
+            ));
             emit_terminal_audit(
                 state.audit.as_ref(),
                 &identity,

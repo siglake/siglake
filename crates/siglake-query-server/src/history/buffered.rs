@@ -244,6 +244,21 @@ where
             (result, evidence)
         })
         .await;
+    if crate::query_controls::runtime::current().is_some()
+        && result.is_ok()
+        && evidence.admitted
+        && evidence.completed
+        && !evidence.transferred
+    {
+        let mut observation = super::streaming::StreamObservation::new(
+            handle.clone(),
+            started,
+            evidence.measurements.clone(),
+        );
+        crate::query_controls::runtime::defer_history(&mut observation);
+        observation.ready();
+        evidence.transferred = true;
+    }
     evidence.measurements.duration_ms = u64::try_from(started.elapsed().as_millis())
         .ok()
         .and_then(|v| Counter::new(v).ok());
@@ -344,11 +359,10 @@ pub(crate) fn transfer_stream() -> Option<super::streaming::StreamObservation> {
             let handle = e.observation.take()?;
             let started = e.started?;
             e.transferred = true;
-            Some(super::streaming::StreamObservation::new(
-                handle,
-                started,
-                e.measurements.clone(),
-            ))
+            let mut observation =
+                super::streaming::StreamObservation::new(handle, started, e.measurements.clone());
+            crate::query_controls::runtime::defer_history(&mut observation);
+            Some(observation)
         })
         .ok()
         .flatten()

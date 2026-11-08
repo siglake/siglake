@@ -302,7 +302,7 @@ async fn generic_primary_preflight_has_no_named_revision_and_closed_is_not_absen
         let result = ingress(
             Instant::now() - limits.interactive.default_timeout,
             run(
-                Some(authority),
+                Some(authority.clone()),
                 CallerIdentity::default(),
                 RequestLimits::default(),
                 Priority::Interactive,
@@ -313,4 +313,5 @@ async fn generic_primary_preflight_has_no_named_revision_and_closed_is_not_absen
         assert_eq!(result.unwrap_err().status, 504);
     })
     .await;
+    authority.shutdown().await;
 }

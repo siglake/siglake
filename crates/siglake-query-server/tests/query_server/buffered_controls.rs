@@ -26,6 +26,16 @@ use uuid::Uuid;
 struct Server {
     base: String,
     task: tokio::task::JoinHandle<()>,
+    state: Option<AppState>,
+}
+impl Server {
+    async fn shutdown(mut self) {
+        if let Some(state) = self.state.take() {
+            state.shutdown_query_controls().await;
+        }
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
 }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -35,8 +45,14 @@ impl Drop for Server {
 async fn serve(state: AppState) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let task = tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
-    Server { base, task }
+    let service_state = state.clone();
+    let task =
+        tokio::spawn(async move { axum::serve(listener, router(service_state)).await.unwrap() });
+    Server {
+        base,
+        task,
+        state: Some(state),
+    }
 }
 fn token(issuer: &str, tenant: &str, client: &str) -> String {
     let mut claims = access_claims(issuer);
@@ -170,6 +186,7 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
     let issuer_owner = Server {
         base: issuer.clone(),
         task: issuer_task,
+        state: None,
     };
     let verifier = OidcVerifier::from_cognito_access_issuer(issuer.clone(), "custom:org_id".into())
         .await
@@ -415,14 +432,6 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
         StatusCode::SERVICE_UNAVAILABLE,
     )
     .await;
-    status(
-        &s.base,
-        &token,
-        "/api/v1/sql/local",
-        json!({"query":"SELECT raw FROM events", "format":"ndjson"}),
-        StatusCode::SERVICE_UNAVAILABLE,
-    )
-    .await;
     for path in [
         "/api/v1/jaeger/events/api/services",
         "/api/v1/jaeger/events/api/services/service/operations",
@@ -438,6 +447,88 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
     drop(held);
+    // Signed actual local NDJSON is now covered, not a format-hint bypass.
+    // The client timeout is deliberately longer than server policy.
+    for route in ["/api/v1/sql", "/api/v1/sql/local"] {
+        let response = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap()
+            .post(format!("{}{route}", s.base)).bearer_auth(&token)
+            .json(&json!({"query":"SELECT raw FROM events WHERE host = 'localhost' LIMIT 10", "default_order":false,"format":"ndjson", "limits":{"circuit_breakers":false}}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.bytes().await.unwrap();
+        let rows: Vec<Value> = payload
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["raw"], "synthetic-row");
+    }
+    // Real authenticated Axum route + PG primary, with a body the transport
+    // NEVER polls. The primary lock spends 700ms of the ORIGINAL 1s budget.
+    // Only source/guard cleanup is observed: no client receipt/ACK claim.
+    {
+        use tower::ServiceExt;
+        let mut blocked = admin.begin().await.unwrap();
+        sqlx::query("LOCK query_policy.agent_limits IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocked)
+            .await
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let route_task = tokio::spawn({
+            let service = router(enabled.clone());
+            let request = axum::http::Request::builder().method("POST").uri("/api/v1/sql/local")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(serde_json::to_vec(&json!({"query":"SELECT raw FROM events WHERE host = 'localhost' LIMIT 11", "default_order":false,"format":"ndjson", "limits":{"circuit_breakers":false,"timeout_seconds":1}})).unwrap())).unwrap();
+            async move { service.oneshot(request).await.unwrap() }
+        });
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        blocked.rollback().await.unwrap();
+        let response = route_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let reserved = |snapshot: &Snapshotter| {
+            snapshot
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .filter_map(|(key, _, _, v)| match v {
+                    DebugValue::Gauge(g)
+                        if key.key().name() == "siglake_query_admission_reserved_bytes" =>
+                    {
+                        Some(g.into_inner())
+                    }
+                    _ => None,
+                })
+                .sum::<f64>()
+        };
+        assert!(
+            reserved(&metrics) > 0.0,
+            "admission remains held through tiny source EOF until outer EOF/deadline"
+        );
+        // DebuggingRecorder snapshots RESET gauges; do not mistake a drained
+        // gauge for cleanup. Reacquiring the entire REAL admission budget is
+        // positive proof that the retained stream guard actually released it.
+        let all = tokio::time::timeout_at(
+            started + Duration::from_millis(1500),
+            enabled
+                .admission
+                .acquire(enabled.limits.admission_budget_bytes),
+        )
+        .await
+        .expect("original server timer must free admission before a reset body timer could")
+        .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "source EOF must not release admission early"
+        );
+        drop(all);
+        assert_eq!(siglake_query_server::queries_in_flight(), 0);
+        let payload = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&payload[..], b"{\"_meta\":\"timeout\"}\n");
+    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT count(*) FROM siglake_query_jobs")
             .fetch_one(&admin)
@@ -468,6 +559,7 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
     let peer_owner = Server {
         base: peer_url.clone(),
         task: peer_task,
+        state: None,
     };
     let dist = serve(
         enabled
@@ -635,7 +727,10 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
     assert_eq!(response.status(), StatusCode::OK);
     response.bytes().await.unwrap();
     job_state.jobs.shutdown().await.unwrap();
-    drop((job_server, peer_owner, issuer_owner));
+    for server in [job_server, dist, generic, old, s, peer_owner, issuer_owner] {
+        server.shutdown().await;
+    }
+    enabled.shutdown_query_controls().await;
     manager.close();
     admin.close().await;
 }
