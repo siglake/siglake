@@ -34,6 +34,7 @@ pub mod limits;
 pub mod midflight;
 pub mod oidc;
 pub mod openapi_dto;
+pub mod query_controls;
 mod sql;
 pub mod tenants;
 pub mod udfs;
