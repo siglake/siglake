@@ -34,6 +34,12 @@ pub mod limits;
 pub mod midflight;
 pub mod oidc;
 pub mod openapi_dto;
+
+/// Named public CA profiles for dedicated connectors; never ordinary app pools.
+pub mod postgres_trust;
+
+#[cfg(test)]
+mod postgres_trust_tests;
 pub mod query_controls;
 mod sql;
 pub mod tenants;

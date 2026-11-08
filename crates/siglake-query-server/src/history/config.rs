@@ -28,15 +28,34 @@ impl HistoryConfig {
         match std::env::var("SIGLAKE_QUERY_HISTORY_DATABASE_URL") {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(_) => Err(HistoryConfigError::Invalid),
-            Ok(uri) => Self::explicit(&uri, audit_disabled).map(Some),
+            Ok(uri) => {
+                let selector = std::env::var("SIGLAKE_QUERY_HISTORY_CA_PROFILE")
+                    .map(Some)
+                    .or_else(|e| match e {
+                        std::env::VarError::NotPresent => Ok(None),
+                        _ => Err(HistoryConfigError::Invalid),
+                    })?;
+                Self::explicit_with_ca_profile(&uri, audit_disabled, selector.as_deref()).map(Some)
+            }
         }
     }
     pub fn explicit(uri: &str, audit_disabled: bool) -> Result<Self, HistoryConfigError> {
+        Self::explicit_with_ca_profile(uri, audit_disabled, None)
+    }
+    pub fn explicit_with_ca_profile(
+        uri: &str,
+        audit_disabled: bool,
+        ca_profile: Option<&str>,
+    ) -> Result<Self, HistoryConfigError> {
         if !audit_disabled {
             return Err(HistoryConfigError::LegacyAuditEnabled);
         }
         Ok(Self {
-            options: options(uri).ok_or(HistoryConfigError::Invalid)?,
+            options: crate::postgres_trust::apply_selector(
+                options(uri).ok_or(HistoryConfigError::Invalid)?,
+                ca_profile,
+            )
+            .ok_or(HistoryConfigError::Invalid)?,
         })
     }
     pub(super) fn connect_options(&self) -> PgConnectOptions {
@@ -157,6 +176,37 @@ mod tests {
         process::{Command, Stdio},
         time::{Duration, Instant},
     };
+    #[tokio::test]
+    #[ignore = "owned synthetic Postgres TLS fixture; explicit pinned tools required"]
+    async fn rds_tls_writer_ca_host_reconnect_and_no_downgrade() {
+        crate::postgres_trust_tests::verify_connector("qh_writer", |uri, selector| {
+            let config = HistoryConfig::explicit_with_ca_profile(uri, true, selector).unwrap();
+            assert_eq!(format!("{config:?}"), "HistoryConfig([redacted])");
+            config.connect_options()
+        })
+        .await;
+    }
+    #[test]
+    fn named_ca_profile_preserves_strict_writer_config() {
+        let uri =
+            "postgresql://qh_writer:synthetic@explicit.invalid:5432/fixture?sslmode=verify-full";
+        for selector in [
+            Some(""),
+            Some("unknown"),
+            Some("aws-rds-us-east-1-rsa2048-g1 "),
+        ] {
+            let error = HistoryConfig::explicit_with_ca_profile(uri, true, selector).unwrap_err();
+            assert_eq!(error, HistoryConfigError::Invalid);
+            assert_eq!(error.to_string(), "invalid explicit history configuration");
+        }
+        assert!(HistoryConfig::explicit_with_ca_profile(uri, true, None).is_ok());
+        assert!(HistoryConfig::explicit_with_ca_profile(
+            "postgresql://qh_writer:@%2Ftmp%2Fsynthetic:5432/fixture?sslmode=disable",
+            true,
+            Some("aws-rds-us-east-1-rsa2048-g1")
+        )
+        .is_err());
+    }
     #[test]
     fn explicit_config_environment_isolation() {
         if let Some(case) = std::env::var_os("QH_SYNTHETIC_CONFIG_CASE") {
@@ -181,6 +231,25 @@ mod tests {
             let _guard = tracing::subscriber::set_default(subscriber);
             let uri="postgresql://qh_writer:synthetic%40password@explicit.example.invalid:6543/history_fixture?sslmode=verify-full";
             let configured = options(uri);
+            // Selectors are ignored without a URI (default-off), rejected once configured.
+            std::env::set_var("SIGLAKE_QUERY_HISTORY_CA_PROFILE", "unknown");
+            assert!(HistoryConfig::from_env(true).unwrap().is_none());
+            std::env::set_var("SIGLAKE_QUERY_HISTORY_DATABASE_URL", uri);
+            assert_eq!(
+                HistoryConfig::from_env(true).unwrap_err(),
+                HistoryConfigError::Invalid
+            );
+            std::env::set_var(
+                "SIGLAKE_QUERY_HISTORY_CA_PROFILE",
+                std::ffi::OsString::from_vec(vec![255]),
+            );
+            assert_eq!(
+                HistoryConfig::from_env(true).unwrap_err(),
+                HistoryConfigError::Invalid
+            );
+            std::env::remove_var("SIGLAKE_QUERY_HISTORY_DATABASE_URL");
+            std::env::remove_var("SIGLAKE_QUERY_HISTORY_CA_PROFILE");
+
             assert!(HistoryConfig::from_env(true).unwrap().is_none());
             assert_eq!(
                 HistoryConfig::explicit(uri, false).unwrap_err(),

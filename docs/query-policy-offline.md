@@ -46,7 +46,8 @@ catalog, jobs, app, libpq/PG, passfile or provider credential fallback is accept
 Constructors overwrite inherited PG fields and reject inherited options/TLS file
 paths even when empty or non-Unicode; SQLx URI parsing and passfile IO are avoided.
 TCP requires nonempty explicit password, explicit port/database, and `verify-full`.
-TLS uses the current bundled **WebPKI** roots; custom/private-CA trust is unsupported.
+TLS defaults to bundled **WebPKI** roots; arbitrary custom/private-CA inputs remain unsupported.
+An explicit named reviewed public RDS root addition is available as described below.
 The existing SQLx dependency/features are unchanged. Empty-password, SSL-disabled
 Unix sockets are supported for explicitly targeted local fixtures only.
 
@@ -168,3 +169,41 @@ wire/skew, customer authorization and full end-to-end gates before advertising
 enforcement. Production schema/security/audit/TLS/operator and deployment approval
 remain separate. Offline Slice 1 was independently accepted; each subsequent
 bounded runtime slice requires its own implementation review.
+
+## Explicit RDS trust addition (no policy activation)
+
+`PolicyConfig::reader_with_ca_profile(uri, bounds, Option<&str>)` and
+`::manager_with_ca_profile(uri, bounds, Option<&str>)` independently select
+`aws-rds-us-east-1-rsa2048-g1`. Existing constructors keep bundled WebPKI unchanged.
+Profiles must be exact and TCP verify-full; unknown/empty selectors and selected
+socket/disable configurations fail closed. Bounds, separate owned connection budgets,
+fixed `qp_reader`/`qp_manager` roles, primary reads and integrity checks are unchanged.
+
+Future deployment mapping is `SIGLAKE_QUERY_POLICY_READER_CA_PROFILE` for the
+`qp_reader` connector and `SIGLAKE_QUERY_POLICY_MANAGER_CA_PROFILE` for `qp_manager`.
+These names are **documentation only**: no environment/main/runtime/UI policy
+activation was added. The caller must explicitly supply each constructor argument.
+No history/app/catalog/jobs pools or credentials are reused.
+See [public root provenance, additive SQLx semantics and rotation](../crates/siglake-query-server/certs/README.md).
+Pinned addition bytes do not mean exclusive trust: WebPKI roots remain accepted.
+Actual RDS TLS/role/schema compatibility and coordinated rollout remain gates.
+
+### Owned PostgreSQL16.13 compatibility check
+
+The unchanged reviewed PG16.14 integrity manifest (`schema-v1-contract.json`,
+SHA256 `16fe62ee8fddbe6453e68754d3feec2697fa12e8eab3d830d6e5e66b292c6fd6`) was accepted by the owned
+socket-only PostgreSQL16.13 fixture: the full policy role/schema/tamper/CAS/primary/
+transaction suite plus signed buffered-controls selection passed. No catalog output
+was learned from live RDS, no new manifest was generated, and no comparison relaxed.
+This establishes local16.13 rendering compatibility, not production role/schema proof.
+
+No verified16.13 installation was cached. With explicit supervisor approval, official
+`https://ftp.postgresql.org/pub/source/v16.13/postgresql-16.13.tar.bz2` was verified
+against its official `.sha256` over HTTPS (archive SHA256
+`dc2ddbbd245c0265a689408e3d2f2f3f9ba2da96bd19318214b313cdd9797287`), built with existing
+GCC15.3.0/make4.4.1 into an isolated private prefix using `--without-readline
+--without-zlib --without-icu` (no SSL enabled), `make -j2`, no global install or Nix
+hash override. Source/archive were removed after installation; public source/tool/
+binary hashes and sanitized command results were retained in private local evidence.
+This no-SSL16.13 build is **only** socket/catalog compatibility proof. Synthetic TLS
+uses cached PostgreSQL16.14 + OpenSSL3.6.2; an actual RDS handshake remains unproved.

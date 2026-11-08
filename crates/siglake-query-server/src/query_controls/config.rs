@@ -36,14 +36,37 @@ impl std::fmt::Debug for PolicyConfig {
 }
 impl PolicyConfig {
     pub fn reader(uri: &str, bounds: ConnectionBounds) -> Result<Self, PolicyError> {
-        Self::explicit(uri, Role::Reader, bounds)
+        Self::reader_with_ca_profile(uri, bounds, None)
     }
     pub fn manager(uri: &str, bounds: ConnectionBounds) -> Result<Self, PolicyError> {
-        Self::explicit(uri, Role::Manager, bounds)
+        Self::manager_with_ca_profile(uri, bounds, None)
     }
-    fn explicit(uri: &str, role: Role, bounds: ConnectionBounds) -> Result<Self, PolicyError> {
+    pub fn reader_with_ca_profile(
+        uri: &str,
+        bounds: ConnectionBounds,
+        ca_profile: Option<&str>,
+    ) -> Result<Self, PolicyError> {
+        Self::explicit(uri, Role::Reader, bounds, ca_profile)
+    }
+    pub fn manager_with_ca_profile(
+        uri: &str,
+        bounds: ConnectionBounds,
+        ca_profile: Option<&str>,
+    ) -> Result<Self, PolicyError> {
+        Self::explicit(uri, Role::Manager, bounds, ca_profile)
+    }
+    fn explicit(
+        uri: &str,
+        role: Role,
+        bounds: ConnectionBounds,
+        ca_profile: Option<&str>,
+    ) -> Result<Self, PolicyError> {
         Ok(Self {
-            options: options(uri, role).ok_or(PolicyError::Configuration)?,
+            options: crate::postgres_trust::apply_selector(
+                options(uri, role).ok_or(PolicyError::Configuration)?,
+                ca_profile,
+            )
+            .ok_or(PolicyError::Configuration)?,
             role,
             bounds: bounds.validate()?,
         })
@@ -157,4 +180,66 @@ fn options(uri: &str, role: Role) -> Option<PgConnectOptions> {
             .extra_float_digits(3)
             .disable_statement_logging(),
     )
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "owned synthetic Postgres TLS fixture; explicit pinned tools required"]
+    async fn rds_tls_policy_reader_and_manager_ca_host_reconnect_and_no_downgrade() {
+        for role in [Role::Reader, Role::Manager] {
+            crate::postgres_trust_tests::verify_connector(role.name(), |uri, selector| {
+                let bounds = ConnectionBounds {
+                    max_connections: 2,
+                    operation_timeout: Duration::from_secs(2),
+                };
+                let config = match role {
+                    Role::Reader => PolicyConfig::reader_with_ca_profile(uri, bounds, selector),
+                    Role::Manager => PolicyConfig::manager_with_ca_profile(uri, bounds, selector),
+                }
+                .unwrap();
+                assert_eq!(format!("{config:?}"), "PolicyConfig([redacted])");
+                assert_eq!(config.bounds.operation_timeout, bounds.operation_timeout);
+                config.options
+            })
+            .await;
+        }
+    }
+    #[test]
+    fn named_ca_profile_preserves_policy_roles_and_bounds() {
+        let bounds = ConnectionBounds {
+            max_connections: 2,
+            operation_timeout: Duration::from_secs(2),
+        };
+        for role in [Role::Reader, Role::Manager] {
+            let uri = format!(
+                "postgresql://{}:synthetic@explicit.invalid:5432/fixture?sslmode=verify-full",
+                role.name()
+            );
+            for selector in [
+                Some(""),
+                Some("unknown"),
+                Some("aws-rds-us-east-1-rsa2048-g1 "),
+            ] {
+                assert!(PolicyConfig::explicit(&uri, role, bounds, selector).is_err());
+            }
+            let config =
+                PolicyConfig::explicit(&uri, role, bounds, Some("aws-rds-us-east-1-rsa2048-g1"))
+                    .unwrap();
+            assert_eq!(config.options.get_username(), role.name());
+            assert_eq!(config.bounds.max_connections, 2);
+            let socket = format!(
+                "postgresql://{}:@%2Ftmp%2Fsynthetic:5432/fixture?sslmode=disable",
+                role.name()
+            );
+            assert!(PolicyConfig::explicit(
+                &socket,
+                role,
+                bounds,
+                Some("aws-rds-us-east-1-rsa2048-g1")
+            )
+            .is_err());
+        }
+    }
 }

@@ -11,6 +11,10 @@ source /data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-auth/p
 export CARGO_BUILD_JOBS=2
 export CARGO_TARGET_DIR=/data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-ndjson/target
 pg=/nix/store/zjpr4rk3vqlfz012idz4i6f04g5naiwz-postgresql-16.14/bin
+# Owned TLS regressions additionally need the already-cached public OpenSSL tool.
+openssl_bin=/nix/store/clvbx203wyqkdnqc5ngyhjlhcqn5s9x9-openssl-3.6.2-bin/bin
+[[ -x "$openssl_bin/openssl" ]] || { echo 'Missing cached TLS fixture tool' >&2; exit 1; }
+export PATH="$pg:$openssl_bin:$PATH"
 for tool in initdb pg_ctl createdb psql postgres; do [[ -x "$pg/$tool" ]] || { echo "Missing cached Postgres tool: $tool" >&2; exit 1; }; done
 work=$(mktemp -d /tmp/siglake-history-XXXXXX)
 started=false

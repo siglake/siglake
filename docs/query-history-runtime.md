@@ -24,15 +24,15 @@ new-store guarantee. Disabling the old audit does not sanitize those paths.
 The restricted URI must explicitly supply scheme `postgres`/`postgresql`, fixed
 username `qh_writer`, password colon, host, nonzero port, database and exactly one
 `sslmode` query parameter. TCP requires a nonempty password and **verify-full**
-using the currently selected SQLx **bundled WebPKI roots**, not OS-installed
-private CAs; no TLS downgrade is permitted. Installing a private CA in the OS
+using SQLx **bundled WebPKI roots** by default (or the explicit reviewed root
+addition below), not OS-installed private CAs; no TLS downgrade is permitted. Installing a private CA in the OS
 trust store does not configure this backend. URI certificate/key/root,
 options, passfile, target override, duplicate or unknown parameters are refused.
 Inherited `PGOPTIONS`, `PGSSLROOTCERT`, `PGSSLCERT` or `PGSSLKEY` (even empty or
 non-Unicode) are refused before SQLx construction. Other effective PG defaults
 are overwritten; `new_without_pgpass` is used, never SQLx URI parsing or pgpass.
 No catalog/jobs pool/URI or PG credential/target fallback is used. Config Debug,
-help and errors never include the URI or SQLx upstream error details. TCP custom
+help and errors never include the URI or SQLx upstream error details. Arbitrary custom
 trust/client certificates are unsupported, not silently ignored. Owned local
 Unix fixtures use an absolute percent-encoded socket-directory host, explicit
 empty password, explicit port/database and `sslmode=disable`; this exception is
@@ -740,3 +740,29 @@ lock and disconnected history-login tests are separately identified. No complete
 history, production startup activation, complete distributed coverage, legacy logging
 cutover, physical erasure, full CI, deploy, console/MCP chain or roadmap completion
 is claimed. All prior rollout/TLS/backup/erasure gates remain unchanged.
+
+## Explicit RDS trust addition (local source slice)
+
+The existing URI name stays `SIGLAKE_QUERY_HISTORY_DATABASE_URL`. Only when it is
+present, `SIGLAKE_QUERY_HISTORY_CA_PROFILE=aws-rds-us-east-1-rsa2048-g1` selects the
+reviewed embedded public root. The explicit API is
+`HistoryConfig::explicit_with_ca_profile(uri, audit_disabled, Option<&str>)`.
+Absent URI remains default-off even with a malformed selector. Absent selector
+preserves bundled WebPKI; empty/unknown/non-Unicode selectors with a URI fail safely.
+A profile with the socket/disable exception is rejected, never silently ignored.
+
+See [certificate provenance and trust semantics](../crates/siglake-query-server/certs/README.md).
+This is a pinned **root addition to WebPKI**, NOT exclusive CA/server pinning.
+Only the us-east-1 RSA2048 G1 root is added, not the regional bundle's other roots.
+The deployment metadata reports `rds-ca-rsa2048-g1` in us-east-1; the named selector
+is the intended future mapping for the distinct `qh_writer` secret/connector, not
+permission to activate it or reuse an app/catalog/jobs pool. Actual RDS handshake
+remains unproved. No runtime refresh/file reads, OS-root installation, TLS downgrade,
+DDL, deployment changes, or activation are part of this slice.
+
+Local ignored TLS regressions use owned PG16.14 + OpenSSL3.6.2 only; the existing
+history/policy fixture launchers explicitly resolve those cached tools before
+private HOME setup. Fixture keys are generated transiently under 0700 directories,
+forced to0600, never committed or copied to evidence, and removed on drop. Tests
+replace the root bytes only in cfg(test) options with their owned synthetic CA;
+there is no runtime synthetic/arbitrary-root selector.
