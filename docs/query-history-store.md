@@ -1,15 +1,17 @@
 # Query history storage/privacy foundations (explicit opt-in only)
 
 The [internal runtime core](query-history-runtime.md) now wraps these primitives
-when explicitly constructed (currently tests only); the storage/reader contract
+when explicitly constructed or explicitly enabled through the local standalone
+collector; the storage/reader contract
 below remains the foundation, with separately versioned v2/v3 dependencies.
 Runtime scheduling, deadlines, retries and health are defined there, not in the
 bare store methods. Optional application-state injection supports only the
-explicitly documented route matrix; no standalone startup is wired.
+explicitly documented route matrix; the dedicated standalone startup contract
+is documented in the runtime document. Default remains disabled.
 
-`siglake_query_server::history` exports internal Rust primitives. No environment
-pool resolver, runtime migration, legacy audit replacement or authentication
-change is introduced. No console/public event-ingestion API.
+`siglake_query_server::history` exports internal Rust primitives. The standalone collector has a dedicated restricted environment resolver,
+not an application/catalog/jobs pool resolver. No runtime migration, silent
+legacy audit replacement or authentication change is introduced. No console/public event-ingestion API.
 The existing raw Iceberg audit and persistent jobs are untouched and are **not**
 privacy-compliant history projections.
 
@@ -27,7 +29,8 @@ been applied to fresh disposable local fixtures.
 v1 is unchanged. Local jobs require the separate manual OWNER
 `schema-v2-batch.sql`. Configured peer/distributed/direct external shard
 observation additionally requires manual OWNER `schema-v3-effective.sql`, on v1
-or v2. v3 adds only nullable `effective_format`/`effective_dry_run`, a validated
+or v2. Standalone activation always requires verified v3, even without peers;
+it does not change accepted local-route effective-NULL semantics. v3 adds only nullable `effective_format`/`effective_dry_run`, a validated
 coherent-tuple check and immutable-once-selected trigger. It does not replace
 v1/v2 constraints, widen grants, backfill old rows or modify original receipts,
 terminals, RLS, row bounds or expiry. Both NULL is unresolved, not records/false.
@@ -60,7 +63,10 @@ application relations may be available through direct or PUBLIC privileges,
 including column-only SELECT/INSERT/UPDATE/REFERENCES grants. Only literal `pg_`
 system-schema prefixes and `information_schema` are excluded from these audits;
 ordinary application schemas such as `pgapp` are checked.
-The preflight rejects these conditions on every new connection; reader operations
+The preflight rejects completed false contracts on every new connection;
+dedicated operational failures executing role/schema checks are unavailable, not
+contract rejection. The standalone writer uses the bounded owned-connection
+backend documented in the runtime guide, without SQLx pool release/close futures; reader operations
 also recheck their transaction. System catalog introspection/built-in functions
 remain PostgreSQL capabilities; "no catalog access" here means application
 catalog data, not an impossible claim to hide PostgreSQL system catalogs.
@@ -84,6 +90,13 @@ rows even without WHERE. Global owners have no reader grant.
 **RLS is not session authorization**: a reader can choose tenant context. Future
 console code must first authorize the organization under its session and only
 then supply that tenant; no caller SQL/cursor/header may establish authority.
+
+Dedicated error-return/release/close safety is **not** a guarantee for arbitrary
+upstream messages. SQLx0.8.6 `connection/stream.rs` logs `NoticeResponse.message()`
+under `sqlx::postgres::notice`, independently of statement logging. The local
+standalone slice trusts the DB/admin and reviewed fixed schema; arbitrary
+NOTICE/INFO and production logging/cutover remain outside its confidentiality
+claim. No global suppression, dependency patch or new protocol layer is used.
 
 ## Event and store contract
 
@@ -178,7 +191,8 @@ explicit calls catch up. Return count is executions deleted, not total metadata
 or a guarantee that cleanup finished. **No application/production sweeper is running today.** The internal runtime
 core provides startup catch-up, ~60s scheduling, health/readiness/overdue-age
 reporting and bounded deadlines only when explicitly constructed, currently in
-local tests.
+local tests or an explicitly enabled standalone collector. No production
+activation is claimed.
 
 This deletes primary rows only, not secure disk erasure, WAL, long-lived MVCC
 snapshots, replicas, backups, final snapshots or historical raw audit/job copies.

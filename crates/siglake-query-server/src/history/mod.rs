@@ -1,7 +1,11 @@
-//! History primitives and opt-in buffered / local NDJSON observation. No startup
-//! wiring, audit cutover, environment configuration or runtime DDL.
+//! History primitives and opt-in buffered / local NDJSON observation. No runtime
+//! DDL. Standalone activation requires explicit dedicated configuration and audit disablement.
 pub(crate) mod batch;
 pub(crate) mod buffered;
+mod collector;
+mod config;
+pub use collector::{CollectorStatus, HistoryCollector, HistoryObserverSource};
+pub use config::{HistoryConfig, HistoryConfigError};
 pub mod redaction;
 mod runtime;
 mod store;

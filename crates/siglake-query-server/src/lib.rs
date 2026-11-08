@@ -260,8 +260,8 @@ pub struct AppState {
     pub jobs: Arc<JobStore>,
     /// Audit handle. `None` disables audit emission.
     pub audit: Option<AuditWriter>,
-    /// Opt-in buffered observation; startup does not configure collection.
-    pub history: Option<history::HistoryObserver>,
+    /// Opt-in observation; the source never owns a collector/runtime task.
+    pub history: Option<history::HistoryObserverSource>,
     /// Per-request tenant routing. `None` ⇒ every request routes
     /// through `ice` (the v0 single-tenant behavior).
     pub tenants: Option<TenantRegistry>,
@@ -408,9 +408,14 @@ impl AppState {
     }
 
     /// Inject a trusted observer without transferring service/task ownership.
-    pub fn with_history(mut self, observer: history::HistoryObserver) -> Self {
-        self.jobs.set_history_observer(observer.clone());
-        self.history = Some(observer);
+    pub fn with_history(self, observer: history::HistoryObserver) -> Self {
+        self.with_history_source(observer.into())
+    }
+
+    /// A non-owning facade; no observer exists until full collector preflight.
+    pub fn with_history_source(mut self, source: history::HistoryObserverSource) -> Self {
+        self.jobs.set_history_observer(source.clone());
+        self.history = Some(source);
         self
     }
 

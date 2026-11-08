@@ -218,6 +218,7 @@ where
         .history
         .as_ref()
         .filter(|_| eligible && !identity.coordinator)
+        .and_then(|source| source.current())
     else {
         return work(state, identity, req).await;
     };

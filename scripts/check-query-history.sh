@@ -59,7 +59,8 @@ cargo --version
 rustc --version
 cargo clippy --version
 timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test history_redaction_logging
-timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --lib history:: -- --include-ignored --test-threads=1
+# Dedicated owned-backend regressions require the separate v3 startup fixture.
+timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --lib history:: -- --include-ignored --test-threads=1 --skip history::store::owned::tests::
 # Separate, fixed synthetic row proves a real server restart, not just a new pool.
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U qh_writer -d qh_fixture >"$work/restart.log" <<'SQL'
 WITH t AS MATERIALIZED (SELECT clock_timestamp() AS now)

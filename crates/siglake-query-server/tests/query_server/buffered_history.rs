@@ -2,7 +2,7 @@
 //! Reuse the public local RS256/JWKS fixture, never a fake query response.
 use super::{access_claims, sign_claims, spawn_fake_idp, TEST_KID};
 #[path = "history_fixture.rs"]
-mod history_fixture;
+pub(super) mod history_fixture;
 use axum::http::StatusCode;
 use history_fixture::{fixture, options};
 use jsonwebtoken::Algorithm;

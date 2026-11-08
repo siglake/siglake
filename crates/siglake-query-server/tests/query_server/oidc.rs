@@ -798,3 +798,6 @@ async fn cognito_access_external_shard_body_cannot_override_signed_tenant() {
 
 #[path = "buffered_history.rs"]
 mod buffered_history;
+
+#[path = "startup_history.rs"]
+mod startup_history;

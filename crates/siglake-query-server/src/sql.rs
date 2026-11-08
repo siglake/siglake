@@ -5907,7 +5907,7 @@ async fn submit_batch(
     if let Some(observation) = &history {
         state.jobs.track_history(id, observation.clone());
     }
-    let observer = state.history.clone();
+    let observer = state.history.as_ref().and_then(|source| source.current());
     let audit = state.audit.clone();
     let identity = identity.clone();
     // Passed WHOLE. `max_rows_scanned` had never been copied across, so

@@ -534,7 +534,7 @@ struct InMemoryRow {
 /// Only safe in-process lifecycle ownership; the durable row stores one UUID.
 #[derive(Default)]
 struct JobHistory {
-    observer: Mutex<Option<crate::history::HistoryObserver>>,
+    observer: Mutex<Option<crate::history::HistoryObserverSource>>,
     active: Mutex<HashMap<JobId, std::sync::Weak<crate::history::batch::BatchObservation>>>,
 }
 struct JobHistoryContext {
@@ -589,7 +589,12 @@ impl JobHistory {
             active.finish(status, recovered);
             return;
         }
-        let observer = self.observer.lock().unwrap().clone();
+        let observer = self
+            .observer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|source| source.current());
         let Some(observer) = observer else {
             return;
         };
@@ -1001,7 +1006,7 @@ impl JobStore {
         Some(store)
     }
 
-    pub(crate) fn set_history_observer(&self, observer: crate::history::HistoryObserver) {
+    pub(crate) fn set_history_observer(&self, observer: crate::history::HistoryObserverSource) {
         *self.history.observer.lock().unwrap() = Some(observer);
     }
 

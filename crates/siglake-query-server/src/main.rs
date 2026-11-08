@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 
 use siglake_query_server::discovery::{self, PeerSource};
+use siglake_query_server::history::{HistoryCollector, HistoryConfig};
 use siglake_query_server::{
     serve, serve_tls, AppState, AuditService, AuthConfig, JobStore, OidcVerifier, QueryScanConfig,
     ServerLimits, TlsConfig,
@@ -53,7 +54,8 @@ enum OidcProfile {
 #[command(
     name = "siglake-query-server",
     about = "HTTP query API for the Siglake Iceberg warehouse",
-    version = siglake_core::BUILD_VERSION
+    version = siglake_core::BUILD_VERSION,
+    after_help = "Optional query history: set dedicated SIGLAKE_QUERY_HISTORY_DATABASE_URL and explicitly disable legacy audit with --audit-disabled. Fixed qh_writer; verified v3 schema required. Absent configuration makes no history connections. Up to 8 bounded preflight attempts; exhaustion requires restart. History degradation never changes SQL liveness/readiness. See docs/query-history-runtime.md."
 )]
 struct Cli {
     /// Address to bind the HTTP API.
@@ -419,6 +421,9 @@ async fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    // Dedicated env-only resolver: absent is disabled; invalid syntax or an
+    // enabled legacy raw audit rejects before any catalog/OIDC/listener work.
+    let history_config = HistoryConfig::from_env(cli.audit_disabled)?;
 
     // Resolve and validate the admission configuration before opening a
     // catalog or contacting OIDC discovery. A configured list without claim
@@ -660,6 +665,10 @@ async fn run() -> Result<()> {
         state = state.with_audit(writer);
     }
 
+    let mut history = HistoryCollector::start(history_config);
+    state = state.with_history_source(history.observer_source());
+    tracing::info!(status = ?history.status(), "query history collector (independent of SQL availability)");
+
     let _metrics = siglake_core::metrics::init(cli.metrics_bind).await?;
     // Alerted counters exist at 0 from the first scrape, so the first
     // abandoned warm cycle or exec-pool task is a delta `increase()` can see.
@@ -674,7 +683,7 @@ async fn run() -> Result<()> {
     )
     .set(1.0);
 
-    match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
+    let result = match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
         (Some(cert), Some(key)) => {
             let tls = TlsConfig {
                 cert_path: cert.into(),
@@ -686,7 +695,13 @@ async fn run() -> Result<()> {
             anyhow::bail!("--tls-cert and --tls-key must both be set (or both unset)")
         }
         (None, None) => serve(cli.bind, state).await,
-    }
+    };
+    let drained = history.shutdown().await;
+    tracing::info!(
+        drained,
+        "query history collector shutdown (not a durability guarantee)"
+    );
+    result
 }
 
 /// Open an [`IcebergContext`] from CLI flag/env-var inputs. Same logic

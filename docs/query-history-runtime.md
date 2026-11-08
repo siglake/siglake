@@ -1,13 +1,147 @@
 # Optional SQL / coordinator / shard query-history integration (PARTIAL coverage)
 
-`AppState::with_history(HistoryService::observer())` is an explicit production
-state/router seam. The default is **None**, and no standalone binary startup,
-CLI flag, URL/environment resolver or migration enables collection. The caller
-must explicitly supply a trusted, preflighted writer and retain the sole service
-owner. Tests inject that application state; this is not deployed collection.
-See [the storage/role contract](query-history-store.md) and the explicit v2 batch
-owner-migration dependency below. Reader fields, RLS, column ACL, literal `pg_`
-contract and original 30-day expiry are unchanged; v1 is preserved byte-for-byte.
+`AppState::with_history(HistoryService::observer())` remains the explicit
+injected-router seam. The standalone binary now also supports **local opt-in
+startup**, described below. Default configuration has no runtime observer and
+makes **no history connections**. This is not production activation or approval
+of provisioning, migration, deployment, erasure or consumer compatibility.
+See [the storage/role contract](query-history-store.md). Reader fields, RLS,
+column ACL, literal `pg_` contract and original 30-day expiry are unchanged;
+v1/v2/v3 migration files are untouched.
+
+## Standalone collector configuration and ownership
+
+Only `SIGLAKE_QUERY_HISTORY_DATABASE_URL` enables the standalone collector.
+There is deliberately no URI CLI argument (and no secret-valued clap field).
+Absent means disabled even when catalog/jobs/DATABASE_URL/PG configuration exists.
+An explicitly empty, non-Unicode or syntactically invalid value rejects startup
+before catalog/OIDC/listener work. Activation also **requires the operator to
+explicitly set `--audit-disabled` or `SIGLAKE_QUERY_AUDIT_DISABLED=true`**; the
+collector never rewrites that setting. Existing raw parser/job/other engine
+logging and historic audit/job copies remain **unsanitized**, outside this
+new-store guarantee. Disabling the old audit does not sanitize those paths.
+
+The restricted URI must explicitly supply scheme `postgres`/`postgresql`, fixed
+username `qh_writer`, password colon, host, nonzero port, database and exactly one
+`sslmode` query parameter. TCP requires a nonempty password and **verify-full**
+using the currently selected SQLx **bundled WebPKI roots**, not OS-installed
+private CAs; no TLS downgrade is permitted. Installing a private CA in the OS
+trust store does not configure this backend. URI certificate/key/root,
+options, passfile, target override, duplicate or unknown parameters are refused.
+Inherited `PGOPTIONS`, `PGSSLROOTCERT`, `PGSSLCERT` or `PGSSLKEY` (even empty or
+non-Unicode) are refused before SQLx construction. Other effective PG defaults
+are overwritten; `new_without_pgpass` is used, never SQLx URI parsing or pgpass.
+No catalog/jobs pool/URI or PG credential/target fallback is used. Config Debug,
+help and errors never include the URI or SQLx upstream error details. TCP custom
+trust/client certificates are unsupported, not silently ignored. Owned local
+Unix fixtures use an absolute percent-encoded socket-directory host, explicit
+empty password, explicit port/database and `sslmode=disable`; this exception is
+not a TCP trust downgrade. Do not put real secrets into shell history or examples.
+
+`HistoryCollector` owns one cancellable startup task. Each of at most **8**
+preflight attempts builds a **fresh** pool with one overall **2-second** budget
+covering connection, fixed role and schema checks. Backoff is 1,2,4,8,8,8,8
+seconds (39 seconds total), with cancellation during connect/backoff. No observer
+is published before complete preflight. Missing/unsafe role/schema is `Rejected`,
+connection/operational failure (including query cancellation while executing role
+or schema checks) is `Unavailable`. Only a completed false contract is rejection;
+exhausted states remain
+`ExhaustedRejected`/`ExhaustedUnavailable` **until process restart**. They are not
+healthy disablement and there is no control/restart API. Pool drops/cancelled
+attempts cannot escape the single owner's finite attempt budget.
+
+Standalone preflight requires the separately owner-applied **v3** schema, checking
+its validated exact constraint, nullable field types, enabled immutable trigger,
+function body/search path and owner. Every fresh pool connection repeats v3 and
+fixed least-privilege role checks. An unsafe fresh connection is refused with a
+fixed safe error, not a schema downgrade. Existing role/policy drift on
+already-open connections and administrator trust remain external responsibilities.
+No runtime DDL/grants, role switching, application-schema/job migration or reader
+API is added. Apply unchanged v1, v2 where jobs are supported, and v3 through a
+separately reviewed owner process; **recreate all reader/service pools** after
+migration. Consumer compatibility and complete erasure remain external hard gates.
+
+The dedicated writer uses a small owned-connection backend, **not SQLx PgPool**.
+At most four local sockets (idle, checked out or connecting) are admitted by its
+permit/idle-slot bookkeeping. Acquisition, connect, full preflight, SQL and final
+protocol drain all remain inside the caller's original 100ms operation budget
+(or startup's overall 2s budget). No await holds the idle-slot lock. A lease is
+non-reusable by default: only completely successful, fully drained protocol work,
+with no unfinished transaction, may return idle. Error/cancel/timeout/uncertainty
+synchronously drops the raw socket, without a server-error-reading release ping,
+SQLx pool callback, graceful-close future or detached return/maintenance task.
+Healthy work reuses sockets rather than reconnecting/preflighting every operation.
+Purge commits/rolls back atomically before dedicated reuse. Legacy explicitly
+injected PgPool writer/reader behavior is separate and unchanged.
+
+Service-owner shutdown (also when its wait is cancelled) and Drop close the
+dedicated backend: idle sockets drop, new leases are refused, and in-flight bounded
+leases cannot reinsert after closure even when non-owning observers survive.
+Socket discard is **not acknowledgement that PostgreSQL stopped the operation or
+did not commit**; original receipt/idempotence/expiry and uncertainty rules remain.
+
+**Narrow diagnostic boundary, not universal server-message confidentiality:**
+dedicated operation ERROR/error-return/release/close paths discard upstream text
+and have only fixed diagnostics. SQLx0.8.6
+`sqlx-postgres/src/connection/stream.rs` NoticeResponse handling separately emits
+`notice.message()` under `sqlx::postgres::notice` when enabled. Statement logging
+disablement does **not** cover arbitrary NOTICE/INFO, and PostgreSQL
+`client_min_messages` cannot suppress all INFO. This local slice trusts the DB,
+administrator and reviewed fixed history schema; arbitrary notices remain outside
+the guarantee. No dependency patch/global logging filter/protocol change was made.
+Production logging/trust/cutover remains an unresolved rollout gate, alongside
+existing unsanitized raw parser/job/audit copies. History still never sends
+original SQL/parameters/results/tokens to its store.
+
+After successful preflight the task retains the **same single HistoryService**,
+owner UUID, bounded queue and runtime/pool for its lifetime. It does not replace
+receipts, reset expiry, backfill unobserved work or create another recovery cycle
+on transient failure. Existing 100ms writes, 1000-entry/8MiB/30s retry queue,
+maintenance and bounded fresh checked connections remain the recovery mechanism. Failed
+writes/maintenance make aggregate status `Degraded`; `Active` requires actual
+`HistoryService::health().history_ready`, sampled about once per second, not a
+latched preflight success. After activation the observer stays attached during
+outage: bounded writes may fail open or lose coverage as before. Startup exhaustion
+requires restart; post-activation transient recovery does not. History status is
+**never SQL readiness/liveness, authorization or admission authority**. No public
+history reader/status endpoint is added; status logs contain fixed enums only.
+
+The managed facade is non-owning and resolves to no observer while unavailable.
+Normal listener completion explicitly shuts down collection after existing job
+drain. Collector shutdown clears the facade, signals its owner, and uses one
+100ms wait/abort/join budget, retaining its task handle across cancellation or
+an unconsumed abort. Drop closes and aborts without awaiting or spawning; the
+owned service retains its established task Drop behavior and closes its dedicated
+backend even if observers survive. A true drain result is not
+a durability/no-loss guarantee; process kill cannot drain volatile history.
+Early startup errors also Drop the owner. Isolation in the local runner is **not
+a sandbox**.
+
+`scripts/check-query-history-startup.sh` uses native pinned Rust1.95/PG16.14,
+private HOME/XDG, both empty passfiles, empty provider files/disabled metadata,
+registry-only private Cargo home, private cwd/explicit manifest and locked offline
+two-job builds. It runs collector cancellation/Drop/normal ownership tests and
+subprocess config/passfile defenses. Its **actual executable** smoke uses the
+existing explicitly trusted loopback RS256 issuer/discovery/JWKS seam, signed
+named-tenant requests and socket-only PG: default-off/no collector sessions;
+safe-role collection/NULL SQL/original expiry; bounded lock outage/original UUID
+recovery, fresh post-Active degraded status and a fresh Active recovery transition
+(using byte offsets, not cumulative startup log matches); unsafe role/disabled-v3-trigger/missing DB without
+SQL regression; fresh-connection v3 refusal; valid TCP connection-refusal secret
+sentinel; invalid-config/help redaction; graceful SIGTERM and SIGKILL while
+unavailable. Binary traces/results/tokens stay memory-only, never evidence files.
+Three separate owned-PG backend regressions verify four-socket cap, healthy
+reuse, cancelled wait/discard/unfinished-transaction/owner close; real role and
+v3 check query cancellations versus completed false rejection; and a gated real
+late server ERROR after the 100ms client timeout with SQLx tracing/logger enabled.
+The latter raw-connection control confirms the delayed synthetic ERROR in memory;
+the dedicated timed-out lease closes without release/close logs or sentinel escape.
+These are internal backend tests, not additional listening-binary claims.
+A separate **constructor** test proves finite real-clock startup exhaustion;
+unit ownership tests use an injected pending task. Those are not listening-binary
+cancellation-of-a-Rust-future or production TLS/credential/rollout proofs. The
+unconfigured local route retains accepted NULL effective metadata; requiring v3
+does not invent effective fields or expand execution semantics.
 
 ## Buffered route boundary and attribution
 
@@ -168,8 +302,8 @@ The engine safe reader handles v1/v2 as effective NULL and projects v3 fields on
 new connections, under unchanged RLS/grants. The current console reader/JSON/UI
 still needs a separately reviewed compatibility adapter before presenting new
 variants: it must NOT show receipt hints as effective execution. No console edit,
-startup activation, URI resolver, production role/DDL/TLS change or deployment
-is included. Earlier immutable buffered E2E artifacts remain their original
+production startup activation, production role/DDL/TLS change or deployment
+is included; local standalone configuration is documented above. Earlier immutable buffered E2E artifacts remain their original
 proof, not v3/coordination proof.
 
 ### Configured integration proof and exact limits
@@ -278,8 +412,8 @@ Only positively selected named-tenant external requests are included. Explicit
 this same source owner; actual coordinator NDJSON uses the already-rendered
 payload body described below. Auth/extractor/default/shared paths remain
 unobserved. Actual local jobs render records and have separate ownership below;
-explicit coordinated batch-tier work is not necessarily a job. No startup
-activation or URI resolution was added.
+explicit coordinated batch-tier work is not necessarily a job. That earlier local-stream integration did not add startup configuration; the
+separate local standalone owner is documented above.
 
 The existing admission hook and verified principal create one external parent;
 `render_ndjson` transfers that same handle and original monotonic start into
@@ -330,8 +464,10 @@ safe DTO payload**, including the one in-flight retry reservation. It contains
 only bounded owned principal/request classification, opaque receipt, fixed
 enums, measurements and tenant-scoped loss-point evidence. Never raw requests,
 SQL, results, parameters, tokens, arbitrary errors or fingerprints. SQL remains
-NULL for all inputs without invoking any parser/tokenizer. The service emits no
-logs. Existing engine audit/job/SQL logging is explicitly unsanitized and outside
+NULL for all inputs without invoking any parser/tokenizer. The standalone owner
+and dedicated fresh-connection boundary emit only fixed lifecycle diagnostics;
+DTO/SQL/error bodies are not logged there. The separate SQLx notice limitation
+is documented above. Existing engine audit/job/SQL logging is explicitly unsanitized and outside
 this new-store guarantee.
 
 Retries run on a one-second cadence (also woken by new work), at most 32 per

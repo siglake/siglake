@@ -449,6 +449,9 @@ impl HistoryService {
     /// been observed. The task stays owned until its completion is consumed,
     /// including if this future is cancelled during either wait.
     pub async fn shutdown(&mut self) -> bool {
+        // Close dedicated idle sockets on completion OR cancellation of this
+        // wait. Legacy injected pools are intentionally unaffected.
+        let _close_owned = self.inner.writer.close_guard();
         self.inner.closed.store(true, Ordering::Release);
         self.inner.wake.notify_one();
         let deadline = Instant::now() + WRITE_BUDGET;
@@ -480,6 +483,7 @@ impl HistoryService {
 }
 impl Drop for HistoryService {
     fn drop(&mut self) {
+        self.inner.writer.close_owned();
         self.inner.closed.store(true, Ordering::Release);
         if let Some(task) = self.task.take() {
             task.abort();

@@ -1,5 +1,7 @@
+mod owned;
 mod runtime;
 use super::*;
+use owned::{OwnedPool, WriterPool};
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions, PgRow},
     Connection, PgPool, Row,
@@ -13,7 +15,7 @@ pub enum WriteResult {
 
 /// No runtime migrations, scheduling, retries or auth decisions are performed.
 pub struct HistoryWriter {
-    pool: PgPool,
+    pool: WriterPool,
 }
 pub struct HistoryReader {
     pool: PgPool,
@@ -138,7 +140,7 @@ fn unavailable(_: sqlx::Error) -> HistoryError {
 // Deliberately stricter than "role is not superuser": fixed logins may have NO
 // memberships (including NOINHERIT/SET ROLE), own nothing, or reach other app
 // tables/functions. Provisioning must also revoke PUBLIC CREATE/TEMP/EXECUTE.
-async fn check_role(conn: &mut sqlx::PgConnection, expected: &str) -> Result<(), sqlx::Error> {
+async fn check_role(conn: &mut sqlx::PgConnection, expected: &str) -> Result<bool, sqlx::Error> {
     let safe: bool = sqlx::query_scalar(r#"
       SELECT current_user = $1 AND session_user = $1
        AND NOT (r.rolsuper OR r.rolbypassrls OR r.rolcreaterole OR r.rolcreatedb OR r.rolreplication)
@@ -163,34 +165,116 @@ async fn check_role(conn: &mut sqlx::PgConnection, expected: &str) -> Result<(),
            OR has_any_column_privilege(current_user,c.oid,'INSERT,UPDATE,REFERENCES'))))
       FROM pg_roles r WHERE r.rolname=current_user
     "#).bind(expected).fetch_one(&mut *conn).await?;
-    if !safe {
-        return Err(sqlx::Error::Protocol(
-            "history privilege contract rejected".into(),
-        ));
+    Ok(safe)
+}
+// Fail closed on an absent, unvalidated or altered v3 contract. These fixed
+// definitions are from the separately applied owner migration, never runtime DDL.
+async fn check_v3(conn: &mut sqlx::PgConnection) -> Result<bool, sqlx::Error> {
+    const CONSTRAINT: &str = r#"CHECK ((((effective_format IS NULL) AND (effective_dry_run IS NULL)) OR ((effective_format IS NOT NULL) AND (effective_dry_run IS NOT NULL) AND (((operation = 'sql'::text) AND ((effective_format = 'records'::text) OR ((effective_format = 'ndjson'::text) AND (NOT effective_dry_run)))) OR ((operation = 'explain'::text) AND (effective_format = 'records'::text) AND effective_dry_run) OR ((operation = 'shard'::text) AND (effective_format = 'arrow'::text) AND (NOT effective_dry_run))))))"#;
+    let migration = include_str!("schema-v3-effective.sql");
+    let function = migration
+        .split_once("AS $$")
+        .expect("fixed migration function")
+        .1
+        .split_once("$$;")
+        .expect("fixed migration function end")
+        .0;
+    let safe: bool = sqlx::query_scalar(
+        r#"
+      SELECT EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_class r ON r.oid=c.conrelid
+        JOIN pg_namespace n ON n.oid=r.relnamespace
+        JOIN pg_roles owner ON owner.oid=r.relowner
+        WHERE n.nspname='query_history' AND r.relname='executions'
+          AND owner.rolname='qh_owner' AND n.nspowner=owner.oid
+          AND c.conname='executions_effective_v3' AND c.contype='c'
+          AND c.convalidated AND NOT c.connoinherit AND pg_get_constraintdef(c.oid)=$1
+      ) AND (SELECT count(*)=2 FROM pg_attribute a
+        WHERE a.attrelid='query_history.executions'::regclass AND NOT a.attisdropped
+          AND NOT a.attnotnull AND a.attgenerated=''
+          AND ((a.attname='effective_format' AND a.atttypid='text'::regtype)
+            OR (a.attname='effective_dry_run' AND a.atttypid='boolean'::regtype)))
+      AND EXISTS (
+        SELECT 1 FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
+        JOIN pg_namespace n ON n.oid=p.pronamespace
+        JOIN pg_roles owner ON owner.oid=p.proowner
+        JOIN pg_language l ON l.oid=p.prolang
+        WHERE t.tgrelid='query_history.executions'::regclass
+          AND t.tgname='immutable_effective_v3' AND t.tgtype=19
+          AND t.tgenabled='O' AND NOT t.tgisinternal AND t.tgqual IS NULL
+          AND t.tgnargs=0 AND t.tgattr=''::int2vector
+          AND n.nspname='query_history' AND p.proname='immutable_effective_v3'
+          AND owner.rolname='qh_owner' AND l.lanname='plpgsql'
+          AND NOT p.prosecdef AND p.prosrc=$2
+          AND p.proconfig=ARRAY['search_path=pg_catalog']::text[]
+      )
+    "#,
+    )
+    .bind(CONSTRAINT)
+    .bind(function)
+    .fetch_one(conn)
+    .await?;
+    Ok(safe)
+}
+// Only a completed false contract is rejection. Transport/protocol/query-cancel
+// failures while executing either check are operational unavailability.
+async fn verify_collector(conn: &mut sqlx::PgConnection) -> Result<(), HistoryError> {
+    if !check_role(conn, "qh_writer").await.map_err(unavailable)?
+        || !check_v3(conn).await.map_err(unavailable)?
+    {
+        return Err(HistoryError::Privilege);
     }
     Ok(())
 }
+// Legacy injected writer/reader path: preserve its original SQLx pool behavior.
 async fn pool(options: PgConnectOptions, expected: &'static str) -> Result<PgPool, HistoryError> {
     let mut preflight = sqlx::PgConnection::connect_with(&options)
         .await
         .map_err(unavailable)?;
-    check_role(&mut preflight, expected)
+    if !check_role(&mut preflight, expected)
         .await
-        .map_err(|_| HistoryError::Privilege)?;
+        .map_err(|_| HistoryError::Privilege)?
+    {
+        return Err(HistoryError::Privilege);
+    }
     drop(preflight);
     PgPoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(2))
-        .after_connect(move |conn, _| Box::pin(async move { check_role(conn, expected).await }))
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                if !check_role(conn, expected).await? {
+                    return Err(sqlx::Error::Protocol(
+                        "history privilege contract rejected".into(),
+                    ));
+                }
+                Ok(())
+            })
+        })
         .connect_with(options)
         .await
         .map_err(unavailable)
 }
 
 impl HistoryWriter {
+    pub(super) fn close_guard(&self) -> impl Drop {
+        self.pool.close_guard()
+    }
+    pub(super) fn close_owned(&self) {
+        self.pool.close_owned();
+    }
+    /// Dedicated standalone path: every fresh connection checks v3 as well as
+    /// the fixed writer privilege contract. No DDL or downgraded schema path.
+    pub(super) async fn connect_collector(options: PgConnectOptions) -> Result<Self, HistoryError> {
+        Ok(Self {
+            pool: WriterPool::Owned(OwnedPool::connect(options).await?),
+        })
+    }
+
     pub async fn connect(options: PgConnectOptions) -> Result<Self, HistoryError> {
         Ok(Self {
-            pool: pool(options, "qh_writer").await?,
+            pool: WriterPool::Legacy(pool(options, "qh_writer").await?),
         })
     }
 
@@ -359,12 +443,18 @@ impl HistoryWriter {
         if batch == 0 || batch > 1000 {
             return Err(HistoryError::InvalidValue);
         }
-        let mut tx = self.pool.begin().await.map_err(unavailable)?;
+        let mut connection = self.pool.acquire().await.map_err(unavailable)?;
+        let mut tx = connection.begin().await.map_err(unavailable)?;
         let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(724918220194)")
             .fetch_one(&mut *tx)
             .await
             .map_err(unavailable)?;
         if !locked {
+            if matches!(&self.pool, WriterPool::Owned(_)) {
+                tx.rollback().await.map_err(unavailable)?;
+                connection.complete().await.map_err(unavailable)?;
+            }
+            // Legacy injection retains its original transaction-Drop rollback.
             return Ok(0);
         }
         let result = sqlx::query("DELETE FROM query_history.executions WHERE execution_id IN (SELECT execution_id FROM query_history.executions WHERE expires_at<=statement_timestamp() ORDER BY expires_at,execution_id LIMIT $1 FOR UPDATE SKIP LOCKED)")
@@ -374,6 +464,7 @@ impl HistoryWriter {
         sqlx::query("DELETE FROM query_history.owners WHERE owner_uuid IN (SELECT o.owner_uuid FROM query_history.owners o WHERE heartbeat_at<=statement_timestamp()-interval '720 hours' AND NOT EXISTS (SELECT 1 FROM query_history.executions e WHERE e.owner_uuid=o.owner_uuid) ORDER BY heartbeat_at LIMIT $1 FOR UPDATE SKIP LOCKED)")
             .bind(i64::from(batch)).execute(&mut *tx).await.map_err(unavailable)?;
         tx.commit().await.map_err(unavailable)?;
+        connection.complete().await.map_err(unavailable)?;
         Ok(result)
     }
 }
@@ -391,9 +482,12 @@ impl HistoryReader {
         let tenant =
             siglake_core::tenant::sanitize_tenant(tenant).ok_or(HistoryError::InvalidValue)?;
         let mut tx = self.pool.begin().await.map_err(unavailable)?;
-        check_role(&mut tx, "qh_reader")
+        if !check_role(&mut tx, "qh_reader")
             .await
-            .map_err(|_| HistoryError::Privilege)?;
+            .map_err(|_| HistoryError::Privilege)?
+        {
+            return Err(HistoryError::Privilege);
+        }
         sqlx::query("SELECT set_config('query_history.tenant',$1,true)")
             .bind(tenant)
             .execute(&mut *tx)
