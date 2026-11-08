@@ -666,7 +666,7 @@ impl<W: Write> Write for CheckedWriter<W> {
         self.0.flush()
     }
 }
-fn checked_json(value: &(impl Serialize + ?Sized)) -> io::Result<Bytes> {
+pub(crate) fn checked_json(value: &(impl Serialize + ?Sized)) -> io::Result<Bytes> {
     let mut writer = CheckedWriter(Vec::new());
     serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
     crate::query_controls::runtime::render_check()?;

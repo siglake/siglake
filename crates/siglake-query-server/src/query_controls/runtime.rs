@@ -157,7 +157,7 @@ where
 
 /// Scope includes observational history waits and fully buffered response
 /// rendering and independently owned body production. Native CPU work remains
-/// cooperative, not OS-preempted. Fanout/shards/Jaeger remain gated.
+/// cooperative, not OS-preempted. Fanout/shards remain gated.
 pub(crate) async fn run<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
@@ -168,7 +168,7 @@ pub(crate) async fn run<F>(
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
-    run_inner(authority, identity, caller, priority, false, future).await
+    run_inner(authority, identity, caller, priority, false, false, future).await
 }
 pub(crate) async fn run_handoff<F>(
     authority: Option<Arc<ControlsAuthority>>,
@@ -180,14 +180,36 @@ pub(crate) async fn run_handoff<F>(
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
-    run_inner(authority, identity, caller, priority, true, future).await
+    run_inner(authority, identity, caller, priority, true, false, future).await
 }
+/// Jaeger keeps native JSON, with fixed typed response-only metadata.
+pub(crate) async fn run_jaeger<F>(
+    authority: Option<Arc<ControlsAuthority>>,
+    identity: CallerIdentity,
+    future: F,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+{
+    run_inner(
+        authority,
+        identity,
+        RequestLimits::default(),
+        Priority::Interactive,
+        false,
+        true,
+        future,
+    )
+    .await
+}
+
 async fn run_inner<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
     caller: RequestLimits,
     priority: Priority,
     handoff: bool,
+    jaeger: bool,
     future: F,
 ) -> Result<Response, ApiError>
 where
@@ -253,10 +275,18 @@ where
         },
         timeout_opt_out_ignored: caller.circuit_breakers == Some(false),
     };
+    let headers = if jaeger {
+        Some(jaeger_headers(controls)?)
+    } else {
+        None
+    };
     if tokio::time::Instant::now() >= controls.deadline {
-        return Err(expired());
+        return Err(with_headers(expired(), &headers));
     }
-    let body_slot = authority.bodies.reserve()?;
+    let body_slot = authority
+        .bodies
+        .reserve()
+        .map_err(|e| with_headers(e, &headers))?;
     let (result, history) = BODY_HISTORY
         .scope(std::cell::RefCell::new(None), async {
             let result = CONTROLS
@@ -265,7 +295,7 @@ where
             (result, BODY_HISTORY.with(|h| h.take()))
         })
         .await;
-    match result {
+    let result = match result {
         Ok(response) => body_slot.start(response, controls, history),
         Err(error) => {
             if let Some(h) = history {
@@ -277,7 +307,73 @@ where
             }
             Err(error)
         }
+    };
+    match headers {
+        Some(headers) => match result {
+            Ok(mut response) => {
+                for (name, value) in headers {
+                    response.headers_mut().insert(name, value);
+                }
+                Ok(response)
+            }
+            Err(mut error) => {
+                error.headers.extend(headers);
+                Err(error)
+            }
+        },
+        None => result,
     }
+}
+fn with_headers(
+    mut error: ApiError,
+    headers: &Option<Vec<(axum::http::HeaderName, axum::http::HeaderValue)>>,
+) -> ApiError {
+    if let Some(headers) = headers {
+        error.headers.extend(headers.iter().cloned());
+    }
+    error
+}
+fn jaeger_headers(
+    c: RequestControls,
+) -> Result<Vec<(axum::http::HeaderName, axum::http::HeaderValue)>, ApiError> {
+    use super::dto::*;
+    let invalid = || ApiError::service_unavailable("query_controls_metadata_unavailable");
+    let mut warnings = WarningSet::default();
+    warnings.insert(WarningCode::ScanEstimateUnavailable);
+    if c.scan_warning.is_some() {
+        warnings.insert(WarningCode::ScanThresholdNotEvaluated);
+    }
+    let dto = EffectiveQueryControls::new(ControlsInput {
+        state: c.state,
+        policy_revision: c.revision,
+        operator_generation: c.generation,
+        priority: ControlPriority::Interactive,
+        mode: SelectedMode::Request,
+        scope: ControlScope::Request,
+        mandatory_timeout: true,
+        effective_timeout_ms: Some(i64::try_from(c.timeout.as_millis()).map_err(|_| invalid())?),
+        effective_output_rows: None,
+        output_cap_enforced: false,
+        scan_bytes_warning: c.scan_warning,
+        estimate_status: EstimateStatus::Unavailable,
+        estimate_exact: None,
+        estimated_bytes: None,
+        warnings,
+    })
+    .map_err(|_| invalid())?;
+    dto.json().map_err(|_| invalid())?;
+    let encoded = dto.headers().map_err(|_| invalid())?;
+    let mut headers = vec![(
+        axum::http::HeaderName::from_static("x-siglake-query-controls"),
+        axum::http::HeaderValue::from_str(&encoded.controls).map_err(|_| invalid())?,
+    )];
+    if let Some(value) = encoded.warnings {
+        headers.push((
+            axum::http::HeaderName::from_static("x-siglake-query-warnings"),
+            axum::http::HeaderValue::from_str(&value).map_err(|_| invalid())?,
+        ));
+    }
+    Ok(headers)
 }
 pub(super) fn runtime_key(identity: &CallerIdentity) -> Result<Option<RuntimeKey>, PolicyError> {
     if identity.coordinator {

@@ -523,3 +523,27 @@ async fn cognito_mixed_real_middleware_controls_id_has_no_named_revision_access_
     state.shutdown_query_controls().await;
     idp.abort();
 }
+
+#[test]
+fn jaeger_typed_headers_are_unavailable_estimate_not_output_clipping_and_encoding_fails_closed() {
+    let c = RequestControls {
+        state: PolicyState::Applied,
+        revision: Some(7),
+        generation: 9,
+        scan_warning: Some(i64::MAX),
+        ..snapshot(Duration::from_secs(1))
+    };
+    let headers = jaeger_headers(c).unwrap();
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers[0].0, "x-siglake-query-controls");
+    assert_eq!(headers[0].1,"v=1;state=applied;rev=7;gen=9;priority=interactive;mode=request;scope=request;mandatory=1;timeout_ms=1000;output_rows=na;output_enforced=0;scan_warning=9223372036854775807;estimate=unavailable;exact=na;estimated_bytes=na");
+    assert_eq!(
+        headers[1].1,
+        "scan_estimate_unavailable,scan_threshold_not_evaluated"
+    );
+    let invalid = RequestControls { generation: 0, ..c };
+    let error = jaeger_headers(invalid).unwrap_err();
+    assert_eq!(error.status, 503);
+    assert_eq!(error.msg, "query_controls_metadata_unavailable");
+    assert!(error.headers.is_empty());
+}

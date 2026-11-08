@@ -444,7 +444,11 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(response.headers()["x-siglake-query-controls"]
+            .to_str()
+            .unwrap()
+            .contains("state=inherited;rev=3;gen=7;"));
     }
     drop(held);
     // Signed actual local NDJSON is now covered, not a format-hint bypass.
@@ -913,3 +917,6 @@ async fn real_signed_explicit_distributed_batch_refuses_before_work_not_handoff(
     enabled.jobs.shutdown().await.unwrap();
     issuer_owner.shutdown().await;
 }
+
+#[path = "jaeger_controls.rs"]
+mod jaeger_controls;
