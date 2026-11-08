@@ -260,6 +260,8 @@ pub struct AppState {
     pub jobs: Arc<JobStore>,
     /// Audit handle. `None` disables audit emission.
     pub audit: Option<AuditWriter>,
+    /// Opt-in buffered observation; startup does not configure collection.
+    pub history: Option<history::HistoryObserver>,
     /// Per-request tenant routing. `None` ⇒ every request routes
     /// through `ice` (the v0 single-tenant behavior).
     pub tenants: Option<TenantRegistry>,
@@ -329,6 +331,7 @@ impl AppState {
             limits: Arc::new(limits),
             jobs: Arc::new(JobStore::default()),
             audit: None,
+            history: None,
             tenants: None,
             allowed_tenants: None,
             query_scan: QueryScanConfig::default(),
@@ -401,6 +404,12 @@ impl AppState {
         self
     }
 
+    /// Inject a trusted observer without transferring service/task ownership.
+    pub fn with_history(mut self, observer: history::HistoryObserver) -> Self {
+        self.history = Some(observer);
+        self
+    }
+
     pub fn with_audit(mut self, audit: AuditWriter) -> Self {
         self.audit = Some(audit);
         self
@@ -457,9 +466,19 @@ impl AppState {
         &self,
         identity: &CallerIdentity,
     ) -> anyhow::Result<Arc<IcebergContext>> {
-        match (&self.tenants, identity.tenant.as_deref()) {
+        match (&self.tenants, self.execution_tenant(identity)) {
             (Some(reg), Some(t)) => reg.resolve(t).await,
             _ => Ok(self.ice.clone()),
+        }
+    }
+
+    /// Authoritative selected routing tenant, before catalog I/O. Exactly the
+    /// same decision is used by resolve_ice and job ownership. No canonical
+    /// tenant exists for the shared/default context; never guess from a claim.
+    pub(crate) fn execution_tenant<'a>(&self, identity: &'a CallerIdentity) -> Option<&'a str> {
+        match (&self.tenants, identity.tenant.as_deref()) {
+            (Some(_), Some(t)) => Some(t),
+            _ => None,
         }
     }
 
@@ -480,10 +499,7 @@ impl AppState {
     /// only after [`crate::tenants::validate`] accepted it, so the owner key
     /// and the namespace suffix are the same string by construction.
     pub fn job_owner(&self, identity: &CallerIdentity) -> Option<String> {
-        match (&self.tenants, identity.tenant.as_deref()) {
-            (Some(_), Some(t)) => Some(t.to_string()),
-            _ => None,
-        }
+        self.execution_tenant(identity).map(str::to_owned)
     }
 }
 

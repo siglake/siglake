@@ -48,7 +48,11 @@ use crate::cost::{estimate, extract_exact_time_bounds_from_expr, CostReport};
 use crate::error::ApiError;
 #[allow(unused_imports)] // referenced by the `#[utoipa::path]` response bodies
 use crate::format::RecordsResponse;
-use crate::format::{NdjsonStream, QueryFormat};
+use crate::format::{batches_to_records, NdjsonStream, QueryFormat};
+use crate::history::{
+    buffered as history_buffered, CacheState as HistoryCacheState, ErrorCode as HistoryErrorCode,
+    Operation as HistoryOperation,
+};
 use crate::jobs::{CompletionOutcome, JobStatus};
 use crate::limits::{Priority, RequestLimits, ResolvedLimits};
 #[allow(unused_imports)]
@@ -4488,10 +4492,18 @@ pub async fn handle(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
+    let eligible = history_buffered::eligible(&req) && state.peers.is_none();
     let execution_id = siglake_storage::QueryExecutionId::next();
     let mut result = siglake_storage::with_query_execution_id(
         execution_id,
-        Box::pin(handle_scoped(state, identity, req)),
+        history_buffered::observe(
+            state,
+            identity,
+            req,
+            HistoryOperation::Sql,
+            eligible,
+            |state, identity, req| Box::pin(handle_scoped(state, identity, req)),
+        ),
     )
     .await;
     stamp_buffered_sql_headers(&mut result, format, started);
@@ -4504,7 +4516,7 @@ async fn handle_scoped(
     req: SqlRequest,
 ) -> Result<Response, ApiError> {
     if req.query.trim().is_empty() {
-        return handle_local(State(state), axum::extract::Extension(identity), Json(req)).await;
+        return handle_local_inner(state, identity, req, None, None, None).await;
     }
     let tier = state.limits.tier(req.priority);
     let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
@@ -4537,6 +4549,7 @@ async fn handle_scoped(
     // would double-count the one histogram.
     clock.prelude.resolve = resolve_started.elapsed();
     let rewrite_started = Instant::now();
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let effective_query = apply_timeout(
         apply_query_rewrites_for_serving(
             &ice,
@@ -4678,15 +4691,47 @@ pub async fn handle_local(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
+    let eligible = history_buffered::eligible(&req);
     let execution_id = siglake_storage::current_query_execution_id()
         .unwrap_or_else(siglake_storage::QueryExecutionId::next);
     let mut result = siglake_storage::with_query_execution_id(
         execution_id,
-        Box::pin(handle_local_inner(state, identity, req, None, None, None)),
+        history_buffered::observe(
+            state,
+            identity,
+            req,
+            HistoryOperation::Sql,
+            eligible,
+            |state, identity, req| {
+                Box::pin(handle_local_inner(state, identity, req, None, None, None))
+            },
+        ),
     )
     .await;
     stamp_buffered_sql_headers(&mut result, format, started);
     result
+}
+
+/// Authoritative execution provenance, never inferred from response defaults.
+enum HistoryScanEvidence<'a> {
+    Unavailable,
+    NoDataScan,
+    Runtime(&'a crate::midflight::PlanRuntimeStats),
+}
+
+/// Copy only numeric execution evidence; never rows, names, plans or errors.
+fn observe_history_record_metrics(body: &RecordsResponse, scan: HistoryScanEvidence<'_>) {
+    let (rows, bytes) = match scan {
+        HistoryScanEvidence::NoDataScan => (Some(0), Some(0)),
+        HistoryScanEvidence::Runtime(runtime) if runtime.unsettled_partitions == 0 => (
+            runtime
+                .leaf_rows_measured
+                .then_some(runtime.leaf_output_rows),
+            runtime.scan_bytes_measured.then_some(runtime.bytes_scanned),
+        ),
+        _ => (None, None),
+    };
+    history_buffered::records(body.row_count, body.truncated, rows, bytes);
 }
 
 async fn handle_local_inner(
@@ -4756,6 +4801,7 @@ async fn handle_local_inner(
     let resolve_elapsed = resolve_started.elapsed() + prelude.resolve;
     record_phase_metric("sql", "resolve_ice", resolve_elapsed);
     let rewrite_started = Instant::now();
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let rewrite = async {
         match pre_rewritten_query {
             Some(query) => Ok(query),
@@ -4867,8 +4913,14 @@ async fn handle_local_inner(
         deadline,
         &effective_query.attr_rewrite_bindings,
     )) {
-        SqlResultCacheDecision::Skip => None,
-        SqlResultCacheDecision::Leader(ctx) => Some(ctx),
+        SqlResultCacheDecision::Skip => {
+            history_buffered::cache(HistoryCacheState::Bypass);
+            None
+        }
+        SqlResultCacheDecision::Leader(ctx) => {
+            history_buffered::cache(HistoryCacheState::Miss);
+            Some(ctx)
+        }
         SqlResultCacheDecision::Hit(body) => {
             // The stored body, shared rather than copied (#2304): only the
             // cost report is cloned out of it, for the audit and the metrics,
@@ -4876,6 +4928,7 @@ async fn handle_local_inner(
             // cannot resolve to a name-list entry (#2302) — see
             // `CachedBody::expect_records`.
             let body = body.expect_records();
+            history_buffered::cache(HistoryCacheState::Hit);
             let cost = body.cost.clone();
             // A hit is a response to THIS request, and this request's clock may
             // already have run out — the probe can be handed a warm entry with
@@ -4897,6 +4950,11 @@ async fn handle_local_inner(
                 );
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
+            }
+            history_buffered::admit();
+            observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
+            if let Some(cost) = &cost {
+                history_buffered::cost(cost);
             }
             let status = if body.truncated {
                 StatusCode::PAYLOAD_TOO_LARGE
@@ -5029,6 +5087,7 @@ async fn handle_local_inner(
         datafusion::prelude::SessionContext::new_with_state(hinted)
     };
     let session_elapsed = session_started.elapsed();
+    history_buffered::phase(HistoryErrorCode::Planning);
     let register_started = Instant::now();
     // Registration reads table metadata (and, with buffering on, lists WAL
     // segments) — catalog and object-store work that a slow backend can stretch
@@ -5107,6 +5166,7 @@ async fn handle_local_inner(
     let estimate_started = Instant::now();
     let mut cost =
         under_request_deadline!(async { estimate(&df, &ice).await.map_err(ApiError::internal) });
+    history_buffered::cost(&cost);
     let estimate_elapsed = estimate_started.elapsed();
     record_phase_metric("sql", "estimate", estimate_elapsed);
 
@@ -5125,6 +5185,8 @@ async fn handle_local_inner(
                 buffer_load.as_ref(),
                 "local_records_fast_path",
             ) {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::NoDataScan);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5161,6 +5223,8 @@ async fn handle_local_inner(
                     try_windowed_count_fast_path_records(&df, &ice, shard, cost.clone(), delta),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5196,6 +5260,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5231,6 +5297,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5266,6 +5334,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5302,6 +5372,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5330,6 +5402,8 @@ async fn handle_local_inner(
                     try_date_histogram_fast_path_records(&df, &ice, shard, cost.clone(), delta),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5491,10 +5565,12 @@ async fn handle_local_inner(
             false,
             Some(msg.clone()),
         );
+        history_buffered::phase(HistoryErrorCode::Validation);
         return Err(ApiError::cost_rejected(msg, &cost));
     }
 
     let admission_started = Instant::now();
+    history_buffered::phase(HistoryErrorCode::Admission);
     let _admission = if req.dry_run {
         None
     } else {
@@ -5520,6 +5596,8 @@ async fn handle_local_inner(
         }
     };
 
+    // Admission covers the upstream numeric probe as well as the normal scan.
+    history_buffered::admit();
     let admission_elapsed = admission_started.elapsed();
 
     // This path reads data, unlike the metadata battery. It runs only AFTER
@@ -5574,6 +5652,7 @@ async fn handle_local_inner(
 
     let mut execute_elapsed = std::time::Duration::ZERO;
     let result = if req.dry_run {
+        history_buffered::planned();
         Ok((StatusCode::OK, Json(cost.clone())).into_response())
     } else {
         let execute_started = Instant::now();
@@ -7108,6 +7187,22 @@ pub async fn explain(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
+    history_buffered::observe(
+        state,
+        identity,
+        req,
+        HistoryOperation::Explain,
+        true,
+        explain_inner,
+    )
+    .await
+}
+
+async fn explain_inner(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
     if req.query.trim().is_empty() {
         return Err(ApiError::bad_request("query is empty"));
     }
@@ -7115,15 +7210,20 @@ pub async fn explain(
         .resolve_ice(&identity)
         .await
         .map_err(ApiError::internal)?;
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let query = rewrite_search_if_needed(&ice, &req.query).await?;
     let ctx = state
         .query_scan
         .session_context_with_order(preferred_scan_order_for_sql(&ice, &query).await);
+    history_buffered::phase(HistoryErrorCode::Planning);
     register_tables_for_query(&ice, &ctx, &query).await?;
     let df = plan_client_sql(&ctx, &query)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let cost = estimate(&df, &ice).await.map_err(ApiError::internal)?;
+    history_buffered::cost(&cost);
+    history_buffered::admit();
+    history_buffered::planned();
     Ok((StatusCode::OK, Json(cost)).into_response())
 }
 
@@ -11769,6 +11869,8 @@ async fn render_records(
                         limit,
                         "ordered-residual drain hit the rows cap; retrying as pruned TopK"
                     );
+                    // The final plan's counters omit this first attempt.
+                    history_buffered::incomplete_scan_attribution();
                     return Box::pin(render_records(
                         fallback,
                         resolved,
@@ -11872,6 +11974,7 @@ async fn render_records(
     if let Some(stats) = body.stats.as_mut() {
         numeric_probe.add_to(stats);
     }
+    observe_history_record_metrics(&body, HistoryScanEvidence::Runtime(&runtime));
     let status = if body.truncated {
         StatusCode::PAYLOAD_TOO_LARGE
     } else {
@@ -13444,6 +13547,7 @@ mod tests {
     fn inline_lane_admits_positive_small_estimates_and_rejects_punts() {
         let base = CostReport {
             files_to_scan: Some(2),
+            estimate_complete: false,
             files_considered: None,
             estimated_bytes_scanned: 1024,
             estimated_rows_processed: 500,
@@ -19102,11 +19206,22 @@ pub async fn distributed(
     // distributed path wants to know it did not happen. The transparent
     // `/api/v1/sql` falls back to local instead (see `handle`).
     let Some(peers) = state.peers.as_ref().and_then(|source| source.capture()) else {
-        return Err(ApiError::bad_request(
-            "distributed query not configured, or peer discovery has not published a \
+        let eligible = history_buffered::eligible(&req);
+        return history_buffered::observe(
+            state,
+            identity,
+            req,
+            HistoryOperation::Sql,
+            eligible,
+            |_, _, _| async {
+                Err(ApiError::bad_request(
+                    "distributed query not configured, or peer discovery has not published a \
              membership yet (set --query-peers, or --query-peer-discovery-srv and wait \
              for the first answer)",
-        ));
+                ))
+            },
+        )
+        .await;
     };
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
@@ -20969,6 +21084,7 @@ mod batch_lifecycle_tests {
     fn cost() -> CostReport {
         CostReport {
             files_to_scan: Some(1),
+            estimate_complete: false,
             files_considered: Some(1),
             estimated_bytes_scanned: 4096,
             estimated_rows_processed: 10,
@@ -22748,5 +22864,124 @@ mod bounded_equality_count_tests {
         };
         assert_eq!(sum(&bounded), (4_100, 1));
         assert_eq!(sum(&bounded), sum(&generic));
+    }
+}
+
+#[cfg(test)]
+mod history_scan_availability_tests {
+    use super::*;
+    use datafusion::execution::context::SessionConfig;
+    use futures::StreamExt;
+    use siglake_core::Event;
+    use siglake_storage::iceberg::IcebergContext;
+
+    fn value(counter: crate::history::Counter) -> u64 {
+        serde_json::to_value(counter).unwrap().as_u64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_scan_snapshot_omits_incomplete_counters_but_keeps_returned_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        ice.append_events(&(0..128).map(|_| Event::now("fixture")).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_batch_size(16)
+                .with_target_partitions(1),
+        );
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let df = ctx.sql("SELECT raw FROM events").await.unwrap();
+        let task_ctx = crate::midflight::task_ctx_for(&df);
+        let plan = df.create_physical_plan().await.unwrap();
+        // A real live siglake partition, not a fabricated boolean. Its
+        // per-partition attribution has not folded, exactly the snapshot shape
+        // retained when the collector's bounded settle expires.
+        let mut stream = plan.execute(0, task_ctx).unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        let incomplete =
+            siglake_storage::settle_scan_partitions(&plan, crate::midflight::SCAN_SETTLE_DEADLINE)
+                .await;
+        assert!(!incomplete.complete && incomplete.live_partitions > 0);
+        let runtime = crate::midflight::summarize_plan_runtime(&plan);
+        assert!(runtime.unsettled_partitions > 0);
+        assert!(runtime.leaf_rows_measured && runtime.scan_bytes_measured);
+        let body = batches_to_records(&[batch], Some(1)).unwrap();
+        assert!(body.truncated);
+        let evidence = history_buffered::capture_test_measurements(async {
+            observe_history_record_metrics(&body, HistoryScanEvidence::Runtime(&runtime));
+        })
+        .await;
+        assert_eq!(value(evidence.counters.returned_rows.unwrap()), 1);
+        assert_eq!(evidence.truncated, Some(true));
+        assert!(evidence.counters.measured_rows_scanned.is_none());
+        assert!(evidence.counters.measured_bytes_scanned.is_none());
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+        let settled =
+            siglake_storage::settle_scan_partitions(&plan, crate::midflight::SCAN_SETTLE_DEADLINE)
+                .await;
+        assert!(settled.complete);
+        let complete = crate::midflight::summarize_plan_runtime(&plan);
+        assert_eq!(complete.unsettled_partitions, 0);
+        assert!(complete.leaf_output_rows > 0 && complete.bytes_scanned > 0);
+        let evidence = history_buffered::capture_test_measurements(async {
+            observe_history_record_metrics(&body, HistoryScanEvidence::Runtime(&complete));
+        })
+        .await;
+        assert_eq!(
+            value(evidence.counters.measured_rows_scanned.unwrap()),
+            complete.leaf_output_rows
+        );
+        assert_eq!(
+            value(evidence.counters.measured_bytes_scanned.unwrap()),
+            complete.bytes_scanned
+        );
+    }
+
+    #[tokio::test]
+    async fn default_stats_do_not_establish_measurement_but_proven_no_scan_zero_does() {
+        let body = RecordsResponse {
+            columns: vec![],
+            rows: serde_json::json!([]),
+            row_count: 0,
+            truncated: false,
+            max_rows: None,
+            cost: None,
+            stats: Some(crate::format::ScanStats::default()),
+            approximation: None,
+        };
+        let default_runtime = crate::midflight::PlanRuntimeStats::default();
+        for scan in [
+            HistoryScanEvidence::Unavailable,
+            HistoryScanEvidence::Runtime(&default_runtime),
+        ] {
+            let unknown = history_buffered::capture_test_measurements(async {
+                observe_history_record_metrics(&body, scan);
+            })
+            .await;
+            assert!(unknown.counters.measured_rows_scanned.is_none());
+            assert!(unknown.counters.measured_bytes_scanned.is_none());
+        }
+        let retried = history_buffered::capture_test_measurements(async {
+            history_buffered::incomplete_scan_attribution();
+            observe_history_record_metrics(&body, HistoryScanEvidence::NoDataScan);
+        })
+        .await;
+        assert!(retried.counters.measured_rows_scanned.is_none());
+        assert!(retried.counters.measured_bytes_scanned.is_none());
+        let zero = history_buffered::capture_test_measurements(async {
+            observe_history_record_metrics(&body, HistoryScanEvidence::NoDataScan);
+        })
+        .await;
+        assert_eq!(value(zero.counters.measured_rows_scanned.unwrap()), 0);
+        assert_eq!(value(zero.counters.measured_bytes_scanned.unwrap()), 0);
     }
 }

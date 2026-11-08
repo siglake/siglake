@@ -1,4 +1,4 @@
-//! Internal lifecycle service. No route, environment, startup or audit wiring.
+//! Explicit lifecycle service. No environment, startup or audit wiring.
 use super::*;
 use std::{
     collections::VecDeque,
@@ -38,7 +38,7 @@ const LOSS_REASONS: usize = 9;
 pub struct HistoryHealth {
     /// Always true: crashes and unobserved requests cannot be counted exactly.
     pub partial_coverage: bool,
-    /// Independent of SQL availability. No public route uses this service yet.
+    /// Independent of SQL availability; never a query admission condition.
     pub history_ready: bool,
     pub startup_caught_up: bool,
     pub maintenance_ok: bool,
@@ -417,6 +417,71 @@ impl HistoryService {
             && health.queued_entries == 0;
         health
     }
+    /// A cloneable request seam, never an owner of the retry task.
+    pub fn observer(&self) -> HistoryObserver {
+        HistoryObserver {
+            inner: self.inner.clone(),
+        }
+    }
+    pub async fn begin(
+        &self,
+        principal: Principal,
+        request: RequestMetadata,
+        sql: RedactedSql,
+    ) -> ObservationHandle {
+        self.observer().begin(principal, request, sql).await
+    }
+    /// One 100ms asynchronous waiting budget, not a real-time scheduler bound.
+    /// Failure preserves uncertainty, not synthetic terminal success or durable
+    /// delivery. On timeout abort is requested; termination may not yet have
+    /// been observed. The task stays owned until its completion is consumed,
+    /// including if this future is cancelled during either wait.
+    pub async fn shutdown(&mut self) -> bool {
+        self.inner.closed.store(true, Ordering::Release);
+        self.inner.wake.notify_one();
+        let deadline = Instant::now() + WRITE_BUDGET;
+        let Some(task) = self.task.as_mut() else {
+            return self.health().queued_entries == 0;
+        };
+        match tokio::time::timeout_at(deadline, &mut *task).await {
+            Ok(result) => {
+                self.task.take();
+                if result.is_err() {
+                    self.inner.signal(LossReason::Shutdown);
+                    false
+                } else {
+                    self.health().queued_entries == 0
+                }
+            }
+            Err(_) => {
+                self.inner.signal(LossReason::Shutdown);
+                task.abort();
+                // No new budget or unbounded abort-and-join wait. Keep ownership
+                // if completion cannot be observed before the same deadline.
+                if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
+                    self.task.take();
+                }
+                false
+            }
+        }
+    }
+}
+impl Drop for HistoryService {
+    fn drop(&mut self) {
+        self.inner.closed.store(true, Ordering::Release);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Cloneable non-owning observer. The sole HistoryService still closes/aborts
+/// the task on shutdown/drop, including when these handles survive it.
+#[derive(Clone)]
+pub struct HistoryObserver {
+    inner: Arc<Inner>,
+}
+impl HistoryObserver {
     /// One 100ms budget for BOTH receipt and initial persistence. A missing DB
     /// receipt yields a disabled handle, never a local-time/recovery receipt.
     /// Failure does not reject or delay SQL beyond this budget. Caller must not
@@ -472,52 +537,10 @@ impl HistoryService {
             }
         }
     }
-    /// One 100ms asynchronous waiting budget, not a real-time scheduler bound.
-    /// Failure preserves uncertainty, not synthetic terminal success or durable
-    /// delivery. On timeout abort is requested; termination may not yet have
-    /// been observed. The task stays owned until its completion is consumed,
-    /// including if this future is cancelled during either wait.
-    pub async fn shutdown(&mut self) -> bool {
-        self.inner.closed.store(true, Ordering::Release);
-        self.inner.wake.notify_one();
-        let deadline = Instant::now() + WRITE_BUDGET;
-        let Some(task) = self.task.as_mut() else {
-            return self.health().queued_entries == 0;
-        };
-        match tokio::time::timeout_at(deadline, &mut *task).await {
-            Ok(result) => {
-                self.task.take();
-                if result.is_err() {
-                    self.inner.signal(LossReason::Shutdown);
-                    false
-                } else {
-                    self.health().queued_entries == 0
-                }
-            }
-            Err(_) => {
-                self.inner.signal(LossReason::Shutdown);
-                task.abort();
-                // No new budget or unbounded abort-and-join wait. Keep ownership
-                // if completion cannot be observed before the same deadline.
-                if tokio::time::timeout_at(deadline, &mut *task).await.is_ok() {
-                    self.task.take();
-                }
-                false
-            }
-        }
-    }
-}
-impl Drop for HistoryService {
-    fn drop(&mut self) {
-        self.inner.closed.store(true, Ordering::Release);
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
 }
 
 /// Transfer this owner (or an Arc of it) into the final records/stream/batch
-/// wrapper; do not create another parent. No public routes currently do so.
+/// wrapper; do not create another parent.
 /// Dropping without terminal evidence queues uncertainty, not execution failure
 /// or proof of client disconnection/cancellation. Drop never awaits or spawns.
 pub struct ObservationHandle {

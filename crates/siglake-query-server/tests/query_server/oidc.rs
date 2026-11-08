@@ -795,3 +795,6 @@ async fn cognito_access_external_shard_body_cannot_override_signed_tenant() {
     );
     idp.abort();
 }
+
+#[path = "buffered_history.rs"]
+mod buffered_history;

@@ -56,6 +56,12 @@ pub const TARGET_DECODE_BPS: f64 = 50.0 * 1024.0 * 1024.0;
 #[derive(Debug, Serialize, serde::Deserialize, Clone, utoipa::ToSchema)]
 pub struct CostReport {
     pub files_to_scan: Option<usize>,
+    /// Internal provenance, independent of `exact`: every referenced scan was
+    /// successfully estimated. Not a response field; deserialized reports have
+    /// no trusted provenance. Never used for admission, scheduling or limits.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub estimate_complete: bool,
     /// Live files considered BEFORE the manifest time-bounds prune —
     /// `files_considered - files_to_scan` is planning-time pruning's win.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,6 +90,7 @@ impl CostReport {
     pub fn unknown_after_timeout() -> Self {
         Self {
             files_to_scan: None,
+            estimate_complete: false,
             files_considered: None,
             estimated_bytes_scanned: 0,
             estimated_rows_processed: 0,
@@ -163,6 +170,7 @@ pub async fn estimate(df: &DataFrame, ice: &Arc<IcebergContext>) -> anyhow::Resu
     // `events` and not user indexes.
     //
     let mut had_known_scan = false;
+    let mut estimate_complete = scan_inventory_covers_subqueries(&logical);
     for table in &scanned {
         let time_col = if is_siglake_table(table) {
             Some("timestamp".to_string())
@@ -182,13 +190,17 @@ pub async fn estimate(df: &DataFrame, ice: &Arc<IcebergContext>) -> anyhow::Resu
                 }
             }
         };
-        let Some(time_col) = time_col else { continue };
+        let Some(time_col) = time_col else {
+            estimate_complete = false;
+            continue;
+        };
         had_known_scan = true;
         match ice.scan_cost(table, &time_col, time_bounds).await {
             Ok(c) => total = total.add(&c),
             Err(e) => {
                 tracing::debug!(table, error = %e, "scan_cost failed; estimate may be incomplete");
                 total.exact = false;
+                estimate_complete = false;
             }
         }
     }
@@ -201,6 +213,7 @@ pub async fn estimate(df: &DataFrame, ice: &Arc<IcebergContext>) -> anyhow::Resu
 
     Ok(CostReport {
         files_to_scan: Some(total.files),
+        estimate_complete,
         files_considered: had_known_scan.then_some(total.files_considered),
         estimated_bytes_scanned: total.bytes,
         estimated_rows_processed: total.rows,
@@ -286,6 +299,36 @@ fn scanned_tables(plan: &LogicalPlan) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// History-only provenance: the legacy inventory uses ordinary plan inputs,
+/// which omit expression-embedded subqueries in unoptimized plans. Do not price
+/// those scans here or change response/admission totals. Any additional scan
+/// occurrence (even of the same table) has an unestablished contribution. A
+/// constant subquery with no scans adds no scan cost and can retain proven zero.
+/// Traversal errors must never certify an incomplete inventory.
+fn scan_inventory_covers_subqueries(plan: &LogicalPlan) -> bool {
+    let mut ordinary_scans = 0usize;
+    if plan
+        .apply(|node| {
+            if matches!(node, LogicalPlan::TableScan(_)) {
+                ordinary_scans += 1;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .is_err()
+    {
+        return false;
+    }
+    let mut all_scans = 0usize;
+    plan.apply_with_subqueries(|node| {
+        if matches!(node, LogicalPlan::TableScan(_)) {
+            all_scans += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .is_ok()
+        && all_scans == ordinary_scans
 }
 
 /// Best-effort extraction of a `(start, end)` time window from
@@ -1447,6 +1490,340 @@ mod user_index_cost_tests {
         assert!(
             !cost.exact,
             "an unknown table must mark the estimate inexact"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_availability_tests {
+    use super::*;
+    use crate::history::buffered;
+    use datafusion::prelude::SessionContext;
+    use siglake_core::{index_config::IndexConfig, Event};
+
+    fn value(counter: crate::history::Counter) -> u64 {
+        serde_json::to_value(counter).unwrap().as_u64().unwrap()
+    }
+
+    async fn recorded(cost: &CostReport) -> crate::history::ExecutionMeasurements {
+        buffered::capture_test_measurements(async { buffered::cost(cost) }).await
+    }
+
+    async fn subquery_fixture() -> (tempfile::TempDir, Arc<IcebergContext>, SessionContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let config = IndexConfig {
+            index_id: "available".into(),
+            ..IndexConfig::builtin_events()
+        };
+        ice.create_index(&config).await.unwrap();
+        let batch = siglake_core::events_to_record_batch(&[Event::now("outer")]).unwrap();
+        let mapped = siglake_core::mapping::map_carrier_batch(&batch, &config).unwrap();
+        ice.append_to_table(&ice.index_table_ident("available"), mapped, &[])
+            .await
+            .unwrap();
+        let mut event = Event::now("inner");
+        event.timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        ice.append_events(&[event]).await.unwrap();
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        ice.register_indexes_with_datafusion(&ctx).await.unwrap();
+        (tmp, ice, ctx)
+    }
+
+    // Inspect the actual unoptimized engine plan, not an independently modeled
+    // completeness flag. Repeated names matter: a second scan of the same table
+    // inside a subquery is still absent from the legacy deduplicated inventory.
+    fn assert_plan_scans(df: &DataFrame, ordinary: &[&str], including_subqueries: &[&str]) {
+        let plan = df.logical_plan();
+        let mut flat = Vec::new();
+        plan.apply(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                flat.push(scan.table_name.table().to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        let mut all = Vec::new();
+        plan.apply_with_subqueries(|node| {
+            if let LogicalPlan::TableScan(scan) = node {
+                all.push(scan.table_name.table().to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .unwrap();
+        flat.sort();
+        all.sort();
+        assert_eq!(flat, ordinary, "{plan:?}");
+        assert_eq!(all, including_subqueries, "{plan:?}");
+    }
+
+    async fn assert_unavailable_with_unchanged_response(cost: &CostReport, legacy: &CostReport) {
+        assert_eq!(
+            serde_json::to_value(cost).unwrap(),
+            serde_json::to_value(legacy).unwrap(),
+            "all legacy public fields, including numerical/admission inputs, must stay unchanged"
+        );
+        assert!(!cost.estimate_complete);
+        let history = recorded(cost).await;
+        assert!(history.counters.estimated_bytes_scanned.is_none());
+        assert!(history.counters.estimated_rows_processed.is_none());
+    }
+
+    #[tokio::test]
+    async fn embedded_only_scans_do_not_certify_legacy_zero_estimates() {
+        let (_tmp, ice, ctx) = subquery_fixture().await;
+        let legacy_zero = estimate(&ctx.sql("SELECT 1").await.unwrap(), &ice)
+            .await
+            .unwrap();
+        assert_eq!(legacy_zero.files_to_scan, Some(0));
+        assert_eq!(legacy_zero.estimated_rows_processed, 0);
+        assert!(
+            ice.scan_cost("events", "timestamp", None)
+                .await
+                .unwrap()
+                .rows
+                > 0
+        );
+        for sql in [
+            "SELECT (SELECT MAX(length(raw)) FROM events) AS n",
+            "SELECT (SELECT (SELECT count(*) FROM events)) AS n",
+        ] {
+            let df = ctx.sql(sql).await.unwrap();
+            assert_plan_scans(&df, &[], &["events"]);
+            assert!(scanned_tables(df.logical_plan()).is_empty());
+            let cost = estimate(&df, &ice).await.unwrap();
+            assert_unavailable_with_unchanged_response(&cost, &legacy_zero).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_scans_do_not_certify_partial_outer_estimates() {
+        let (_tmp, ice, ctx) = subquery_fixture().await;
+        let legacy_outer = estimate(&ctx.sql("SELECT raw FROM available").await.unwrap(), &ice)
+            .await
+            .unwrap();
+        assert_eq!(legacy_outer.files_to_scan, Some(1));
+        assert_eq!(legacy_outer.estimated_rows_processed, 1);
+        assert!(legacy_outer.estimated_bytes_scanned > 0);
+        for (sql, inner) in [
+            ("SELECT raw, (SELECT MAX(length(raw)) FROM events) AS n FROM available", "events"),
+            ("SELECT raw FROM available WHERE EXISTS (SELECT 1 FROM events)", "events"),
+            ("SELECT raw FROM available WHERE raw IN (SELECT raw FROM events)", "events"),
+            ("SELECT raw, count(*) AS n FROM available GROUP BY raw HAVING count(*) >= (SELECT count(*) FROM events)", "events"),
+            ("SELECT raw FROM available WHERE EXISTS (SELECT 1 FROM available)", "available"),
+        ] {
+            let df = ctx.sql(sql).await.unwrap();
+            assert_plan_scans(&df, &["available"], &["available", inner]);
+            assert_eq!(scanned_tables(df.logical_plan()), ["available"]);
+            let cost = estimate(&df, &ice).await.unwrap();
+            assert_unavailable_with_unchanged_response(&cost, &legacy_outer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn embedded_catalog_failure_does_not_certify_zero_or_partial_estimates() {
+        let (_tmp, ice, ctx) = subquery_fixture().await;
+        let nested_only = ctx
+            .sql("SELECT (SELECT count(*) FROM events) AS n")
+            .await
+            .unwrap();
+        let partial = ctx
+            .sql("SELECT raw FROM available WHERE EXISTS (SELECT 1 FROM events)")
+            .await
+            .unwrap();
+        assert_plan_scans(&nested_only, &[], &["events"]);
+        assert_plan_scans(&partial, &["available"], &["available", "events"]);
+        // Same owned catalog failure as the flat regression: registered plans
+        // survive fixture table removal, but the real inner scan_cost now fails.
+        ice.catalog().drop_table(ice.table_ident()).await.unwrap();
+        ice.invalidate_cached_table(ice.table_ident()).await;
+        assert!(ice.scan_cost("events", "timestamp", None).await.is_err());
+        for (df, legacy_sql) in [
+            (nested_only, "SELECT 1"),
+            (partial, "SELECT raw FROM available"),
+        ] {
+            let legacy = estimate(&ctx.sql(legacy_sql).await.unwrap(), &ice)
+                .await
+                .unwrap();
+            let cost = estimate(&df, &ice).await.unwrap();
+            assert_unavailable_with_unchanged_response(&cost, &legacy).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn constant_subqueries_preserve_proven_zero_and_heuristic_estimates() {
+        let (_tmp, ice, ctx) = subquery_fixture().await;
+        for sql in [
+            "SELECT (SELECT 1) AS n",
+            "SELECT (SELECT (SELECT 1)) AS n",
+            "SELECT 1 WHERE EXISTS (SELECT 1)",
+            "SELECT 1 WHERE 1 IN (SELECT 1)",
+        ] {
+            let df = ctx.sql(sql).await.unwrap();
+            assert_plan_scans(&df, &[], &[]);
+            let cost = estimate(&df, &ice).await.unwrap();
+            assert!(cost.estimate_complete);
+            assert_eq!(cost.files_to_scan, Some(0));
+            assert_eq!(
+                value(
+                    recorded(&cost)
+                        .await
+                        .counters
+                        .estimated_rows_processed
+                        .unwrap()
+                ),
+                0
+            );
+            assert_eq!(
+                value(
+                    recorded(&cost)
+                        .await
+                        .counters
+                        .estimated_bytes_scanned
+                        .unwrap()
+                ),
+                0
+            );
+        }
+        let df = ctx.sql(
+            "SELECT raw, (SELECT 1) AS n FROM events WHERE timestamp >= to_timestamp('2026-01-01T00:00:20Z') AND timestamp < to_timestamp('2026-01-01T00:00:40Z')"
+        ).await.unwrap();
+        assert_plan_scans(&df, &["events"], &["events"]);
+        let cost = estimate(&df, &ice).await.unwrap();
+        assert!(!cost.exact);
+        assert!(cost.estimate_complete);
+        assert_eq!(cost.estimated_rows_processed, 1);
+        let history = recorded(&cost).await;
+        assert_eq!(value(history.counters.estimated_rows_processed.unwrap()), 1);
+        assert_eq!(
+            value(history.counters.estimated_bytes_scanned.unwrap()),
+            cost.estimated_bytes_scanned
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_cost_failure_retains_response_totals_but_not_history_estimates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let config = IndexConfig {
+            index_id: "available".into(),
+            ..IndexConfig::builtin_events()
+        };
+        ice.create_index(&config).await.unwrap();
+        let batch = siglake_core::events_to_record_batch(&[Event::now("fixture")]).unwrap();
+        let mapped = siglake_core::mapping::map_carrier_batch(&batch, &config).unwrap();
+        ice.append_to_table(&ice.index_table_ident("available"), mapped, &[])
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        ice.register_indexes_with_datafusion(&ctx).await.unwrap();
+        // Keep the registered plan, but remove only this fixture's catalog table.
+        // The earlier alphabetic `available` scan succeeds before `events` fails.
+        let partial_df = ctx
+            .sql("SELECT raw FROM available UNION ALL SELECT raw FROM events")
+            .await
+            .unwrap();
+        let failed_df = ctx.sql("SELECT raw FROM events").await.unwrap();
+        ice.catalog().drop_table(ice.table_ident()).await.unwrap();
+        ice.invalidate_cached_table(ice.table_ident()).await;
+        assert!(ice.scan_cost("events", "timestamp", None).await.is_err());
+        for (df, partial) in [(partial_df, true), (failed_df, false)] {
+            let cost = estimate(&df, &ice).await.unwrap();
+            assert!(!cost.estimate_complete);
+            assert!(!cost.exact);
+            // The old response/limiter inputs are unchanged, including partial
+            // accumulation and Some(0) on failure. Only history availability differs.
+            assert_eq!(cost.files_to_scan, Some(usize::from(partial)));
+            assert_eq!(cost.estimated_rows_processed, u64::from(partial));
+            let history = recorded(&cost).await;
+            assert!(history.counters.estimated_bytes_scanned.is_none());
+            assert!(history.counters.estimated_rows_processed.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_heuristic_and_established_zero_are_available_not_measurements() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let mut event = Event::now("fixture");
+        event.timestamp = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 30).unwrap();
+        ice.append_events(&[event]).await.unwrap();
+        let ctx = SessionContext::new();
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        for (predicate, rows, exact) in [
+            ("timestamp >= to_timestamp('2026-01-01T00:00:20Z') AND timestamp < to_timestamp('2026-01-01T00:00:40Z')", 1, false),
+            ("timestamp >= to_timestamp('2026-01-02T00:00:00Z') AND timestamp < to_timestamp('2026-01-03T00:00:00Z')", 0, true),
+        ] {
+            let df = ctx.sql(&format!("SELECT raw FROM events WHERE {predicate}")).await.unwrap();
+            let cost = estimate(&df, &ice).await.unwrap();
+            assert_eq!(cost.exact, exact);
+            assert!(cost.estimate_complete);
+            assert_eq!(cost.estimated_rows_processed, rows);
+            let history = recorded(&cost).await;
+            assert_eq!(value(history.counters.estimated_rows_processed.unwrap()), rows);
+            assert_eq!(value(history.counters.estimated_bytes_scanned.unwrap()), cost.estimated_bytes_scanned);
+            assert!(history.counters.measured_rows_scanned.is_none());
+            assert!(history.counters.measured_bytes_scanned.is_none());
+            let wire = serde_json::to_value(&cost).unwrap();
+            assert!(wire.get("estimate_complete").is_none());
+            assert!(!serde_json::from_value::<CostReport>(wire).unwrap().estimate_complete);
+        }
+    }
+
+    #[tokio::test]
+    async fn unestablished_scan_is_unavailable_but_no_scan_plan_establishes_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        let ctx = SessionContext::new();
+        ctx.sql("CREATE TABLE unknown_source AS SELECT 1 AS n")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let unknown = estimate(
+            &ctx.sql("SELECT * FROM unknown_source").await.unwrap(),
+            &ice,
+        )
+        .await
+        .unwrap();
+        assert!(!unknown.estimate_complete);
+        assert!(recorded(&unknown)
+            .await
+            .counters
+            .estimated_rows_processed
+            .is_none());
+        let no_scan = estimate(&ctx.sql("SELECT 1").await.unwrap(), &ice)
+            .await
+            .unwrap();
+        assert!(no_scan.estimate_complete);
+        assert_eq!(
+            value(
+                recorded(&no_scan)
+                    .await
+                    .counters
+                    .estimated_rows_processed
+                    .unwrap()
+            ),
+            0
         );
     }
 }

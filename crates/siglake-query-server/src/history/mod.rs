@@ -1,10 +1,12 @@
-//! Internal history primitives and opt-in lifecycle object. No route/startup
+//! History primitives and opt-in buffered route observation. No startup
 //! wiring, audit cutover, environment configuration or runtime DDL.
+pub(crate) mod buffered;
 pub mod redaction;
 mod runtime;
 mod store;
 pub use runtime::{
-    Delivery, HistoryHealth, HistoryService, LossReason, ObservationHandle, WRITE_BUDGET,
+    Delivery, HistoryHealth, HistoryObserver, HistoryService, LossReason, ObservationHandle,
+    WRITE_BUDGET,
 };
 pub use store::{HistoryReader, HistoryWriter, StoredExecution, WriteResult};
 

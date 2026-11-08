@@ -2757,6 +2757,7 @@ mod cancellation_tests {
     fn cost() -> CostReport {
         CostReport {
             files_to_scan: Some(1),
+            estimate_complete: false,
             files_considered: Some(1),
             estimated_bytes_scanned: 1,
             estimated_rows_processed: 1,

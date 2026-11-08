@@ -1,11 +1,96 @@
-# Internal query-history runtime core (not routed collection)
+# Optional buffered query-history integration (PARTIAL coverage)
 
-`siglake_query_server::history::{HistoryService, ObservationHandle}` is an
-internal lifecycle API, currently called **only by tests**. No application
-startup constructs it, no CLI/environment flag enables collection, and no SQL,
-HTTP, stream, job or legacy-audit path uses it. See
-[the unchanged storage/role contract](query-history-store.md). Schema, reader
-RLS/column-ACL preflight, fixed roles and parser-free SQL omission are unchanged.
+`AppState::with_history(HistoryService::observer())` is an explicit production
+state/router seam. The default is **None**, and no standalone binary startup,
+CLI flag, URL/environment resolver or migration enables collection. The caller
+must explicitly supply a trusted, preflighted writer and retain the sole service
+owner. Tests inject that application state; this is not deployed collection.
+See [the unchanged storage/role contract](query-history-store.md). Reader schema,
+RLS, column ACL, literal `pg_` contract and original 30-day expiry are unchanged.
+
+## Buffered route boundary and attribution
+
+The external handler owns exactly one observation. Observation begins after
+production authentication and JSON extraction and the pure authoritative
+`AppState::execution_tenant` routing decision, before namespace-open, empty SQL,
+rewrite, cache, planning, admission and execution can fail. `resolve_ice` and job
+ownership share that same `(TenantRegistry present, authenticated tenant present)`
+decision; catalog opening remains inside its existing execution deadline. A
+selected tenant does not prove that the catalog opened or work was admitted.
+
+There is **no accepted canonical tenant for shared/default storage**. A signed
+tenant without a configured registry is not used for routing and is not used for
+history. Missing/ambiguous selected tenant, including current open/static/default
+routes, is explicitly unobserved; query behavior is unchanged. For a selected
+named tenant, generic verified callers without a supported provider principal
+still produce tenant-scoped **unknown** principal rows. The engine does not know
+console credential mappings. Only existing authenticated `CallerIdentity` can
+supply verified issuer/client; no headers, body provider fields, subjects, emails,
+user-supplied correlation IDs or namespace guesses supply attribution. Principal
+validation failure disables observation, not the query.
+
+### Supported/unsupported matrix
+
+| Path | Observation in this slice |
+| --- | --- |
+| `/api/v1/sql`, records, no configured peer source, interactive | Buffered planning/data/cache/typed errors; one external parent |
+| `/api/v1/sql/local`, records, interactive | Same, independent of configured peers |
+| Supported SQL records `dry_run` (including batch priority dry-run) | Planning only; no returned/scanned measurement fabricated |
+| `/api/v1/sql/explain` | Independent planning observation; actual JSON format regardless of ignored request format/priority |
+| `/api/v1/sql/distributed` with no captured membership, eligible records | Not-admitted validation rejection; no helper/duplicate parent |
+| Buffered records metadata fast-paths | Numeric completion boundary at selecting a real fast-path result; count path exercised by new routed proof |
+| `/api/v1/sql` with **any configured peer source**, even discovery without a current membership | Deferred entirely, including local fallbacks |
+| Configured explicit coordinator/fallback and direct/coordinator shard routes | Deferred; no parent/child rows or fabricated terminal success |
+| NDJSON and other unsupported/remaining fast-path formats | Deferred, including EOF/error/disconnect/body abandonment |
+| Batch submit/run/cancel/restart (202) | Deferred; submission is not terminal success |
+| Auth/tenant middleware or JSON extractor rejection | No execution observation |
+| Missing/ambiguous effective tenant, no observer, stopped service/no DB receipt | No durable execution row promised; never a fabricated correlation ID |
+| Jaeger/search/warmers, direct engine APIs, MCP subprocess, console chain | Not observed/proved by this slice |
+
+Records cache acceptance, a selected real metadata result, accepted planning-only
+work, and the real reservation/disabled-admission boundary explicitly provide
+admission evidence; **HTTP200 alone never does**. Pre-admission bad SQL,
+validation/planning/admission rejection stays not admitted. Execution errors and
+504 timeouts use fixed safe codes without inspecting/copying error strings.
+Buffered completion means engine execution/render handler completion, **not
+network delivery**. Transparent local helpers do not open another observation.
+
+A request-scoped task-local safe evidence object carries only the existing
+handle, fixed enums, nullable numeric counters and booleans through internal
+helpers. It never owns SQL, results, tokens, arbitrary errors, plans or names.
+Renderer hooks copy only numeric row counts, truncation and existing measured
+scan counters, never read/clone rows or HTTP bodies. Cache hits do not reuse the
+original run's scan counters as current measurements. Estimates are distinct
+from measured counters; absent/unestablished estimates and unavailable measured
+counters stay NULL. Estimator completeness is internal provenance independent of
+exactness: successful heuristics and established zero estimates remain available,
+but failed or partially accumulated estimates do not. Scan evidence comes from
+authoritative execution branches and complete instrumented snapshots, never the
+presence of default response stats. Uninstrumented fast paths (including windowed
+boundary counts and footer/page fallbacks), snapshots with unsettled partitions,
+and residual retries whose final snapshot omits the first attempt retain NULL scan measurements while preserving returned-row/truncation evidence.
+Whole-table metadata count has positive no-data-scan evidence and can report zero.
+This does not change execution, settle deadlines, scheduling or limit enforcement.
+Success requires explicit completion and admission evidence;
+an unrecognized successful branch would retain uncertainty, not synthesize it.
+All original SQL remains parser-free NULL. Existing raw engine parser/audit/job
+logging remains **UNSANITIZED and outside the new-store guarantee**; nothing is
+deleted, backfilled or silently cut over.
+
+`x-siglake-history-id` is added to success/error responses **only for a real DB
+receipt** and matches its execution UUID. It is correlation, not acknowledgement
+that the row is durable: initial/terminal failures may queue or lose evidence.
+Absent receipt means no header. Clients cannot choose/override the UUID.
+
+The monotonic `duration_ms` is buffered handler elapsed **after receipt/initial
+write and before terminal write**, including catalog I/O/planning/serialization;
+it is not pure scan time or full HTTP latency. The existing query deadline starts
+where it did before. History begin/finish each retain their configured 100ms
+budget outside that execution budget; unavailable history can add bounded
+telemetry overhead but cannot alter result/auth/admission policy. Original event
+wall times remain unknown; `received_at` is DB receipt time and
+`admission_observed_at`/`finished_observed_at` are DB persistence-observation times,
+not exact original event/completion times. Retries retain original receipt/expiry.
 
 ## API and ownership
 
@@ -20,6 +105,9 @@ RLS/column-ACL preflight, fixed roles and parser-free SQL omission are unchanged
   URIs/environment nor retroactively guarantees how options were created. Pool
   creation/preflight is separate from request observation; request availability
   must never depend on history readiness.
+* `HistoryService::observer()` clones a non-owning `HistoryObserver`; it never
+  owns/spawns/joins the maintenance task. Service shutdown/drop closes surviving
+  observers and remains cancellation-safe.
 * `begin(Principal, RequestMetadata, RedactedSql)` returns a handle, not a query
   admission decision. A **single 100ms budget** includes DB receipt acquisition
   and initial persistence. If receipt acquisition fails, the handle has no
@@ -58,7 +146,7 @@ RLS/column-ACL preflight, fixed roles and parser-free SQL omission are unchanged
   claim that execution stopped. Drop uses a nonblocking queue try-lock and atomic loss signals; it never waits
   for a contended state lock, awaits, blocks on DB or spawns tasks.
 
-### Requirements for the next integration pass
+### Requirements for subsequent integration passes
 
 Records wrappers must own all early `?` exits and finalize typed execution/render
 results before returning; this is not proof of network delivery. NDJSON/other
@@ -70,12 +158,9 @@ same execution UUID through job submission, run, cancellation and recovery;
 public parents or trust client-provided parent IDs. These changes require branch
 and cancellation tests, and an explicitly reviewed legacy raw-audit/log cutover.
 
-**NOT YET OBSERVED:** public SQL records/cache/dry-run/fast paths, explain,
-explicit local/distributed SQL, externally called shard routes, authenticated
-coordinator children, NDJSON/CSV/Arrow/Parquet streaming completion/abandonment,
-batch submit/run/poll/cancel/recovery, and all early handler/extractor failures.
-Jaeger/search/warmers are not implicitly observed either. No public read/event
-endpoint, console integration or executed-query E2E coverage is added here.
+Coverage remains PARTIAL. The deferred matrix above is not inferred from seeded
+history events, and no full SQL-history, production activation, erasure,
+complete-roadmap, MCP-subprocess or console-chain claim is made.
 
 ## Bounded writes, retries and loss provenance
 
@@ -192,3 +277,29 @@ shutdown and task abort. Replay after a known committed write models lost
 acknowledgement; it is not network-fault injection at the commit packet. Separate
 existing privacy/logger/ACL/identity regressions remain required. These are
 internal core tests, not routed SQL collection, full CI or source acceptance.
+
+### Buffered integration proof
+
+`scripts/check-query-history-buffered.sh` uses the same corrected isolation
+helper and disposable real PostgreSQL setup as the prior core runner. The new
+ignored `oidc::buffered_history::real_router_buffered_history_identity_lifecycle_privacy_and_outage`
+test reuses the existing public test-only local RS256 issuer/JWKS fixture and
+executes the **production HTTP router** against a temporary real engine warehouse
+(one synthetic engine event supplies the real snapshot needed for cache; no
+history execution is seeded). It checks renewed same-client identity, distinct
+client/tenant/header tampering, reader tenant isolation, real cache miss/hit,
+planning-only dry-run/explain, parse/planning/catalog/execution/admission/timeout
+failures, count metadata completion, one UUID/owner, DB-admin privacy/NULL SQL/
+original expiry/counter inspection, auth/extractor/deferred/default non-observation,
+real PG table-lock write deadline/retry with original UUID, a history delay longer
+than the query budget without consuming it, and fixture-role no-receipt outage
+without changing real query results. It also checks observer clones surviving
+shutdown and service Drop. Only this fixture's CONNECT privilege/sessions are
+changed for fault injection; all fixture state is destroyed on exit. This is not
+production startup, actual MCP subprocess or console/browser integration.
+
+Trust remains **trusted-host root-/tmp-level build configuration and local
+filesystem/processes**, not a sandbox. No real HOME, passfile or provider config
+is inspected. The runner uses private Cargo cwd, explicit workspace manifest,
+registry-only private CARGO_HOME, pinned 1.95, `--offline --locked`, bounded build
+jobs, disposable private HOME/XDG/provider files and metadata discovery disabled.
