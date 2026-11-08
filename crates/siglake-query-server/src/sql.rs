@@ -12014,6 +12014,10 @@ pub(crate) fn shard_timeout_error(timeout: std::time::Duration, priority: Priori
         "priority" => priority.label()
     )
     .increment(1);
+    shard_timeout_response(timeout)
+}
+
+fn shard_timeout_response(timeout: std::time::Duration) -> ApiError {
     ApiError::new_status(
         axum::http::StatusCode::GATEWAY_TIMEOUT,
         format!(
@@ -18955,13 +18959,23 @@ async fn shard_scoped(
     let deadline = crate::query_controls::runtime::current()
         .map(|c| c.deadline)
         .unwrap_or_else(|| tokio::time::Instant::now() + resolved.timeout);
+    // Controlled expiry is accounted once by the outer native-response adapter,
+    // after phase/until arbitration. Inner errors may be replaced there. Legacy
+    // execution has no outer owner and retains its native increment here.
+    let timeout_error = || {
+        if crate::query_controls::runtime::current().is_some() {
+            shard_timeout_response(resolved.timeout)
+        } else {
+            shard_timeout_error(resolved.timeout, resolved.priority)
+        }
+    };
     macro_rules! under_shard_deadline {
         ($point:ident, $future:expr) => {
             under_shard_deadline!(async {
                 #[cfg(test)]
                 shard_controls_tests::checkpoint(shard_controls_tests::Point::$point).await;
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(shard_timeout_error(resolved.timeout, resolved.priority));
+                    return Err(timeout_error());
                 }
                 $future.await
             })
@@ -18971,15 +18985,15 @@ async fn shard_scoped(
             // before consulting the clock, so an already-ready metadata path
             // would otherwise turn an exhausted budget into a success.
             if tokio::time::Instant::now() >= deadline {
-                return Err(shard_timeout_error(resolved.timeout, resolved.priority));
+                return Err(timeout_error());
             }
             let result = tokio::time::timeout_at(deadline, $future).await;
             if tokio::time::Instant::now() >= deadline {
-                return Err(shard_timeout_error(resolved.timeout, resolved.priority));
+                return Err(timeout_error());
             }
             match result {
                 Ok(res) => res?,
-                Err(_) => return Err(shard_timeout_error(resolved.timeout, resolved.priority)),
+                Err(_) => return Err(timeout_error()),
             }
         }};
     }
@@ -19365,7 +19379,9 @@ async fn shard_scoped(
     // scan stops rather than running on unobserved — which is the whole point of
     // arming it: a timeout that only stops WAITING leaves the work running.
     let batches = under_shard_deadline!(Collect, collect);
-    let bytes = under_shard_deadline!(Render, async {
+    let bytes = under_shard_deadline!(async {
+        #[cfg(test)]
+        shard_controls_tests::checkpoint(shard_controls_tests::Point::Render).await;
         crate::format::batches_to_arrow_ipc(&batches).map_err(ApiError::internal)
     });
     let mut resp = Response::new(Body::from(bytes));
@@ -19406,7 +19422,7 @@ async fn shard_scoped(
             .then_some(runtime.bytes_scanned),
     );
     if tokio::time::Instant::now() >= deadline {
-        return Err(shard_timeout_error(resolved.timeout, resolved.priority));
+        return Err(timeout_error());
     }
     Ok(resp)
 }

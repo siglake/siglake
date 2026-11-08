@@ -134,3 +134,215 @@ async fn expired_shard_never_polls_catalog_even_for_ready_empty_results_and_no_d
         drop(held);
     }
 }
+
+/// The recorder is thread-local only DURING EACH POLL, never merely during
+/// future construction and never installed globally across concurrent tests.
+async fn recorded_timeout_trips<F: std::future::Future>(future: F) -> (F::Output, u64) {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshot = recorder.snapshotter();
+    let mut future = Box::pin(future);
+    let result = futures::future::poll_fn(|cx| {
+        metrics::with_local_recorder(&recorder, || future.as_mut().poll(cx))
+    })
+    .await;
+    let trips = snapshot
+        .snapshot()
+        .into_vec()
+        .into_iter()
+        .filter_map(|(key, _, _, value)| {
+            let key = key.key();
+            (key.name() == "siglake_query_breaker_trips_total"
+                && key
+                    .labels()
+                    .any(|l| l.key() == "breaker" && l.value() == "shard_timeout")
+                && key
+                    .labels()
+                    .any(|l| l.key() == "priority" && l.value() == "interactive"))
+            .then_some(value)
+        })
+        .map(|value| match value {
+            DebugValue::Counter(n) => n,
+            other => panic!("not a counter: {other:?}"),
+        })
+        .sum();
+    (result, trips)
+}
+
+#[tokio::test]
+#[ignore = "owned primary fixture; check-shard-policy.sh"]
+async fn controlled_shard_timeout_counter_has_one_owner_through_complete_wrapper() {
+    use crate::query_controls::runtime::ingress;
+    use crate::query_controls::{ConnectionBounds, PolicyConfig, PolicyReader};
+    let socket = std::path::PathBuf::from(
+        std::env::var("SIGLAKE_POLICY_FIXTURE_DIR").expect("use check-shard-policy.sh"),
+    );
+    assert!(
+        socket.starts_with("/tmp")
+            && socket
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("siglake-policy-")
+    );
+    assert_eq!(
+        std::fs::read_to_string(socket.join("fixture-marker")).unwrap(),
+        "new-owned-policy-fixture-v1\n"
+    );
+    let reader = Arc::new(
+        PolicyReader::connect(
+            PolicyConfig::reader(
+                &format!(
+                    "postgres://qp_reader:@{}:5432/qh_fixture?sslmode=disable",
+                    socket.to_str().unwrap().replace('/', "%2F")
+                ),
+                ConnectionBounds {
+                    max_connections: 1,
+                    operation_timeout: Duration::from_secs(2),
+                },
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap(),
+    );
+    let (base, _tmp) = state().await;
+    let mut limits = crate::ServerLimits::default();
+    limits.interactive.default_timeout = Duration::from_millis(80);
+    limits.interactive.ceiling_timeout = Duration::from_millis(80);
+    let base = base.with_limits(limits);
+    let enabled = base.clone().with_query_controls(reader.clone(), 1).unwrap();
+    for (name, configured, delay, expired, query, expected_status, expected_trips) in [
+        (
+            "controlled-late-render",
+            true,
+            Some(Point::Render),
+            false,
+            None,
+            504,
+            1,
+        ),
+        (
+            "controlled-awaited-collect",
+            true,
+            Some(Point::Collect),
+            false,
+            None,
+            504,
+            1,
+        ),
+        ("controlled-early-ingress", true, None, true, None, 504, 1),
+        (
+            "controlled-unrelated-error",
+            true,
+            None,
+            false,
+            Some(""),
+            400,
+            0,
+        ),
+        (
+            "disabled-late-render",
+            false,
+            Some(Point::Render),
+            false,
+            None,
+            504,
+            1,
+        ),
+        (
+            "disabled-awaited-collect",
+            false,
+            Some(Point::Collect),
+            false,
+            None,
+            504,
+            1,
+        ),
+        (
+            "disabled-unrelated-error",
+            false,
+            None,
+            false,
+            Some(""),
+            400,
+            0,
+        ),
+        ("controlled-policy503", true, None, false, None, 503, 0),
+    ] {
+        if name == "controlled-policy503" {
+            reader.close();
+        }
+        let state = if configured {
+            enabled.clone()
+        } else {
+            base.clone()
+        };
+        let mut req = request(Point::Render);
+        if let Some(query) = query {
+            req.query = query.into();
+        }
+        let started = Instant::now()
+            - if expired {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            };
+        let work = Box::pin(shard(
+            State(state),
+            axum::extract::Extension(CallerIdentity::default()),
+            Json(req),
+        ));
+        let execute = async {
+            let future = ingress(started, work);
+            match delay {
+                Some(point) => DELAY.scope(point, future).await,
+                None => future.await,
+            }
+        };
+        let (result, trips) = recorded_timeout_trips(execute).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.status.as_u16(), expected_status, "{name}");
+        if expected_status == 504 {
+            assert_eq!(
+                error.msg, "shard exceeded its wall-clock budget of 0s",
+                "{name}"
+            );
+            assert!(
+                error.context.is_none(),
+                "native shard timeout must not gain SQL/Jaeger cost"
+            );
+            assert!(
+                started.elapsed() >= Duration::from_millis(80),
+                "original deadline: {name}"
+            );
+        }
+        if configured && !expired && expected_status != 503 {
+            let value = error
+                .headers
+                .iter()
+                .find(|(n, _)| n == "x-siglake-query-controls")
+                .unwrap()
+                .1
+                .to_str()
+                .unwrap();
+            assert!(value.starts_with("v=1;state=inherited;rev=na;gen=1;"));
+            assert!(
+                value.contains(";mandatory=1;timeout_ms=80;"),
+                "{name}: {value}"
+            );
+        } else {
+            assert!(error.headers.is_empty(), "no fabricated snapshot: {name}");
+        }
+        eprintln!(
+            "{name}: status={expected_status} shard_timeout_trips={trips} elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            trips, expected_trips,
+            "{name}: exactly one pre-header accounting owner"
+        );
+    }
+    enabled.shutdown_query_controls().await;
+}
