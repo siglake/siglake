@@ -1,7 +1,13 @@
 # Test-only isolation; source only after env -i. No DB/URI configuration is read.
 # Pinned build tools/target are set separately by the caller.
 history_isolate_environment() {
-  local work=$1 cache=/data/homes/gianarb/.cargo/registry part
+  local work=$1 cache=/data/homes/gianarb/.cargo/registry part native
+  # Resolve native tools before HOME changes even in runners that repeat their
+  # version assertions below. Never allow rustup/home-dependent resolution.
+  for part in cargo rustc rustdoc cargo-clippy clippy-driver rustfmt; do
+    native=$(command -v "$part") || return 1
+    [[ $native == /data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-auth/pinned/toolchain/bin/* && ! -L $native && $(file -b "$native") == ELF* ]] || return 1
+  done
   [[ -d "$work" && $(stat -c %a "$work") == 700 ]] || return 1
   [[ -z ${DATABASE_URL+x} ]] || return 1
   # new_without_pgpass still imports PGHOST/PGUSER/PGSSL*/PGOPTIONS/etc.
@@ -28,6 +34,13 @@ history_isolate_environment() {
     chmod 600 "$part"
     [[ ! -s "$part" && $(stat -c %a "$part") == 600 ]] || return 1
   done
+  # Keep default provider locations empty too. All fixture runners share this
+  # helper; explicit overrides alone must not leave a fallback location unclear.
+  mkdir -m 700 "$HOME/.aws" "$HOME/.config" "$HOME/.config/gcloud" "$HOME/.azure" "$HOME/.kube"
+  for part in "$HOME/.aws/config" "$HOME/.aws/credentials" "$HOME/.boto" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.azure/accessTokens.json" "$HOME/.azure/azureProfile.json" "$HOME/.kube/config"; do
+    : > "$part"
+    chmod 600 "$part"
+  done
   # Share ONLY cached public registry sources/index/archives; never Cargo config,
   # credential files, bin, Git config or an original HOME. Tool metadata is private.
   export CARGO_HOME=/data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-ndjson/isolated-cargo
@@ -40,7 +53,7 @@ history_isolate_environment() {
     [[ $(readlink "$CARGO_HOME/registry/$part") == "$cache/$part" ]] || return 1
   done
   export CARGO_NET_OFFLINE=true
-  printf '%s\n' 'Isolation: private HOME/XDG/provider dirs; empty 0600 explicit PGPASSFILE and private HOME/.pgpass; empty AWS/provider files; AWS metadata disabled; env -i; offline locked cache-only build.'
+  printf '%s\n' 'Isolation: private HOME/XDG/provider dirs; empty 0600 explicit PGPASSFILE and private HOME/.pgpass; empty default/explicit AWS/provider files; AWS metadata disabled; env -i; offline locked cache-only build.'
   for part in src index cache; do
     printf 'Cargo registry %s -> %s\n' "$part" "$(readlink "$CARGO_HOME/registry/$part")"
   done

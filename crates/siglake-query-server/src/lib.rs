@@ -263,6 +263,8 @@ pub struct AppState {
     pub audit: Option<AuditWriter>,
     /// Opt-in observation; the source never owns a collector/runtime task.
     pub history: Option<history::HistoryObserverSource>,
+    /// Injection-only partial controls. Never activated by main/environment.
+    pub(crate) query_controls: Option<Arc<query_controls::ControlsAuthority>>,
     /// Per-request tenant routing. `None` ⇒ every request routes
     /// through `ice` (the v0 single-tenant behavior).
     pub tenants: Option<TenantRegistry>,
@@ -333,6 +335,7 @@ impl AppState {
             jobs: Arc::new(JobStore::default()),
             audit: None,
             history: None,
+            query_controls: None,
             tenants: None,
             allowed_tenants: None,
             query_scan: QueryScanConfig::default(),
@@ -398,6 +401,23 @@ impl AppState {
         ));
         self.limits = Arc::new(limits);
         self
+    }
+
+    /// Local/test server-side injection only. Captures validated operator timeout
+    /// settings; configure limits before calling. Unsupported lifetimes fail
+    /// closed until body/job/Jaeger/shard gates are implemented and reviewed.
+    /// No env/CLI/main activation or successful enforcement labels are provided.
+    pub fn with_query_controls(
+        mut self,
+        reader: Arc<query_controls::PolicyReader>,
+        operator_generation: i64,
+    ) -> Result<Self, query_controls::PolicyError> {
+        self.query_controls = Some(Arc::new(query_controls::ControlsAuthority::new(
+            reader,
+            &self.limits,
+            operator_generation,
+        )?));
+        Ok(self)
     }
 
     pub fn with_jobs(mut self, jobs: JobStore) -> Self {

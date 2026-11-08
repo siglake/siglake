@@ -1,13 +1,15 @@
-//! OFFLINE policy authority primitives only. No startup activation, HTTP routes,
-//! authentication, resolution defaults, cache, or runtime enforcement.
-//! Supplied keys/bindings/actors are trusted metadata, NOT authentication proof.
+//! Policy store and injection-only buffered request authority. No env/main
+//! activation or public enforcement metadata. Supplied metadata constructors
+//! are NOT authentication proof; runtime derives keys from verified identity.
 mod config;
 mod dto;
 mod owned;
 mod role;
+pub(crate) mod runtime;
 mod store;
 pub use config::{ConnectionBounds, PolicyConfig};
 pub use dto::*;
+pub use runtime::ControlsAuthority;
 pub use store::{PolicyManager, PolicyReader};
 use uuid::Uuid;
 

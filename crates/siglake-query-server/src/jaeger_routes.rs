@@ -556,6 +556,9 @@ impl TraceRequest {
     /// nothing to wait for, and holding it from the start is what keeps a flood
     /// of trace reads from all registering tables at once.
     async fn begin(state: &AppState) -> Result<Self, ApiError> {
+        if state.query_controls.is_some() {
+            return Err(crate::query_controls::runtime::unsupported());
+        }
         let tier = state.limits.tier(Priority::Interactive);
         let resolved =
             ResolvedLimits::resolve(&RequestLimits::default(), Priority::Interactive, &tier);

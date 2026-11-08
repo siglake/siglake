@@ -228,7 +228,13 @@ pub async fn middleware(
         return refusal.into_response();
     }
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    if state.query_controls.is_some() {
+        // Original monotonic anchor, after verified authorization and before
+        // extractors, policy/history/catalog/cache or selected-path work.
+        crate::query_controls::runtime::ingress(std::time::Instant::now(), next.run(request)).await
+    } else {
+        next.run(request).await
+    }
 }
 
 /// Decide the tenant a verified token is scoped to, or the refusal that stops

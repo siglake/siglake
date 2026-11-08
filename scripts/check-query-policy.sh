@@ -30,11 +30,6 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 source "$root/scripts/query-history-isolation.bash"
 history_isolate_environment "$work"
-# Empty default provider locations as well as the explicit override files.
-mkdir -m 700 "$HOME/.aws" "$HOME/.config" "$HOME/.config/gcloud" "$HOME/.azure" "$HOME/.kube"
-for file in "$HOME/.aws/config" "$HOME/.aws/credentials" "$HOME/.boto" "$HOME/.config/gcloud/application_default_credentials.json" "$HOME/.azure/accessTokens.json" "$HOME/.azure/azureProfile.json" "$HOME/.kube/config"; do
- : > "$file"; chmod 600 "$file"
-done
 cd "$work"
 printf 'Private cwd: %s\nExplicit manifest: %s\nNot a sandbox; trusted host root/tmp configuration.\n' "$PWD" "$root/Cargo.toml"
 "$pg/initdb" -D "$work/data" --username=fixture_admin --no-locale --encoding=UTF8 --auth=trust >"$work/init.log"
@@ -62,4 +57,5 @@ SQL
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -c 'REVOKE CREATE ON DATABASE qh_fixture FROM qp_owner' >>"$work/setup.log"
 export SIGLAKE_POLICY_FIXTURE_DIR="$work"
 timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --lib query_controls:: -- --include-ignored --test-threads=1
+timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test query_server oidc::buffered_controls:: -- --include-ignored --test-threads=1
 ISOLATED_POLICY

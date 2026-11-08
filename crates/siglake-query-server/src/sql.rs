@@ -291,7 +291,17 @@ struct RequestClock {
 }
 
 impl RequestClock {
+    fn controls() -> Option<Self> {
+        crate::query_controls::runtime::current().map(|c| Self {
+            started: c.started,
+            deadline: c.deadline,
+        })
+    }
+
     fn new(timeout: std::time::Duration) -> Self {
+        if let Some(clock) = Self::controls() {
+            return clock;
+        }
         let started = Instant::now();
         Self {
             deadline: tokio::time::Instant::from_std(started + timeout),
@@ -873,14 +883,18 @@ fn result_cache_key(
     scope: ResultCacheScope,
 ) -> String {
     let normalized_query = normalize_query_for_cache(query);
+    let controls = crate::query_controls::runtime::cache_discriminator(resolved)
+        .map(|value| format!("|{value}"))
+        .unwrap_or_default();
     format!(
-        "{}|snapshot={}|schema={}|rows={}|bytes={}|{}|query={}",
+        "{}|snapshot={}|schema={}|rows={}|bytes={}|{}{}|query={}",
         namespace,
         snapshot_id,
         schema_id,
         resolved.max_rows_returned,
         resolved.max_bytes_scanned,
         scope.key_fragment(),
+        controls,
         normalized_query
     )
 }
@@ -4405,6 +4419,32 @@ pub(crate) async fn plan_client_sql(
     ctx.sql_with_options(sql, read_only_sql()).await
 }
 
+async fn controlled<F, W>(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+    work: W,
+) -> Result<Response, ApiError>
+where
+    F: std::future::Future<Output = Result<Response, ApiError>>,
+    W: FnOnce(AppState, CallerIdentity, SqlRequest) -> F,
+{
+    let authority = state.query_controls.clone();
+    let caller = identity.clone();
+    let limits = req.limits.clone();
+    let priority = req.priority;
+    crate::query_controls::runtime::run(
+        authority,
+        caller,
+        limits,
+        priority,
+        // SQL's selected future is large. Keep one heap-owned future rather
+        // than embedding/copying it through each authority/deadline wrapper.
+        Box::pin(work(state, identity, req)),
+    )
+    .await
+}
+
 // The single-pod fallback is implemented by `handle_local`.
 /// `POST /api/v1/sql` entry point. Transparently coordinates a distributed
 /// query when worker peers are configured and this is an ordinary interactive
@@ -4492,11 +4532,23 @@ pub async fn handle(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
+    let mut result = controlled(state, identity, req, handle_observed).await;
+    stamp_buffered_sql_headers(&mut result, format, started);
+    result
+}
+
+async fn handle_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
     let execution_id = siglake_storage::QueryExecutionId::next();
-    let mut result = siglake_storage::with_query_execution_id(execution_id, async move {
+    siglake_storage::with_query_execution_id(execution_id, async move {
         if state.peers.is_some() {
             history_buffered::observe_configured(state, identity, req, |state, identity, req| {
-                Box::pin(handle_scoped(state, identity, req))
+                Box::pin(crate::query_controls::runtime::phase(handle_scoped(
+                    state, identity, req,
+                )))
             })
             .await
         } else {
@@ -4507,14 +4559,16 @@ pub async fn handle(
                 req,
                 HistoryOperation::Sql,
                 eligible,
-                |state, identity, req| Box::pin(handle_scoped(state, identity, req)),
+                |state, identity, req| {
+                    Box::pin(crate::query_controls::runtime::phase(handle_scoped(
+                        state, identity, req,
+                    )))
+                },
             )
             .await
         }
     })
-    .await;
-    stamp_buffered_sql_headers(&mut result, format, started);
-    result
+    .await
 }
 
 async fn handle_scoped(
@@ -4526,7 +4580,7 @@ async fn handle_scoped(
         return handle_local_inner(state, identity, req, None, None, None).await;
     }
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
+    let resolved = crate::query_controls::runtime::resolve(&req.limits, req.priority, &tier);
 
     // A batch request's timeout governs the queued RUN, not the HTTP handoff.
     // Keep validation, tenant resolution, admission and the 202 outside that
@@ -4698,10 +4752,20 @@ pub async fn handle_local(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
+    let mut result = controlled(state, identity, req, handle_local_observed).await;
+    stamp_buffered_sql_headers(&mut result, format, started);
+    result
+}
+
+async fn handle_local_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
     let eligible = history_buffered::eligible(&req);
     let execution_id = siglake_storage::current_query_execution_id()
         .unwrap_or_else(siglake_storage::QueryExecutionId::next);
-    let mut result = siglake_storage::with_query_execution_id(
+    siglake_storage::with_query_execution_id(
         execution_id,
         history_buffered::observe(
             state,
@@ -4710,13 +4774,13 @@ pub async fn handle_local(
             HistoryOperation::Sql,
             eligible,
             |state, identity, req| {
-                Box::pin(handle_local_inner(state, identity, req, None, None, None))
+                Box::pin(crate::query_controls::runtime::phase(handle_local_inner(
+                    state, identity, req, None, None, None,
+                )))
             },
         ),
     )
-    .await;
-    stamp_buffered_sql_headers(&mut result, format, started);
-    result
+    .await
 }
 
 /// Authoritative execution provenance, never inferred from response defaults.
@@ -4749,6 +4813,7 @@ async fn handle_local_inner(
     pre_rewritten_query: Option<RewrittenQuery>,
     request_clock: Option<RequestClock>,
 ) -> Result<Response, ApiError> {
+    let request_clock = request_clock.or_else(RequestClock::controls);
     let start = request_clock
         .map(|clock| clock.started)
         .unwrap_or_else(Instant::now);
@@ -4776,7 +4841,7 @@ async fn handle_local_inner(
         req.dry_run,
     );
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
+    let resolved = crate::query_controls::runtime::resolve(&req.limits, req.priority, &tier);
     let clock = request_clock.unwrap_or(RequestClock {
         started: start,
         deadline: tokio::time::Instant::from_std(start + resolved.timeout),
@@ -4795,6 +4860,11 @@ async fn handle_local_inner(
     let allow_approximate = AllowApproximate::for_request(&req);
     let unknown_cost = CostReport::unknown_after_timeout();
     let batch_submission = req.priority == Priority::Batch && !req.dry_run;
+    if state.query_controls.is_some()
+        && (batch_submission || (!req.dry_run && format == QueryFormat::Ndjson))
+    {
+        return Err(crate::query_controls::runtime::unsupported());
+    }
     let resolve_started = Instant::now();
     let resolve = async {
         match pre_resolved_ice {
@@ -7240,13 +7310,23 @@ pub async fn explain(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
+    controlled(state, identity, req, explain_observed).await
+}
+
+async fn explain_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
     history_buffered::observe(
         state,
         identity,
         req,
         HistoryOperation::Explain,
         true,
-        explain_inner,
+        |state, identity, req| {
+            crate::query_controls::runtime::phase(explain_inner(state, identity, req))
+        },
     )
     .await
 }
@@ -11797,6 +11877,9 @@ pub(crate) async fn apply_timeout<F, T>(
 where
     F: std::future::Future<Output = Result<T, ApiError>>,
 {
+    if crate::query_controls::runtime::current().is_some() {
+        return crate::query_controls::runtime::phase(fut).await;
+    }
     if !resolved.circuit_breakers {
         return fut.await;
     }
@@ -11821,6 +11904,9 @@ where
 /// without awaiting anything the deadline could cut, so without this check a
 /// warmed entry answered 200 to a request whose budget had already gone.
 pub(crate) fn deadline_expired(resolved: &ResolvedLimits, deadline: tokio::time::Instant) -> bool {
+    if let Some(controls) = crate::query_controls::runtime::current() {
+        return tokio::time::Instant::now() >= controls.deadline;
+    }
     resolved.circuit_breakers && tokio::time::Instant::now() >= deadline
 }
 
@@ -18734,6 +18820,9 @@ pub async fn shard(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<ShardQueryRequest>,
 ) -> Result<Response, ApiError> {
+    if state.query_controls.is_some() {
+        return Err(crate::query_controls::runtime::unsupported());
+    }
     let execution_id = siglake_storage::QueryExecutionId::next();
     siglake_storage::with_query_execution_id(
         execution_id,
@@ -19283,11 +19372,21 @@ pub async fn distributed(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
+    let mut result = controlled(state, identity, req, distributed_observed).await;
+    stamp_buffered_sql_headers(&mut result, format, started);
+    result
+}
+
+async fn distributed_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
     // Capture at the original boundary, before any history await; telemetry
     // must not change which discovery membership this request selected.
     let peers = state.peers.as_ref().and_then(|source| source.capture());
     let execution_id = siglake_storage::QueryExecutionId::next();
-    let mut result = siglake_storage::with_query_execution_id(
+    siglake_storage::with_query_execution_id(
         execution_id,
         history_buffered::observe_configured(state, identity, req, |state, identity, req| async {
             // Preserve the explicit endpoint's existing no-membership refusal.
@@ -19298,12 +19397,13 @@ pub async fn distributed(
              for the first answer)",
                 ));
             };
-            Box::pin(distributed_inner(state, identity, req, None, None, peers)).await
+            crate::query_controls::runtime::phase(Box::pin(distributed_inner(
+                state, identity, req, None, None, peers,
+            )))
+            .await
         }),
     )
-    .await;
-    stamp_buffered_sql_headers(&mut result, format, started);
-    result
+    .await
 }
 
 #[tracing::instrument(skip_all, fields(otel.kind = "internal", query = %req.query))]
@@ -19362,7 +19462,7 @@ async fn distributed_inner(
     let start = Instant::now();
     let format = req.format.unwrap_or_default();
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
+    let resolved = crate::query_controls::runtime::resolve(&req.limits, req.priority, &tier);
     let effective_query = match pre_rewritten_query {
         Some(query) => query,
         None => {
@@ -19720,6 +19820,12 @@ async fn distributed_inner(
             )),
         )
         .await;
+    }
+
+    // The actual coordinated path needs trusted worker/wire lifetimes, not a
+    // second local timer. Refuse before admission, partial scans or dispatch.
+    if state.query_controls.is_some() {
+        return Err(crate::query_controls::runtime::unsupported());
     }
 
     // Legacy explicit routing ignores dry_run and uses batch only as a tier

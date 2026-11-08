@@ -1,10 +1,10 @@
 # Query policy v1: OFFLINE authority only
 
-This library slice does **not** enable controls. No startup/AppState/HTTP/session
-integration, defaults resolver, policy cache, execution deadline, customer form,
-effective endpoint, job/wire/history changes, or production migration is included.
-Existing SQL, Jaeger, Arrow, body, distributed and queue/run gaps remain. Saved
-settings are not effective limits. Nothing here claims a deployed numerical default.
+This document describes the accepted offline store contract. It does **not**
+authorize runtime activation or production migration. Subsequent injection-only
+buffered request work is documented in [query-controls-buffered.md](query-controls-buffered.md);
+body/jobs/Jaeger/Arrow/wire/skew and presentation gates remain. Saved settings are
+not effective limits. Nothing here claims a deployed numerical default.
 
 ## Reviewed manual owner artifacts
 
@@ -96,9 +96,9 @@ No global logging filter, dependency patch or feature change is made.
 `RuntimeKey`, `ManagementBinding` and `VerifiedHumanActor` are deliberately not
 request-deserializable. Their `from_trusted_metadata` constructors validate storage
 bounds, not authentication. Offline values are fixtures/already-trusted metadata.
-Future runtime keys must come from verified `CallerIdentity`/principal exact tenant,
-issuer and client, never request headers/JSON, `sub`, display name, JWT bytes or
-history. Customer saves still require session, exact Origin, org/credential UUID,
+Injected runtime resolution derives keys from verified `CallerIdentity`/principal
+exact tenant, issuer and client, never request headers/JSON, `sub`, display name,
+JWT bytes or history. Customer saves still require session, exact Origin, org/credential UUID,
 ready lifecycle and trusted provisioning binding authorization. Manager access to
 a tenant GUC is **not isolation from a compromised manager application**.
 
@@ -153,7 +153,8 @@ free text, extension bag or request-header authority exists. No route emits it.
 Rust 1.95 and PG16.14 before private HOME/XDG isolation, creates/marks a **new**
 socket-only disposable cluster before roles/DDL, uses empty explicit and HOME
 passfiles, empty provider files/disabled metadata and registry-only private Cargo,
-and runs the complete policy suite including fixture-gated tests. Missing setup
+and runs the complete policy suite plus the injection-only signed-JWT buffered
+router suite, including fixture-gated tests. Missing setup
 fails; ignored tests are run explicitly, not counted as passes. Isolation is not a
 sandbox. No existing cluster, real provider/auth credential or production role is
 used. The fixture tests include a local synthetic wire relay dropping COMMIT
@@ -165,4 +166,5 @@ sentinel; arbitrary NOTICE/INFO is still excluded. No wire payloads are logged.
 Later slices must close SQL/body/job, all four Jaeger, external Arrow/internal
 wire/skew, customer authorization and full end-to-end gates before advertising
 enforcement. Production schema/security/audit/TLS/operator and deployment approval
-remain separate. This checkpoint must be independently reviewed before Slice 2.
+remain separate. Offline Slice 1 was independently accepted; each subsequent
+bounded runtime slice requires its own implementation review.

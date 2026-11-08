@@ -30,6 +30,17 @@ impl PolicyReader {
     pub async fn lookup(&self, key: &RuntimeKey) -> Result<PolicyLookup, PolicyError> {
         lookup(&self.pool, key, None).await
     }
+    /// Fresh configured-primary health for callers without a verified agent key.
+    /// Checkout verifies role/schema/primary/closed state, without reading or
+    /// inventing a policy tuple. No cached health latch or agent attribution.
+    pub async fn preflight(&self) -> Result<(), PolicyError> {
+        tokio::time::timeout(self.pool.budget, async {
+            let mut lease = self.pool.acquire().await?;
+            lease.complete().await
+        })
+        .await
+        .map_err(|_| PolicyError::Unavailable)?
+    }
     pub fn close(&self) {
         self.pool.close();
     }
