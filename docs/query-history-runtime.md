@@ -1,4 +1,4 @@
-# Optional buffered query-history integration (PARTIAL coverage)
+# Optional buffered / local NDJSON query-history integration (PARTIAL coverage)
 
 `AppState::with_history(HistoryService::observer())` is an explicit production
 state/router seam. The default is **None**, and no standalone binary startup,
@@ -41,7 +41,9 @@ validation failure disables observation, not the query.
 | Buffered records metadata fast-paths | Numeric completion boundary at selecting a real fast-path result; count path exercised by new routed proof |
 | `/api/v1/sql` with **any configured peer source**, even discovery without a current membership | Deferred entirely, including local fallbacks |
 | Configured explicit coordinator/fallback and direct/coordinator shard routes | Deferred; no parent/child rows or fabricated terminal success |
-| NDJSON and other unsupported/remaining fast-path formats | Deferred, including EOF/error/disconnect/body abandonment |
+| `/api/v1/sql` NDJSON with no configured peer source, nonbatch | Same external parent transferred into the actual typed source/body lifetime |
+| `/api/v1/sql/local` NDJSON, nonbatch | Same, independent of configured peers; real EOF/error/truncation or server-observed body abandonment |
+| Explicit distributed NDJSON, configured transparent coordinator/fallback, shard, other formats | Deferred; no stream/job lifecycle inferred |
 | Batch submit/run/cancel/restart (202) | Deferred; submission is not terminal success |
 | Auth/tenant middleware or JSON extractor rejection | No execution observation |
 | Missing/ambiguous effective tenant, no observer, stopped service/no DB receipt | No durable execution row promised; never a fabricated correlation ID |
@@ -82,9 +84,12 @@ receipt** and matches its execution UUID. It is correlation, not acknowledgement
 that the row is durable: initial/terminal failures may queue or lose evidence.
 Absent receipt means no header. Clients cannot choose/override the UUID.
 
-The monotonic `duration_ms` is buffered handler elapsed **after receipt/initial
-write and before terminal write**, including catalog I/O/planning/serialization;
-it is not pure scan time or full HTTP latency. The existing query deadline starts
+The monotonic `duration_ms` is elapsed **after receipt/initial write and before
+terminal selection/write**, including catalog I/O/planning/serialization. For
+buffered work it ends at handler completion; for NDJSON it continues through
+the observed source lifetime, including downstream polling/backpressure, until
+typed completion/error or body abandonment. It is not pure scan time, a proven
+execution/admission timestamp, or full client HTTP latency. The existing query deadline starts
 where it did before. History begin/finish each retain their configured 100ms
 budget outside that execution budget; unavailable history can add bounded
 telemetry overhead but cannot alter result/auth/admission policy. Original event
@@ -148,11 +153,11 @@ not exact original event/completion times. Retries retain original receipt/expir
 
 ### Requirements for subsequent integration passes
 
-Records wrappers must own all early `?` exits and finalize typed execution/render
-results before returning; this is not proof of network delivery. NDJSON/other
-stream wrappers must transfer ownership through EOF/error/timeout/truncation and
-body abandonment, supplying genuine admission/disconnection evidence rather than
-letting a temporary handle drop early. Batch wrappers must persist/transfer the
+Records wrappers own early `?` exits and finalize typed execution/render results
+before returning; this is not proof of network delivery. Local NDJSON transfers
+the same owner through source completion/error/truncation and body abandonment
+as described below. Other formats and configured distributed sources remain
+unobserved. Batch wrappers must persist/transfer the
 same execution UUID through job submission, run, cancellation and recovery;
 202/queued is not terminal success. Coordinator fanout must not produce duplicate
 public parents or trust client-provided parent IDs. These changes require branch
@@ -161,6 +166,55 @@ and cancellation tests, and an explicitly reviewed legacy raw-audit/log cutover.
 Coverage remains PARTIAL. The deferred matrix above is not inferred from seeded
 history events, and no full SQL-history, production activation, erasure,
 complete-roadmap, MCP-subprocess or console-chain claim is made.
+
+## Local NDJSON ownership and typed evidence
+
+Only positively selected named-tenant, nonbatch, nonshard requests are included.
+Transparent `/sql` requires **no configured peer source**; explicit `/sql/local`
+remains local even with peers configured. Auth/extractor/default/shared paths,
+configured coordinator/fallback, explicit distributed NDJSON and jobs remain
+deferred/unobserved. No startup activation or URI resolution was added.
+
+The existing admission hook and verified principal create one external parent;
+`render_ndjson` transfers that same handle and original monotonic start into
+`NdjsonStream`. HTTP200 and stream construction select no terminal. The source
+calls typed numeric hooks at actual upstream EOF, existing encoded execution
+error/render failure, or the existing row/scan-cap truncation decision. The
+source's error marker is still **Ok(JSON bytes)**; history never parses that
+marker or mistakes the later EOF for success. No requests, Arrow batches,
+results, marker bytes or arbitrary errors enter the history DTO. Legacy response
+error text and raw audit/engine logging remain unchanged and unsanitized outside
+this new-store guarantee.
+
+Returned rows count successfully rendered Arrow rows at typed source completion,
+not newlines, trailers or client receipt. Truncation comes only from existing
+source cap evidence. Complete scan counters additionally require positive
+instrumentation and zero unsettled partitions at natural EOF; early truncation,
+errors and abandonment keep them NULL. No scan/cost zeros are inferred from a
+cache or default runtime stats. Metadata NDJSON fast paths transfer ownership
+into their already-rendered payload's body: numeric row counts come from the
+selected typed result, and only whole-table metadata count has positive
+no-data-scan zero evidence. Other metadata reads retain NULL scan counts.
+Unobserved metadata paths retain their original buffered body representation.
+Observed metadata bodies use an owned stream over the existing payload (without
+copying/parsing it); transport framing may therefore be chunked.
+
+Dropping an unfinished source/body selects `disconnected` with nullable unknown
+returned/truncation/scan measurements. This means **server-observed delivery
+abandonment**, including in-process Body drop: not proof of TCP disconnect,
+engine cancellation, or client receipt. Existing `GuardedStream` admission and
+CancelOnDrop guards are unchanged. A genuine engine error/completion already
+selected before drop remains immutable. Poll/drop terminal selection uses a
+try-lock and the bounded volatile queue, never awaits/spawns or waits on DB/state
+locks. Contention/full/closed queue retains loss signals and uncertainty; queued
+evidence and the correlation header are not durability acknowledgements.
+
+The **existing** NDJSON timeout covers catalog/planning/admission/stream
+construction before the handler returns. There is no existing mid-body
+wall-clock timeout, and none was added. A pre-body typed 504 is observed by the
+outer wrapper; this must not be presented as proof of mid-stream timeout or
+cancellation. Original event wall times remain NULL; DB observation times retain
+their existing meaning and original expiry is unchanged.
 
 ## Bounded writes, retries and loss provenance
 
@@ -303,3 +357,29 @@ filesystem/processes**, not a sandbox. No real HOME, passfile or provider config
 is inspected. The runner uses private Cargo cwd, explicit workspace manifest,
 registry-only private CARGO_HOME, pinned 1.95, `--offline --locked`, bounded build
 jobs, disposable private HOME/XDG/provider files and metadata discovery disabled.
+
+### NDJSON local lifecycle proof and limits
+
+`scripts/check-query-history-ndjson.sh` uses the same isolated socket-only PG16.14,
+private registry-only Cargo home/target, native pinned Rust1.95, two build jobs,
+private HOME/XDG/empty passfiles/provider files and local signed issuer as the
+buffered runner. Its source-named production-router test covers natural EOF,
+late real-engine execution error encoded as JSON, actual row-cap truncation,
+existing pre-body timeout, and unpolled / partially-polled in-process Body drop.
+It also exercises renewed/two-tenant identities and spoofed headers, real PG lock
+outage with bounded start/drop and original-UUID recovery, no-receipt outage,
+configured-peer/default/explicit-distributed exclusions and owner shutdown with
+an outstanding body. Body-drop assertions are **not listening TCP disconnect
+proof**; the listening loopback server is used for completed stream/error cases.
+No deterministic listening-client backpressure/disconnect fault is claimed.
+
+Separate internal PG tests use a bounded synthetic channel source (not a real
+engine execution) to control pending polls, late typed failure, source EOF,
+returned-row and scanned-row caps, abandonment before a queued trailer, and
+marker-shaped / newline-containing row values without arbitrary sleeps. They
+check one immutable terminal, thread-barrier terminal/drop contention and
+shutdown races, and NULL uninstrumented/incomplete scans. Existing GuardedStream
+cancellation and formatter/pool-marker regressions remain separate checks. There
+is no new mid-body timeout/cancellation acknowledgement, real provider test,
+full CI, complete metrics/coverage, full erasure, console/MCP-chain or production
+activation claim.

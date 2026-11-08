@@ -9,6 +9,8 @@ set -euo pipefail
 umask 077
 root=$1
 source /data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-auth/pinned/env.sh
+export CARGO_BUILD_JOBS=2
+export CARGO_TARGET_DIR=/data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-ndjson/target
 pg=/nix/store/zjpr4rk3vqlfz012idz4i6f04g5naiwz-postgresql-16.14/bin
 for tool in initdb pg_ctl createdb psql postgres; do [[ -x "$pg/$tool" ]] || { echo "Missing cached Postgres tool: $tool" >&2; exit 1; }; done
 work=$(mktemp -d /tmp/siglake-history-XXXXXX)
@@ -24,6 +26,12 @@ source "$root/scripts/query-history-isolation.bash"
 history_isolate_environment "$work"
 cd "$work"
 printf 'Cargo launch cwd: %s\nManifest: %s\nCompiler: %s\nCargo: %s\n' "$PWD" "$root/Cargo.toml" "$(command -v rustc)" "$(command -v cargo)"
+# Verify the sanitized PATH resolves actual native pinned tools, not rustup.
+for tool in cargo rustc rustdoc cargo-clippy clippy-driver rustfmt; do
+  native=$(command -v "$tool")
+  [[ $native == /data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-auth/pinned/toolchain/bin/* && ! -L $native ]] || exit 1
+  [[ $(file -b "$native") == ELF* ]] || exit 1
+done
 [[ $(rustc --version) == 'rustc 1.95.0 '* ]] || exit 1
 [[ $(cargo --version) == 'cargo 1.95.0 '* ]] || exit 1
 [[ $(cargo clippy --version) == 'clippy 0.1.95 '* ]] || exit 1

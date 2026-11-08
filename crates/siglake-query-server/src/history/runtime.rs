@@ -585,6 +585,35 @@ impl ObservationHandle {
         };
         Ok(self.inner.queue(payload))
     }
+    /// Select terminal evidence without awaiting or waiting on a state lock.
+    /// Used by stream poll/Drop. Queued is volatile, never a durability ack;
+    /// contention/loss retains uncertainty instead of fabricating success.
+    pub(crate) fn finish_queued(
+        &self,
+        terminal: TerminalExecution,
+    ) -> Result<Delivery, HistoryError> {
+        let Ok(mut state) = self.observation.try_lock() else {
+            self.inner.signal(LossReason::QueueContended);
+            return Ok(Delivery::Unobserved);
+        };
+        let Some(o) = state.as_mut() else {
+            return Ok(Delivery::Unobserved);
+        };
+        if let Some(existing) = &o.terminal {
+            return if serde_json::to_value(existing).ok() == serde_json::to_value(&terminal).ok() {
+                Ok(Delivery::AlreadyFinalized)
+            } else {
+                Err(HistoryError::Conflict)
+            };
+        }
+        if o.admitted && terminal.admission_evidence != AdmissionEvidence::Admitted {
+            return Err(HistoryError::Conflict);
+        }
+        o.terminal = Some(terminal);
+        let payload = Payload::Observation(Box::new(o.clone()));
+        drop(state);
+        Ok(self.inner.queue(payload))
+    }
     /// Caller supplies genuine outcome and separately measured monotonic
     /// duration. Persistence timestamps are never substituted for event times.
     /// Exactly one local terminal choice; identical repeats are no-ops. Once

@@ -960,3 +960,81 @@ async fn postgres_runtime_retry_expiring_during_persistence_preserves_tenant_los
     );
     assert!(service.shutdown().await);
 }
+
+#[tokio::test]
+#[ignore = "requires own disposable Postgres runner"]
+async fn postgres_stream_queue_terminal_contention_duplicates_and_shutdown() {
+    let f = fixture().await;
+    let mut service = ready_service(&f).await;
+    let handle = Arc::new(begin(&service).await);
+    let receipt = handle.receipt().unwrap();
+    handle.admit().unwrap();
+    // Contended stream finalization never waits on a state lock. No selected
+    // success or fabricated delivery acknowledgement survives this attempt.
+    {
+        let lock = handle.observation.lock().unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            handle.finish_queued(terminal(Outcome::Success)).unwrap(),
+            Delivery::Unobserved
+        );
+        assert!(start.elapsed() < Duration::from_millis(100));
+        assert!(lock.as_ref().unwrap().terminal.is_none());
+    }
+    assert!(service.health().loss_signals(LossReason::QueueContended) > 0);
+    // Real simultaneous source-terminal/drop choices still have one winner.
+    let barrier = std::sync::Barrier::new(3);
+    let choices = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            barrier.wait();
+            (
+                Outcome::Success,
+                handle.finish_queued(terminal(Outcome::Success)),
+            )
+        });
+        let b = scope.spawn(|| {
+            barrier.wait();
+            (
+                Outcome::Disconnected,
+                handle.finish_queued(terminal(Outcome::Disconnected)),
+            )
+        });
+        barrier.wait();
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    assert_eq!(
+        choices
+            .iter()
+            .filter(|(_, r)| *r == Ok(Delivery::Queued))
+            .count(),
+        1
+    );
+    let winner = choices
+        .iter()
+        .find(|(_, r)| *r == Ok(Delivery::Queued))
+        .unwrap()
+        .0;
+    for (_, result) in &choices {
+        assert!(matches!(
+            result,
+            Ok(Delivery::Queued | Delivery::Unobserved) | Err(HistoryError::Conflict)
+        ));
+    }
+    assert_eq!(
+        handle.finish_queued(terminal(winner)).unwrap(),
+        Delivery::AlreadyFinalized
+    );
+    assert_eq!(
+        handle.finish(terminal(winner)).await.unwrap(),
+        Delivery::AlreadyFinalized
+    );
+    let row = wait_row(&f, receipt.execution_id(), "terminal").await;
+    assert_eq!(row["outcome"], serde_json::to_value(winner).unwrap());
+    let expires = row["expires_at"].clone();
+    drop(handle);
+    let _ = service.shutdown().await;
+    assert_eq!(
+        json_row(&f, receipt.execution_id()).await["expires_at"],
+        expires
+    );
+}

@@ -1,4 +1,4 @@
-//! Buffered-only route ownership and fixed safe evidence. Never inspect bodies,
+//! External route ownership and fixed safe evidence. Never inspect bodies,
 //! SQL syntax, error messages, provider headers, or arbitrary context JSON.
 use super::*;
 use crate::{cost::CostReport, error::ApiError, sql::SqlRequest, AppState};
@@ -14,6 +14,8 @@ tokio::task_local! {
 }
 struct Evidence {
     observation: Option<std::sync::Arc<ObservationHandle>>,
+    started: Option<Instant>,
+    transferred: bool,
     admitted: bool,
     completed: bool,
     scan_attribution_complete: bool,
@@ -24,6 +26,8 @@ impl Default for Evidence {
     fn default() -> Self {
         Self {
             observation: None,
+            started: None,
+            transferred: false,
             admitted: false,
             completed: false,
             scan_attribution_complete: true,
@@ -130,7 +134,14 @@ where
             principal,
             RequestMetadata {
                 operation,
-                format: OutputFormat::Records,
+                format: if operation != Operation::Explain
+                    && !req.dry_run
+                    && req.format == Some(crate::format::QueryFormat::Ndjson)
+                {
+                    OutputFormat::Ndjson
+                } else {
+                    OutputFormat::Records
+                },
                 priority: match req.priority {
                     crate::limits::Priority::Interactive => Priority::Interactive,
                     crate::limits::Priority::Batch => Priority::Batch,
@@ -144,6 +155,7 @@ where
     let started = Instant::now();
     let initial = Evidence {
         observation: Some(handle.clone()),
+        started: Some(started),
         ..Evidence::default()
     };
     let (mut result, mut evidence) = EVIDENCE
@@ -157,6 +169,7 @@ where
         .ok()
         .and_then(|v| Counter::new(v).ok());
     let terminal = match &result {
+        Ok(_) if evidence.transferred => None,
         Ok(_) if evidence.completed && evidence.admitted => Some((Outcome::Success, None)),
         // No status-code inference of successful admission/completion.
         Ok(_) => None,
@@ -201,9 +214,31 @@ where
 }
 
 pub(crate) fn eligible(req: &SqlRequest) -> bool {
-    req.format.unwrap_or_default() == crate::format::QueryFormat::Records
-        && (req.priority != crate::limits::Priority::Batch || req.dry_run)
+    (req.priority != crate::limits::Priority::Batch
+        || (req.dry_run && req.format.unwrap_or_default() == crate::format::QueryFormat::Records))
         && req.shard.is_none()
+}
+
+/// Move the sole lifecycle owner into the source/body, not a task-local clone
+/// that would disappear at HTTP-handler return. Only typed admission permits it.
+pub(crate) fn transfer_stream() -> Option<super::streaming::StreamObservation> {
+    EVIDENCE
+        .try_with(|e| {
+            let mut e = e.borrow_mut();
+            if !e.admitted || e.transferred {
+                return None;
+            }
+            let handle = e.observation.take()?;
+            let started = e.started?;
+            e.transferred = true;
+            Some(super::streaming::StreamObservation::new(
+                handle,
+                started,
+                e.measurements.clone(),
+            ))
+        })
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]

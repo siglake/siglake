@@ -1,9 +1,10 @@
-//! History primitives and opt-in buffered route observation. No startup
+//! History primitives and opt-in buffered / local NDJSON observation. No startup
 //! wiring, audit cutover, environment configuration or runtime DDL.
 pub(crate) mod buffered;
 pub mod redaction;
 mod runtime;
 mod store;
+pub(crate) mod streaming;
 pub use runtime::{
     Delivery, HistoryHealth, HistoryObserver, HistoryService, LossReason, ObservationHandle,
     WRITE_BUDGET,

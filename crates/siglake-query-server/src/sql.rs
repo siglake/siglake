@@ -7477,7 +7477,11 @@ fn try_count_fast_path_response(
         }
         QueryFormat::Ndjson => {
             let line = serde_json::to_vec(&row).map_err(ApiError::internal)?;
-            let mut resp = Response::new(Body::from([line, b"\n".to_vec()].concat()));
+            let mut resp = Response::new(crate::format::rendered_ndjson_body(
+                [line, b"\n".to_vec()].concat(),
+                1,
+                true,
+            ));
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/x-ndjson"),
@@ -8657,13 +8661,16 @@ async fn try_group_count_fast_path_response_with_bindings(
             let rows = body.rows.as_array().ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!("group fast path rows must be an array"))
             })?;
+            let row_count = rows.len();
             let mut payload = Vec::new();
             for row in rows {
                 let line = serde_json::to_vec(row).map_err(ApiError::internal)?;
                 payload.extend_from_slice(&line);
                 payload.push(b'\n');
             }
-            let mut resp = Response::new(Body::from(payload));
+            let mut resp = Response::new(crate::format::rendered_ndjson_body(
+                payload, row_count, false,
+            ));
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/x-ndjson"),
@@ -9325,13 +9332,16 @@ async fn try_date_histogram_fast_path_response(
                     "date_histogram fast path rows must be an array"
                 ))
             })?;
+            let row_count = rows.len();
             let mut payload = Vec::new();
             for row in rows {
                 let line = serde_json::to_vec(row).map_err(ApiError::internal)?;
                 payload.extend_from_slice(&line);
                 payload.push(b'\n');
             }
-            let mut resp = Response::new(Body::from(payload));
+            let mut resp = Response::new(crate::format::rendered_ndjson_body(
+                payload, row_count, false,
+            ));
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/x-ndjson"),
@@ -12080,7 +12090,8 @@ async fn render_ndjson(
         .map_err(ApiError::internal)?;
     let stream = datafusion::physical_plan::execute_stream(plan.clone(), task_ctx)
         .map_err(ApiError::internal)?;
-    let mut ndjson = NdjsonStream::new(stream, Some(resolved.max_rows_returned));
+    let mut ndjson = NdjsonStream::new(stream, Some(resolved.max_rows_returned))
+        .with_history(history_buffered::transfer_stream(), plan.clone());
     if resolved.circuit_breakers {
         ndjson = ndjson.with_rows_scanned_cap(plan, resolved.max_rows_scanned, resolved.priority);
     }
@@ -19206,7 +19217,8 @@ pub async fn distributed(
     // distributed path wants to know it did not happen. The transparent
     // `/api/v1/sql` falls back to local instead (see `handle`).
     let Some(peers) = state.peers.as_ref().and_then(|source| source.capture()) else {
-        let eligible = history_buffered::eligible(&req);
+        let eligible = history_buffered::eligible(&req)
+            && req.format.unwrap_or_default() == QueryFormat::Records;
         return history_buffered::observe(
             state,
             identity,

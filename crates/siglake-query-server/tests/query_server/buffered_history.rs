@@ -19,6 +19,8 @@ use std::{
 };
 use uuid::Uuid;
 const CORRELATION: &str = "x-siglake-history-id";
+#[path = "ndjson_history.rs"]
+mod ndjson_history;
 
 struct Server {
     base: String,
@@ -390,15 +392,17 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
         StatusCode::UNPROCESSABLE_ENTITY,
     )
     .await;
-    unobserved(
+    let streamed = post(
         &s,
         &t,
-        &f.admin,
         "/api/v1/sql",
         json!({"query":"SELECT 1", "format":"ndjson"}),
-        StatusCode::OK,
     )
     .await;
+    assert_eq!(streamed.status(), StatusCode::OK);
+    let streamed_id = correlation(&streamed);
+    let _ = streamed.bytes().await.unwrap();
+    assert_eq!(row(&f.admin, streamed_id).await["outcome"], "success");
     unobserved(
         &s,
         &t,
@@ -496,7 +500,7 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
     // Admin inspection of EVERY collected execution, without dumping row data.
     let facts = sqlx::query("SELECT count(*) AS n, count(DISTINCT execution_id) AS ids, count(DISTINCT owner_uuid) AS owners, bool_and(redacted_sql IS NULL AND redaction_status='omitted' AND expires_at-received_at=interval '720 hours' AND admitted_at IS NULL AND finished_at IS NULL AND finished_observed_at IS NOT NULL AND duration_ms IS NOT NULL AND observation_state='terminal') AS safe FROM query_history.executions").fetch_one(&f.admin).await.unwrap();
     let n: i64 = facts.get("n");
-    assert_eq!(n, 17);
+    assert_eq!(n, 18);
     assert_eq!(n, facts.get::<i64, _>("ids"));
     assert_eq!(facts.get::<i64, _>("owners"), 1);
     assert!(facts.get::<bool, _>("safe"));
@@ -634,7 +638,7 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
     )
     .await;
     issuer_task.abort();
-    eprintln!("Buffered real-router proof: 19 unique durable execution rows; one owner; safe NULL SQL/30-day expiry; renewed RS256 client; typed planning/cache/errors/admission; real PG lock/retry/no-receipt faults; auth/extractor/deferred/default routes add zero rows.");
+    eprintln!("Buffered/NDJSON real-router proof: 20 unique durable execution rows; one owner; safe NULL SQL/30-day expiry; renewed RS256 client; typed planning/cache/errors/admission; real PG lock/retry/no-receipt faults; auth/extractor/deferred/default routes add zero rows.");
 }
 
 #[tokio::test]

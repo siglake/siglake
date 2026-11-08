@@ -816,6 +816,42 @@ fn trim_batches_to(batches: &[RecordBatch], cap: usize) -> Vec<RecordBatch> {
 
 // ---- Streaming NDJSON -----------------------------------------------------
 
+/// Metadata fast paths already render one payload. Retain that source payload
+/// separately from safe numeric history evidence, without parsing/rebuffering.
+pub(crate) fn rendered_ndjson_body(
+    payload: Vec<u8>,
+    rows: usize,
+    no_data_scan: bool,
+) -> axum::body::Body {
+    let observation = crate::history::streaming::rendered_observation(no_data_scan);
+    if observation.is_none() {
+        return axum::body::Body::from(payload);
+    }
+    axum::body::Body::from_stream(RenderedNdjsonStream {
+        payload: Some(Bytes::from(payload)),
+        rows,
+        observation,
+    })
+}
+struct RenderedNdjsonStream {
+    payload: Option<Bytes>,
+    rows: usize,
+    observation: Option<crate::history::streaming::StreamObservation>,
+}
+impl Stream for RenderedNdjsonStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(payload) = self.payload.take() {
+            return Poll::Ready(Some(Ok(payload)));
+        }
+        let rows = self.rows;
+        if let Some(o) = &mut self.observation {
+            o.complete(rows, false, None, None);
+        }
+        Poll::Ready(None)
+    }
+}
+
 /// Adapt a DataFusion record batch stream into a byte stream of NDJSON
 /// chunks, with row-cap enforcement built in.
 ///
@@ -841,6 +877,10 @@ pub struct NdjsonStream {
     priority: crate::limits::Priority,
     finished: bool,
     trailer: Option<Bytes>,
+    history: Option<(
+        crate::history::streaming::StreamObservation,
+        std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )>,
 }
 
 impl NdjsonStream {
@@ -854,6 +894,37 @@ impl NdjsonStream {
             priority: crate::limits::Priority::Interactive,
             finished: false,
             trailer: None,
+            history: None,
+        }
+    }
+
+    pub(crate) fn with_history(
+        mut self,
+        observation: Option<crate::history::streaming::StreamObservation>,
+        plan: std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    ) -> Self {
+        self.history = observation.map(|o| (o, plan));
+        self
+    }
+
+    fn complete_history(&mut self, truncated: bool) {
+        if let Some((mut observation, plan)) = self.history.take() {
+            let runtime = (!truncated)
+                .then(|| crate::midflight::summarize_plan_runtime(&plan))
+                .filter(|s| s.unsettled_partitions == 0);
+            let rows = runtime
+                .as_ref()
+                .and_then(|s| s.leaf_rows_measured.then_some(s.leaf_output_rows));
+            let bytes = runtime
+                .as_ref()
+                .and_then(|s| s.scan_bytes_measured.then_some(s.bytes_scanned));
+            observation.complete(self.rows_emitted, truncated, rows, bytes);
+        }
+    }
+
+    fn fail_history(&mut self) {
+        if let Some((mut observation, _)) = self.history.take() {
+            observation.failed();
         }
     }
 
@@ -882,6 +953,7 @@ impl Stream for NdjsonStream {
         // Emit a queued trailer (the truncation marker) if we have one.
         if let Some(trailer) = self.trailer.take() {
             self.finished = true;
+            self.complete_history(true);
             return Poll::Ready(Some(Ok(trailer)));
         }
         if self.finished {
@@ -892,10 +964,12 @@ impl Stream for NdjsonStream {
         match next {
             None => {
                 self.finished = true;
+                self.complete_history(false);
                 Poll::Ready(None)
             }
             Some(Err(e)) => {
                 self.finished = true;
+                self.fail_history();
                 Poll::Ready(Some(Ok(make_execution_error_marker(e, self.priority))))
             }
             Some(Ok(batch)) => {
@@ -904,6 +978,7 @@ impl Stream for NdjsonStream {
                     Ok(b) => b,
                     Err(e) => {
                         self.finished = true;
+                        self.fail_history();
                         return Poll::Ready(Some(Err(std::io::Error::other(format!(
                             "ndjson render: {e}"
                         )))));

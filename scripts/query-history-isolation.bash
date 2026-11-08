@@ -30,7 +30,7 @@ history_isolate_environment() {
   done
   # Share ONLY cached public registry sources/index/archives; never Cargo config,
   # credential files, bin, Git config or an original HOME. Tool metadata is private.
-  export CARGO_HOME=/data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-runtime/isolated-cargo
+  export CARGO_HOME=/data/homes/gianarb/.local/state/gastone-agent-roadmap/milestone-2-ndjson/isolated-cargo
   mkdir -p -m 700 "$CARGO_HOME/registry"
   [[ ! -e "$CARGO_HOME/config" && ! -e "$CARGO_HOME/config.toml" && ! -e "$CARGO_HOME/credentials" && ! -e "$CARGO_HOME/credentials.toml" ]] || return 1
   for part in src index cache; do
