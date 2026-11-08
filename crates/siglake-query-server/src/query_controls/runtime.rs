@@ -252,7 +252,8 @@ where
             }
         }),
     )
-    .await?;
+    .await
+    .map_err(|error| jaeger_timeout(error, jaeger, initial_timeout, started))?;
     let timeout = timeout(tier, &caller, policy);
     let controls = RequestControls {
         started,
@@ -281,7 +282,10 @@ where
         None
     };
     if tokio::time::Instant::now() >= controls.deadline {
-        return Err(with_headers(expired(), &headers));
+        return Err(with_headers(
+            jaeger_timeout(expired(), jaeger, timeout, started),
+            &headers,
+        ));
     }
     let body_slot = authority
         .bodies
@@ -316,13 +320,39 @@ where
                 }
                 Ok(response)
             }
-            Err(mut error) => {
+            Err(error) => {
+                let mut error = jaeger_timeout(error, true, timeout, started);
                 error.headers.extend(headers);
                 Err(error)
             }
         },
         None => result,
     }
+}
+/// Pre-header Jaeger wire compatibility only. Keep the original anchor and
+/// initial/resolved budget, and reuse TraceRequest's existing unestimated cost
+/// stand-in, not a new estimate. SQL/jobs, policy failures and already-native
+/// errors retain their existing construction. Sent bodies are never adapted.
+fn jaeger_timeout(
+    mut error: ApiError,
+    jaeger: bool,
+    timeout: Duration,
+    started: Instant,
+) -> ApiError {
+    if jaeger
+        && error.status == axum::http::StatusCode::GATEWAY_TIMEOUT
+        && error.msg == "query deadline exceeded"
+        && error.context.is_none()
+    {
+        let native = ApiError::timeout(
+            &crate::cost::CostReport::unknown_after_timeout(),
+            started.elapsed().as_secs_f64(),
+            timeout.as_secs(),
+        );
+        error.msg = native.msg;
+        error.context = native.context;
+    }
+    error
 }
 fn with_headers(
     mut error: ApiError,

@@ -547,3 +547,63 @@ fn jaeger_typed_headers_are_unavailable_estimate_not_output_clipping_and_encodin
     assert_eq!(error.msg, "query_controls_metadata_unavailable");
     assert!(error.headers.is_empty());
 }
+
+#[tokio::test]
+async fn jaeger_timeout_adapter_preserves_native_budget_and_generic_errors() {
+    for scenario in 0..3 {
+        let started = Instant::now();
+        let budget = Duration::from_millis(10);
+        let deadline = tokio::time::Instant::from_std(started + budget);
+        if scenario == 0 {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let error = until(deadline, async {
+            if scenario == 1 {
+                // Late-ready native error: expiry must win before adaptation.
+                std::thread::sleep(Duration::from_millis(15));
+                return Err(ApiError::internal("late native error"));
+            }
+            if scenario == 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.msg, "query deadline exceeded");
+        let native = jaeger_timeout(error, true, budget, started);
+        assert_eq!(native.status, 504);
+        assert!(native
+            .msg
+            .starts_with("query exceeded 0s timeout (elapsed: "));
+        assert_eq!(
+            native.context,
+            ApiError::timeout(&crate::cost::CostReport::unknown_after_timeout(), 0.0, 0).context
+        );
+    }
+    let started = Instant::now();
+    let effective = jaeger_timeout(expired(), true, Duration::from_secs(1), started);
+    assert!(effective.msg.starts_with("query exceeded 1s timeout"));
+    // Already-native timeout context/budget must not be replaced by an outer
+    // operator bound, and unrelated native 504s are not generic controls expiry.
+    let preserved = jaeger_timeout(effective, true, Duration::from_secs(3), started);
+    assert!(preserved.msg.starts_with("query exceeded 1s timeout"));
+    let other = jaeger_timeout(
+        ApiError::new_status(
+            axum::http::StatusCode::GATEWAY_TIMEOUT,
+            "other native timeout",
+        ),
+        true,
+        Duration::from_secs(1),
+        started,
+    );
+    assert_eq!(other.msg, "other native timeout");
+    assert!(other.context.is_none());
+    let generic = jaeger_timeout(expired(), false, Duration::from_secs(1), started);
+    assert_eq!(generic.msg, "query deadline exceeded");
+    assert!(generic.context.is_none());
+    let unavailable = jaeger_timeout(unavailable(), true, Duration::from_secs(1), started);
+    assert_eq!(unavailable.status, 503);
+    assert_eq!(unavailable.msg, "query_policy_unavailable");
+    assert!(unavailable.context.is_none());
+}

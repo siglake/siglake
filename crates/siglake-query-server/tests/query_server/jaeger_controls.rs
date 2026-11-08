@@ -242,7 +242,9 @@ async fn signed_jaeger_four_routes_primary_freshness_native_payloads_headers_and
                 );
                 headers(&response, "applied", "2", 17, true);
                 assert!(start.elapsed() < Duration::from_secs(3));
-                response.bytes().await.unwrap();
+                // The resolved one-second policy, NOT the old three-second
+                // operator budget, must describe this native timeout.
+                native_timeout(response.json().await.unwrap(), 1);
             }
         }
     }
@@ -308,6 +310,160 @@ async fn signed_jaeger_four_routes_primary_freshness_native_payloads_headers_and
     assert!(!response.headers().contains_key("x-siglake-query-controls"));
     drop(held);
     next.shutdown().await;
+    enabled.shutdown().await;
+    disabled.shutdown().await;
+    idp.shutdown().await;
+    manager.close();
+    admin.close().await;
+}
+
+// Ignore only genuinely variable elapsed time; retain every native error/cost
+// key and value, including the explicit unestimated-cost provenance.
+fn native_timeout(mut body: Value, seconds: u64) -> Value {
+    let error = body["error"].as_str().expect("native error string");
+    let (prefix, rest) = error
+        .split_once(" (elapsed: ")
+        .expect("native timeout message");
+    assert_eq!(prefix, format!("query exceeded {seconds}s timeout"));
+    let (elapsed, suffix) = rest.split_once("s); ").expect("native elapsed/suggestion");
+    let elapsed: f64 = elapsed.parse().unwrap();
+    assert!(elapsed.is_finite() && elapsed >= 0.0);
+    assert_eq!(
+        suffix,
+        "retry with `priority: \"batch\"` for long-running queries"
+    );
+    body["error"] = json!(format!("{prefix} (elapsed: <variable>s); {suffix}"));
+    assert_eq!(body["code"], 504);
+    assert!(body["cost"].get("estimate_complete").is_none());
+    assert_eq!(body["cost"]["exact"], false);
+    assert_eq!(body["cost"]["files_to_scan"], Value::Null);
+    assert_eq!(
+        body["cost"]["warnings"],
+        json!(["cost was not estimated: the query timed out"])
+    );
+    body
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "owned signed primary fixture; check-query-policy.sh"]
+async fn signed_jaeger_native_timeout_compatibility() {
+    let (socket, admin) = fixture().await;
+    let manager = PolicyManager::connect(policy_config(&socket, false))
+        .await
+        .unwrap();
+    let reader = Arc::new(
+        PolicyReader::connect(policy_config(&socket, true))
+            .await
+            .unwrap(),
+    );
+    let (issuer, task) = spawn_fake_idp().await;
+    let idp = Server {
+        base: issuer.clone(),
+        task,
+        state: None,
+    };
+    let jwt = token(&issuer, "acme", "timeout-client");
+    let verifier = OidcVerifier::from_cognito_access_issuer(issuer.clone(), "custom:org_id".into())
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(IcebergContext::open(tmp.path()).await.unwrap());
+    let mut limits = ServerLimits::default();
+    limits.interactive.default_timeout = Duration::from_secs(1);
+    limits.interactive.ceiling_timeout = Duration::from_secs(1);
+    limits.admission_wait_timeout = Duration::from_secs(3);
+    let base = AppState::new(ice.clone(), AuthConfig::from_oidc(verifier))
+        .with_tenants(TenantRegistry::new(ice))
+        .with_limits(limits);
+    let enabled_state = base
+        .clone()
+        .with_query_controls(reader.clone(), 33)
+        .unwrap();
+    let disabled = serve(base.clone()).await;
+    let enabled = serve(enabled_state.clone()).await;
+    // Both servers share precisely the same saturated operator admission pool.
+    // The nonexistent trace index cannot be reached before this timeout.
+    let held = base
+        .admission
+        .acquire(base.limits.admission_budget_bytes)
+        .await
+        .unwrap();
+    let mut native = Vec::new();
+    for route in ROUTES {
+        let response = get(&disabled, &jwt, route).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!response.headers().contains_key("x-siglake-query-controls"));
+        native.push(native_timeout(response.json().await.unwrap(), 1));
+    }
+    let binding = ManagementBinding::from_trusted_metadata(
+        RuntimeKey::from_trusted_metadata("acme", &issuer, "timeout-client").unwrap(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )
+    .unwrap();
+    let actor = VerifiedHumanActor::from_trusted_metadata("synthetic-human").unwrap();
+    for revision in [0, 1] {
+        if revision == 1 {
+            manager
+                .save(
+                    &binding,
+                    &actor,
+                    SaveRequest::new(0, SavedSettings::new(None, None).unwrap()).unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+        for (i, route) in ROUTES.iter().enumerate() {
+            let response = get(&enabled, &jwt, route).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            headers(
+                &response,
+                "inherited",
+                if revision == 0 { "na" } else { "1" },
+                33,
+                false,
+            );
+            assert!(response.headers()["x-siglake-query-controls"]
+                .to_str()
+                .unwrap()
+                .contains("timeout_ms=1000;"));
+            assert_eq!(
+                native_timeout(response.json().await.unwrap(), 1),
+                native[i],
+                "resolved admission/outer timeout: {route}"
+            );
+        }
+    }
+    // A real primary lock exceeds the initial original clock before resolution.
+    // This must retain native timeout semantics WITHOUT claiming resolved policy.
+    for (i, route) in ROUTES.iter().enumerate() {
+        let mut lock = admin.begin().await.unwrap();
+        sqlx::query("LOCK TABLE query_policy.agent_limits IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let response = get(&enabled, &jwt, route).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(!response.headers().contains_key("x-siglake-query-controls"));
+        assert!(!response.headers().contains_key("x-siglake-query-warnings"));
+        assert_eq!(
+            native_timeout(response.json().await.unwrap(), 1),
+            native[i],
+            "primary/prework timeout: {route}"
+        );
+        lock.rollback().await.unwrap();
+    }
+    drop(held);
+    reader.close();
+    for route in ROUTES {
+        let response = get(&enabled, &jwt, route).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!response.headers().contains_key("x-siglake-query-controls"));
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"],
+            "query_policy_unavailable"
+        );
+    }
     enabled.shutdown().await;
     disabled.shutdown().await;
     idp.shutdown().await;
