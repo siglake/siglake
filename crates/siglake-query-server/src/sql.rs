@@ -19452,7 +19452,12 @@ pub async fn distributed(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let mut result = controlled(state, identity, req, true, distributed_observed).await;
+    // Refuse before constructing/polling work, including nondistributable batch.
+    let mut result = if state.query_controls.is_some() && req.priority == Priority::Batch && !req.dry_run {
+        Err(crate::query_controls::runtime::unsupported())
+    } else {
+        controlled(state, identity, req, false, distributed_observed).await
+    };
     stamp_buffered_sql_headers(&mut result, format, started);
     result
 }

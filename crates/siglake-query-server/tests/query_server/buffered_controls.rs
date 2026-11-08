@@ -734,3 +734,182 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
     manager.close();
     admin.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "owned synthetic primary/JWT fixture; scripts/check-query-policy.sh"]
+async fn real_signed_explicit_distributed_batch_refuses_before_work_not_handoff() {
+    let (socket, admin) = fixture().await;
+    let manager = PolicyManager::connect(policy_config(&socket, false))
+        .await
+        .unwrap();
+    let reader = Arc::new(
+        PolicyReader::connect(policy_config(&socket, true))
+            .await
+            .unwrap(),
+    );
+    let (issuer, issuer_task) = spawn_fake_idp().await;
+    let issuer_owner = Server {
+        base: issuer.clone(),
+        task: issuer_task,
+        state: None,
+    };
+    let verifier = OidcVerifier::from_cognito_access_issuer(issuer.clone(), "custom:org_id".into())
+        .await
+        .unwrap();
+    let credential = token(&issuer, "acme", "distributed-clock-client");
+    let binding = ManagementBinding::from_trusted_metadata(
+        RuntimeKey::from_trusted_metadata("acme", &issuer, "distributed-clock-client").unwrap(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )
+    .unwrap();
+    manager
+        .save(
+            &binding,
+            &VerifiedHumanActor::from_trusted_metadata("synthetic-human").unwrap(),
+            SaveRequest::new(0, SavedSettings::new(Some(1), None).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(IcebergContext::open(tmp.path()).await.unwrap());
+    ice.for_namespace("tenant_acme")
+        .await
+        .unwrap()
+        .append_events(&[siglake_core::Event::now("synthetic-row")])
+        .await
+        .unwrap();
+    let mut limits = ServerLimits::default();
+    limits.interactive.default_timeout = Duration::from_secs(2);
+    limits.interactive.ceiling_timeout = Duration::from_secs(3);
+    limits.batch.default_timeout = Duration::from_secs(2);
+    limits.batch.ceiling_timeout = Duration::from_secs(3);
+    // Configured membership, but these metadata/local-only requests must never
+    // dispatch. No peer service is started or contacted by this fixture.
+    let baseline = AppState::new(ice.clone(), AuthConfig::from_oidc(verifier))
+        .with_tenants(TenantRegistry::new(ice))
+        .with_limits(limits)
+        .with_coordinator(
+            vec!["http://127.0.0.1:9".into()],
+            Some("synthetic-coordinator".into()),
+        );
+    let enabled = baseline
+        .clone()
+        .with_query_controls(reader.clone(), 9)
+        .unwrap();
+    let controlled = serve(enabled.clone()).await;
+    let legacy = serve(baseline.clone()).await;
+    let route = "/api/v1/sql/distributed";
+    for query in ["SELECT count(*) FROM events", "SELECT 1"] {
+        for seconds in [0, 1, 2] {
+            let body = status(&controlled.base, &credential, route,
+                json!({"query":query,"priority":"batch","limits":{"timeout_seconds":seconds,"circuit_breakers":false}}),
+                StatusCode::SERVICE_UNAVAILABLE).await;
+            assert_eq!(body["error"], "query_controls_path_unavailable");
+        }
+    }
+    assert_eq!(enabled.jobs.active_count().await, 0);
+    // Dry-run and interactive Tier1 keep request-clock semantics, not the
+    // unsupported batch-execution branch and not the operator handoff budget.
+    for extra in [json!({}), json!({"priority":"batch","dry_run":true})] {
+        let mut body = json!({"query":"SELECT count(*) FROM events","limits":{"timeout_seconds":0,"circuit_breakers":false}});
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        status(
+            &controlled.base,
+            &credential,
+            route,
+            body.clone(),
+            StatusCode::GATEWAY_TIMEOUT,
+        )
+        .await;
+        body["limits"]["timeout_seconds"] = json!(2);
+        let success = status(
+            &controlled.base,
+            &credential,
+            route,
+            body.clone(),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(success["row_count"], 1);
+        // Charge a delayed primary read to ORIGINAL ingress: the one-second
+        // policy has expired, although the two-second operator clock has not.
+        let mut lock = admin.begin().await.unwrap();
+        sqlx::query("LOCK TABLE query_policy.agent_limits IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *lock)
+            .await
+            .unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            lock.rollback().await.unwrap();
+        });
+        status(
+            &controlled.base,
+            &credential,
+            route,
+            body,
+            StatusCode::GATEWAY_TIMEOUT,
+        )
+        .await;
+        release.await.unwrap();
+    }
+    // No authority retains baseline synchronous Tier1 batch behavior, including
+    // its existing optional timeout opt-out at zero; no job is fabricated.
+    let old = status(&legacy.base, &credential, route,
+        json!({"query":"SELECT count(*) FROM events","priority":"batch","limits":{"timeout_seconds":0,"circuit_breakers":false}}),
+        StatusCode::OK).await;
+    assert_eq!(old["row_count"], 1);
+    assert!(old.get("job_id").is_none());
+    // Actual main/local durable selection must STILL hand off zero/short runs.
+    for path in ["/api/v1/sql", "/api/v1/sql/local"] {
+        for seconds in [0, 1] {
+            let response = post(&controlled.base, &credential, path,
+                json!({"query":"SELECT 1","priority":"batch","limits":{"timeout_seconds":seconds,"circuit_breakers":false}})).await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            let accepted: Value = response.json().await.unwrap();
+            assert_eq!(
+                accepted["controls"]["accepted"]["effective_timeout_ms"],
+                seconds * 1000
+            );
+            let id = siglake_query_server::jobs::JobId::parse(accepted["job_id"].as_str().unwrap())
+                .unwrap();
+            let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let info = enabled.jobs.info(id).await.unwrap().unwrap();
+                    if info.status.is_terminal() {
+                        break info.status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                terminal,
+                if seconds == 0 {
+                    siglake_query_server::jobs::JobStatus::Timeout
+                } else {
+                    siglake_query_server::jobs::JobStatus::Succeeded
+                }
+            );
+        }
+    }
+    // Closed primary + invalid SQL still produce the declared early branch
+    // refusal, not a primary-read/planning error: work must not be polled.
+    reader.close();
+    let refused = status(
+        &controlled.base,
+        &credential,
+        route,
+        json!({"query":"not valid SQL","priority":"batch","limits":{"timeout_seconds":1}}),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    assert_eq!(refused["error"], "query_controls_path_unavailable");
+    controlled.shutdown().await;
+    legacy.shutdown().await;
+    enabled.jobs.shutdown().await.unwrap();
+    issuer_owner.shutdown().await;
+}

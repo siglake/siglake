@@ -32,8 +32,15 @@ Jaeger/wire proofs precede any enablement.
 
 ## Lifetime and ownership
 
-Only actual durable selection uses operator-default handoff rather than the run
-budget. Request policy/history/rewrite/admission/store waits remain within that
+Only actual main/local durable selection uses operator-default handoff rather
+than the run budget. Controlled explicit `/api/v1/sql/distributed` batch execution
+(`priority=batch`, `dry_run=false`) is temporarily unavailable BEFORE work,
+including Tier1 metadata execution and nondistributable fallback. That endpoint
+never selects handoff from request flags: interactive/dry-run work retains its
+original request clock. Actual selected-path support awaits the distributed/wire
+slice; absent-authority explicit behavior is unchanged.
+
+Request policy/history/rewrite/admission/store waits remain within that
 original ingress handoff clock. Accepted queue+run timestamps, expiry and snapshot
 are immutable; private binding contains only trusted tenant/issuer/client, never
 sub/token. Public accepted/execution metadata has no binding or owner.
