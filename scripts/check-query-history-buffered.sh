@@ -53,6 +53,7 @@ REVOKE ALL ON SCHEMA app_catalog FROM PUBLIC;
 REVOKE ALL ON app_catalog.secrets FROM PUBLIC;
 SQL
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -f "$root/crates/siglake-query-server/src/history/schema.sql" >>"$work/setup.log"
+"$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -f "$root/crates/siglake-query-server/src/history/schema-v3-effective.sql" >>"$work/setup.log"
 printf 'isolated-history-fixture-v1\n' > "$work/fixture-marker"
 export SIGLAKE_HISTORY_FIXTURE_DIR="$work"
 "$pg/postgres" --version
@@ -62,5 +63,5 @@ cargo clippy --version
 # Preserve ALL prior buffered/NDJSON selections. The newly nested batch tests
 # require the separate v2 + job-role fixture in check-query-history-batch.sh;
 # this explicit skip excludes no previously accepted test name.
-timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test query_server oidc::buffered_history:: -- --include-ignored --skip oidc::buffered_history::batch_history:: --test-threads=1
+timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test query_server oidc::buffered_history:: -- --include-ignored --skip oidc::buffered_history::batch_history:: --skip oidc::buffered_history::distributed_history:: --test-threads=1
 ISOLATED_FIXTURE

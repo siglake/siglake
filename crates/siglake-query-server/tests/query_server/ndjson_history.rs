@@ -227,22 +227,25 @@ async fn real_router_ndjson_eof_error_truncation_drop_identity_and_outage() {
     lock.rollback().await.unwrap();
     assert_eq!(row(&f.admin, eof_id).await["outcome"], "success");
     assert_eq!(row(&f.admin, abandoned_id).await["outcome"], "disconnected");
-    // Configured transparent fallback and explicit distributed NDJSON remain
-    // deferred; local is deliberately independent of configured peers.
+    // Configured delegation transfers the same parent to the local stream.
     let coordinator_state = state
         .clone()
         .with_coordinator(vec!["http://127.0.0.1:1".into()], None);
     let coordinator = server(coordinator_state.clone()).await;
     for route in ["/api/v1/sql", "/api/v1/sql/distributed"] {
-        unobserved(
+        let before = count(&f.admin).await;
+        let response = post(
             &coordinator,
             &t,
-            &f.admin,
             route,
             json!({"query":"SELECT 1", "format":"ndjson"}),
-            StatusCode::OK,
         )
         .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = correlation(&response);
+        let _ = response.bytes().await.unwrap();
+        assert_eq!(row(&f.admin, id).await["outcome"], "success");
+        assert_eq!(count(&f.admin).await, before + 1);
     }
     let local = in_process(coordinator_state, &t, query.clone()).await;
     let local_id = body_id(&local);
@@ -263,7 +266,7 @@ async fn real_router_ndjson_eof_error_truncation_drop_identity_and_outage() {
     )
     .await;
     let explicit = server(state.clone()).await;
-    unobserved(
+    observed(
         &explicit,
         &t,
         &f.admin,

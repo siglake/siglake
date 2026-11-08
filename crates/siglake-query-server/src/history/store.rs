@@ -36,6 +36,8 @@ pub struct StoredExecution {
     execution_admitted: Option<bool>,
     #[serde(flatten)]
     request: RequestMetadata,
+    effective_format: Option<OutputFormat>,
+    effective_dry_run: Option<bool>,
     outcome: Option<Outcome>,
     error_code: Option<ErrorCode>,
     redacted_sql: Option<String>,
@@ -90,6 +92,16 @@ fn stored(row: PgRow) -> Result<StoredExecution, HistoryError> {
             format: OutputFormat::parse(row.try_get("format").map_err(unavailable)?)?,
             priority: Priority::parse(row.try_get("priority").map_err(unavailable)?)?,
             dry_run: row.try_get("dry_run").map_err(unavailable)?,
+        },
+        effective_format: match row.try_get::<Option<&str>, _>("effective_format") {
+            Ok(value) => value.map(OutputFormat::parse).transpose()?,
+            Err(sqlx::Error::ColumnNotFound(_)) => None, // v1/v2 compatibility
+            Err(error) => return Err(unavailable(error)),
+        },
+        effective_dry_run: match row.try_get("effective_dry_run") {
+            Ok(value) => value,
+            Err(sqlx::Error::ColumnNotFound(_)) => None,
+            Err(error) => return Err(unavailable(error)),
         },
         outcome: row
             .try_get::<Option<&str>, _>("outcome")
@@ -275,6 +287,19 @@ impl HistoryWriter {
     pub async fn admit(&self, receipt: &Receipt) -> Result<WriteResult, HistoryError> {
         let changed = sqlx::query("UPDATE query_history.executions SET execution_admitted=true, admission_observed_at=COALESCE(admission_observed_at,clock_timestamp()) WHERE execution_id=$1 AND expires_at>clock_timestamp() AND observation_state<>'terminal'")
             .bind(receipt.execution_id).execute(&self.pool).await.map_err(unavailable)?.rows_affected();
+        self.classify(receipt.execution_id, changed).await
+    }
+    /// v3 only. A missing migration loses telemetry, never changes execution.
+    pub(crate) async fn select_effective(
+        &self,
+        receipt: &Receipt,
+        effective: EffectiveExecution,
+    ) -> Result<WriteResult, HistoryError> {
+        let format =
+            serde_json::to_value(effective.format).map_err(|_| HistoryError::InvalidValue)?;
+        let changed = sqlx::query("UPDATE query_history.executions SET effective_format=$2, effective_dry_run=$3 WHERE execution_id=$1 AND expires_at>clock_timestamp() AND ((effective_format IS NULL AND observation_state<>'terminal') OR (effective_format=$2 AND effective_dry_run=$3))")
+            .bind(receipt.execution_id).bind(format.as_str()).bind(effective.dry_run)
+            .execute(&self.pool).await.map_err(unavailable)?.rows_affected();
         self.classify(receipt.execution_id, changed).await
     }
     /// Reconcile indeterminate with genuine terminal evidence; never overwrite a

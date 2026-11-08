@@ -73,6 +73,7 @@ pub enum Delivery {
 #[derive(Clone, Serialize)]
 struct Observation {
     event: PendingExecution,
+    effective: Option<EffectiveExecution>,
     admitted: bool,
     terminal: Option<TerminalExecution>,
     abandoned: bool,
@@ -109,6 +110,9 @@ impl Payload {
         match self {
             Self::Observation(o) => {
                 writer.persist_pending(&o.event).await?;
+                if let Some(effective) = o.effective {
+                    writer.select_effective(&o.event.receipt, effective).await?;
+                }
                 if let Some(terminal) = &o.terminal {
                     writer.finish(&o.event.receipt, terminal).await?;
                 } else {
@@ -168,6 +172,14 @@ impl RetryQueue {
             .position(|e| e.payload.id() == entry.payload.id());
         if let Some(index) = existing {
             let old = &mut self.entries[index];
+            // An older in-flight snapshot must not erase a later typed path
+            // selection when it rejoins the queue after a failed write.
+            if let (Payload::Observation(old), Payload::Observation(new)) =
+                (&old.payload, &mut entry.payload)
+            {
+                new.effective = new.effective.or(old.effective);
+                entry.bytes = entry.payload.bytes();
+            }
             if old.payload.rank() > entry.payload.rank() {
                 old.store_failure_observed |= entry.store_failure_observed;
                 old.first_attempt = old.first_attempt.min(entry.first_attempt);
@@ -507,6 +519,7 @@ impl HistoryObserver {
                     inner: self.inner.clone(),
                     observation: Mutex::new(Some(Observation {
                         event,
+                        effective: None,
                         admitted: admitted == Some(true),
                         terminal: None,
                         abandoned: false,
@@ -548,6 +561,7 @@ impl HistoryObserver {
                 PendingExecution::new(receipt, principal.clone(), self.inner.owner, request, sql)?;
             observation = Some(Observation {
                 event,
+                effective: None,
                 admitted: false,
                 terminal: None,
                 abandoned: false,
@@ -610,6 +624,34 @@ impl ObservationHandle {
     }
     pub fn initial_delivery(&self) -> Delivery {
         self.initial_delivery
+    }
+    /// Nonblocking typed path selection. No receipt mutation or query policy.
+    /// Lost selection remains unknown; every later snapshot carries this tuple.
+    pub(crate) fn select_effective(
+        &self,
+        effective: EffectiveExecution,
+    ) -> Result<Delivery, HistoryError> {
+        let Ok(mut state) = self.observation.try_lock() else {
+            self.inner.signal(LossReason::QueueContended);
+            return Ok(Delivery::Unobserved);
+        };
+        let Some(o) = state.as_mut() else {
+            return Ok(Delivery::Unobserved);
+        };
+        if let Some(selected) = o.effective {
+            return if selected == effective {
+                Ok(Delivery::AlreadyFinalized)
+            } else {
+                Err(HistoryError::Conflict)
+            };
+        }
+        if o.terminal.is_some() {
+            return Err(HistoryError::Conflict);
+        }
+        o.effective = Some(effective);
+        let payload = Payload::Observation(Box::new(o.clone()));
+        drop(state);
+        Ok(self.inner.queue(payload))
     }
     /// Trusted backend admission only. Volatile on queue loss; terminal evidence
     /// can still reconcile an absent admission write with the original receipt.

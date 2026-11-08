@@ -20,9 +20,9 @@ async fn jobs(socket: &std::path::Path) -> JobStore {
     .await
     .unwrap()
 }
-struct QueueGate(Option<std::sync::mpsc::Sender<()>>);
+pub(super) struct QueueGate(Option<std::sync::mpsc::Sender<()>>);
 impl QueueGate {
-    async fn hold(jobs: &JobStore) -> Self {
+    pub(super) async fn hold(jobs: &JobStore) -> Self {
         let (ready, waiting) = tokio::sync::oneshot::channel();
         let (release, held) = std::sync::mpsc::channel();
         jobs.batch_runtime().spawn(async move {
@@ -35,7 +35,7 @@ impl QueueGate {
             .unwrap();
         Self(Some(release))
     }
-    fn release(mut self) {
+    pub(super) fn release(mut self) {
         let _ = self.0.take().unwrap().send(());
     }
 }
@@ -303,24 +303,29 @@ async fn real_router_batch_queue_execution_cancellation_identity_and_privacy() {
     assert!(refused["job_id"].is_null());
     drop(_all);
 
-    // Configured transparent peers, explicit distributed batch and default
-    // routing remain unobserved. Spoofed IDs cannot opt these paths in.
+    // Configured local batch now retains one parent; no-membership explicit
+    // rejection is not admitted. Default/auth failures remain unobserved.
     let configured = server(
         state
             .clone()
             .with_coordinator(vec!["http://127.0.0.1:1".into()], None),
     )
     .await;
-    unobserved(
+    let before = count(&f.admin).await;
+    let response = post(
         &configured,
         &original,
-        &f.admin,
         "/api/v1/sql",
         json!({"query":"SELECT 1","priority":"batch"}),
-        StatusCode::ACCEPTED,
     )
     .await;
-    unobserved(
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        row(&f.admin, correlation(&response)).await["outcome"],
+        "success"
+    );
+    assert_eq!(count(&f.admin).await, before + 1);
+    observed(
         &s,
         &original,
         &f.admin,
@@ -1107,6 +1112,7 @@ async fn real_router_batch_dropped_submit_during_association_owned_execution_and
                 .unwrap();
             let expected = if cancel { "cancelled" } else { "succeeded" };
             persisted(&f.admin, job, expected).await;
+            eprintln!("owned association terminal wait: cancel={cancel}, outage={outage}");
             let terminal = row(&f.admin, execution).await;
             assert_eq!(
                 terminal["outcome"],

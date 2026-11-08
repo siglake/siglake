@@ -126,6 +126,48 @@ async fn queue_entry_limit_includes_inflight_and_age_is_not_refreshed() {
     assert_eq!(q.count, QUEUE_ENTRIES);
 }
 #[test]
+fn effective_selection_survives_older_inflight_snapshot_and_bounded_queue_coalescing() {
+    let now = Utc::now();
+    let event = PendingExecution::new(
+        Receipt {
+            execution_id: Uuid::new_v4(),
+            received_at: now,
+            expires_at: now + chrono::Duration::hours(720),
+        },
+        principal(),
+        Uuid::new_v4(),
+        request(),
+        RedactedSql::parse("SELECT 1"),
+    )
+    .unwrap();
+    let original = Observation {
+        event,
+        effective: None,
+        admitted: true,
+        terminal: None,
+        abandoned: false,
+    };
+    let mut selected = original.clone();
+    let effective = EffectiveExecution {
+        format: OutputFormat::Ndjson,
+        dry_run: false,
+    };
+    selected.effective = Some(effective);
+    let mut q = RetryQueue::default();
+    assert!(q.push(Entry::new(Payload::Observation(Box::new(selected)))));
+    assert!(q.push(Entry::new(Payload::Observation(Box::new(original)))));
+    assert_eq!(q.count, 1);
+    let entry = q.take().unwrap();
+    assert_eq!(q.bytes, entry.payload.bytes());
+    let Payload::Observation(snapshot) = &entry.payload else {
+        panic!("observation")
+    };
+    assert_eq!(snapshot.effective, Some(effective));
+    q.release(&entry);
+    assert_eq!(q.bytes, 0);
+}
+
+#[test]
 fn queue_payload_byte_limit_and_safe_serialization() {
     let mut q = RetryQueue::default();
     let mut entry = Entry::new(point());

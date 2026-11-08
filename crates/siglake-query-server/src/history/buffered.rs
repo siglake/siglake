@@ -16,6 +16,7 @@ struct Evidence {
     observation: Option<std::sync::Arc<ObservationHandle>>,
     started: Option<Instant>,
     transferred: bool,
+    effective_metadata: bool,
     admitted: bool,
     completed: bool,
     scan_attribution_complete: bool,
@@ -28,6 +29,7 @@ impl Default for Evidence {
             observation: None,
             started: None,
             transferred: false,
+            effective_metadata: false,
             admitted: false,
             completed: false,
             scan_attribution_complete: true,
@@ -104,6 +106,16 @@ pub(crate) fn records(
 pub(crate) fn planned() {
     update(|e| e.completed = true);
 }
+/// Typed chosen branch, never inferred from the eventual HTTP response.
+pub(crate) fn effective(format: OutputFormat, dry_run: bool) {
+    update(|e| {
+        if e.effective_metadata {
+            if let Some(handle) = &e.observation {
+                let _ = handle.select_effective(EffectiveExecution { format, dry_run });
+            }
+        }
+    });
+}
 
 /// One external parent. Metadata I/O is outside the pre-existing execution
 /// timeout. Duration starts AFTER receipt work and ends BEFORE terminal I/O:
@@ -120,6 +132,88 @@ where
     F: Future<Output = Result<Response, ApiError>>,
     W: FnOnce(AppState, CallerIdentity, SqlRequest) -> F,
 {
+    let metadata = (
+        sql_metadata(&req, operation),
+        RedactedSql::parse(&req.query),
+    );
+    observe_request(state, identity, req, metadata, eligible, false, work).await
+}
+
+pub(crate) async fn observe_configured<F, W>(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+    work: W,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+    W: FnOnce(AppState, CallerIdentity, SqlRequest) -> F,
+{
+    let metadata = (
+        sql_metadata(&req, Operation::Sql),
+        RedactedSql::parse(&req.query),
+    );
+    // Every extractor-accepted configured SQL request gets its original
+    // parent, including existing body-shard and validation-rejection paths.
+    observe_request(state, identity, req, metadata, true, true, work).await
+}
+
+fn sql_metadata(req: &SqlRequest, operation: Operation) -> RequestMetadata {
+    RequestMetadata {
+        operation,
+        format: if operation != Operation::Explain
+            && req.priority != crate::limits::Priority::Batch
+            && !req.dry_run
+            && req.format == Some(crate::format::QueryFormat::Ndjson)
+        {
+            OutputFormat::Ndjson
+        } else {
+            OutputFormat::Records
+        },
+        priority: match req.priority {
+            crate::limits::Priority::Interactive => Priority::Interactive,
+            crate::limits::Priority::Batch => Priority::Batch,
+        },
+        dry_run: req.dry_run,
+    }
+}
+
+pub(crate) async fn observe_shard<F, W>(
+    state: AppState,
+    identity: CallerIdentity,
+    req: crate::sql::ShardQueryRequest,
+    work: W,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+    W: FnOnce(AppState, CallerIdentity, crate::sql::ShardQueryRequest) -> F,
+{
+    let metadata = RequestMetadata {
+        operation: Operation::Shard,
+        format: OutputFormat::Arrow,
+        priority: match req.priority {
+            crate::limits::Priority::Interactive => Priority::Interactive,
+            crate::limits::Priority::Batch => Priority::Batch,
+        },
+        dry_run: false,
+    };
+    let metadata = (metadata, RedactedSql::parse(&req.query));
+    observe_request(state, identity, req, metadata, true, true, work).await
+}
+
+async fn observe_request<R, F, W>(
+    state: AppState,
+    identity: CallerIdentity,
+    req: R,
+    metadata: (RequestMetadata, RedactedSql),
+    eligible: bool,
+    effective_metadata: bool,
+    work: W,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+    W: FnOnce(AppState, CallerIdentity, R) -> F,
+{
     let Some(observer) = state
         .history
         .as_ref()
@@ -133,34 +227,13 @@ where
     else {
         return work(state, identity, req).await;
     };
-    let handle = observer
-        .begin(
-            principal,
-            RequestMetadata {
-                operation,
-                format: if operation != Operation::Explain
-                    && req.priority != crate::limits::Priority::Batch
-                    && !req.dry_run
-                    && req.format == Some(crate::format::QueryFormat::Ndjson)
-                {
-                    OutputFormat::Ndjson
-                } else {
-                    OutputFormat::Records
-                },
-                priority: match req.priority {
-                    crate::limits::Priority::Interactive => Priority::Interactive,
-                    crate::limits::Priority::Batch => Priority::Batch,
-                },
-                dry_run: req.dry_run,
-            },
-            RedactedSql::parse(&req.query),
-        )
-        .await;
+    let handle = observer.begin(principal, metadata.0, metadata.1).await;
     let handle = std::sync::Arc::new(handle);
     let started = Instant::now();
     let initial = Evidence {
         observation: Some(handle.clone()),
         started: Some(started),
+        effective_metadata,
         ..Evidence::default()
     };
     let (mut result, mut evidence) = EVIDENCE

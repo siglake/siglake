@@ -102,6 +102,14 @@ impl Principal {
     }
 }
 
+/// Typed execution semantics selected after routing/planning. Receipt hints are
+/// immutable and cannot describe all legacy explicit-coordinator branches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct EffectiveExecution {
+    pub format: OutputFormat,
+    pub dry_run: bool,
+}
+
 #[derive(Clone, Serialize)]
 pub struct RequestMetadata {
     pub operation: Operation,

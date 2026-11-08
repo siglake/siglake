@@ -1,4 +1,4 @@
-# Optional buffered / local NDJSON / local batch query-history integration (PARTIAL coverage)
+# Optional SQL / coordinator / shard query-history integration (PARTIAL coverage)
 
 `AppState::with_history(HistoryService::observer())` is an explicit production
 state/router seam. The default is **None**, and no standalone binary startup,
@@ -38,15 +38,21 @@ validation failure disables observation, not the query.
 | `/api/v1/sql/local`, records, interactive | Same, independent of configured peers |
 | Supported SQL records `dry_run` (including batch priority dry-run) | Planning only; no returned/scanned measurement fabricated |
 | `/api/v1/sql/explain` | Independent planning observation; actual JSON format regardless of ignored request format/priority |
-| `/api/v1/sql/distributed` with no captured membership, eligible records | Not-admitted validation rejection; no helper/duplicate parent |
+| `/api/v1/sql/distributed` with no captured membership, extractor-accepted requests | Not-admitted validation rejection; effective semantics unresolved; no helper/duplicate parent |
 | Buffered records metadata fast-paths | Numeric completion boundary at selecting a real fast-path result; count path exercised by new routed proof |
-| `/api/v1/sql` with **any configured peer source**, even discovery without a current membership | Deferred entirely, including local fallbacks |
-| Configured explicit coordinator/fallback and direct/coordinator shard routes | Deferred; no parent/child rows or fabricated terminal success |
+| `/api/v1/sql` with configured peers, including discovery without membership | One external parent over actual coordinator, metadata/cache, or local fallback branch; v3 effective metadata required |
+| Configured `/api/v1/sql/distributed`, records | One external parent over actual selected execution; no changes to existing routing/fallback/admission/timeouts |
+| `/api/v1/sql/shard`, externally authenticated named tenant | Separate truthful shard/Arrow buffered observation; signed tenant resolution, not body/header tenant; no job inferred |
+| Authenticated coordinator shard work | No public parent/child history row or fabricated provider identity; existing service-token trust unchanged |
 | `/api/v1/sql` NDJSON with no configured peer source, nonbatch | Same external parent transferred into the actual typed source/body lifetime |
 | `/api/v1/sql/local` NDJSON, nonbatch | Same, independent of configured peers; real EOF/error/truncation or server-observed body abandonment |
-| Explicit distributed NDJSON, configured transparent coordinator/fallback, shard, other formats | Deferred; no stream/job lifecycle inferred |
+| Configured coordinated NDJSON | Existing fanout is buffered; original payload body owns observation through EOF/drop; returned rows known, complete remote scan counters unavailable |
+| Configured local NDJSON delegation | Same existing typed local source/body owner, EOF/error/truncation/drop semantics |
+| SQL request formats other than records/NDJSON | Still rejected by existing JSON extractor; not implemented or observed |
 | Local non-coordinator batch submit/run/cancel/controller recovery | One external UUID; 202 is queued, not execution admission or terminal success; v2 association required for verified durable resume |
-| Configured transparent peers, explicit distributed batch, shard/internal batch | Deferred/unobserved, including configured transparent local fallback |
+| Configured transparent batch | Existing local job path; same original UUID transferred, v2 association plus v3 effective metadata |
+| Explicit distributed batch/dry-run hints | Branch-dependent legacy behavior, NOT a planning/job guarantee; see v3 warning below |
+| SQL body-shard variants on configured routes | Existing local path, one external parent; no new shard capability |
 | Auth/tenant middleware or JSON extractor rejection | No execution observation |
 | Missing/ambiguous effective tenant, no observer, stopped service/no DB receipt | No durable execution row promised; never a fabricated correlation ID |
 | Jaeger/search/warmers, direct engine APIs, MCP subprocess, console chain | Not observed/proved by this slice |
@@ -98,6 +104,103 @@ telemetry overhead but cannot alter result/auth/admission policy. Original event
 wall times remain unknown; `received_at` is DB receipt time and
 `admission_observed_at`/`finished_observed_at` are DB persistence-observation times,
 not exact original event/completion times. Retries retain original receipt/expiry.
+
+## Configured coordination and v3 effective semantics (manual OWNER dependency)
+
+**Pre-existing API limitation, not fixed here:** explicit `/sql/distributed`
+can execute a distributable query even with `dry_run=true`. It can use
+`priority=batch` only as a coordinator resource tier and return HTTP200
+records/NDJSON, not a queued job. Its nondistributable/scan-local branches instead
+delegate to local planning/job behavior. The chosen branch is known only after
+catalog/planning; moving it before history begin or enforcing new validation
+would change execution policy. Transparent `/sql` continues to honor its existing
+local dry-run/batch routing. Query-controls must be revalidated against actual
+execution paths in a separate pass, never against these request hints.
+
+Apply unchanged v1 `schema.sql`, optionally/where jobs are supported v2
+`schema-v2-batch.sql`, then separately reviewed manual OWNER
+`schema-v3-effective.sql`. v3 works on v1 or v2 without replacing their checks.
+It adds ONLY nullable `effective_format` and `effective_dry_run`. Both NULL means
+unresolved/unestablished; old rows remain NULL, with no backfill. Typed route
+selection supplies a coherent tuple once (SQL records, SQL NDJSON non-dry-run,
+explain records planning, or shard Arrow non-dry-run); it cannot be rebound or
+cleared. Receipt `format`/`dry_run` retain their original immutable legacy
+request-classification meaning (already normalized for local batch/dry-run),
+**not a guarantee of effective coordinator execution**. Priority retains the
+actual requested coordinator/local resource tier; worker HTTP priority defaults
+remain as before. No generalized metadata blob, parent ID, principal authority,
+reader grant, retention change or automatic/runtime DDL was introduced.
+
+Effective selection queues only fixed enums/boolean through the existing
+100ms/1000-entry/8MiB/30s owned snapshot path; it adds no blocking await inside
+query deadlines or between durable job INSERT and owned-task spawn. Every later
+snapshot retains the tuple; an older in-flight retry cannot erase it. Outage,
+contention or missing-v3 writes can lose effective evidence or leave the original
+row pending/indeterminate, never invent another receipt or change query/job
+availability. Buffered terminals still mean handler completion; direct shard
+Arrow is collected and encoded before response construction, NOT a live Arrow
+source. Actual coordinated NDJSON is also already buffered: its original
+payload moves, without copying/parsing, into the existing owned body source for
+EOF/abandonment evidence. No new distributed/format/job capability is added.
+
+Internal shard requests authenticate with the existing service credential and
+remain unobserved publicly, including self-shard failover. No unsigned parent or
+coordinator indicator, forwarded header, JWT bytes or body tenant supplies
+principal authority. No new correlation wire field is needed. Direct external
+shards use their existing signed effective tenant and produce their own
+shard/Arrow observation, never a fake records label. Their disabled-reservation
+execution boundary is actual collect polling. Coordinated parents are admitted
+at the original successful reservation/disabled-admission boundary; subsequent
+worker refusals/errors are accepted failures, not pre-admission rejections.
+
+Remote `x-siglake-scan` is existing partial diagnostic attribution, not complete
+row/byte scan evidence across workers, retries and coordinator metadata/WAL work.
+Consequently new coordinated history scan measurements stay NULL, even when
+remote fields are present/nonzero. Typed returned rows/truncation and complete
+heuristic estimates remain separately available. Existing diagnostic aggregation,
+response costs, admission estimates, fallback, cancellation and timeout policy
+are unchanged. Direct shard settled instrumented runtime counters and genuinely
+local delegated measurements retain the accepted provenance requirements.
+
+**Hard consumer/rollout gate:** manual migration requires recreating reader/
+service pools (cached PostgreSQL `SELECT *` result shapes cannot change in place).
+The engine safe reader handles v1/v2 as effective NULL and projects v3 fields on
+new connections, under unchanged RLS/grants. The current console reader/JSON/UI
+still needs a separately reviewed compatibility adapter before presenting new
+variants: it must NOT show receipt hints as effective execution. No console edit,
+startup activation, URI resolver, production role/DDL/TLS change or deployment
+is included. Earlier immutable buffered E2E artifacts remain their original
+proof, not v3/coordination proof.
+
+### Configured integration proof and exact limits
+
+The expanded `scripts/check-query-history-batch.sh` owns real PG16.14 v1/v2/v3
+fixtures and runs the production-router `distributed_history` tests together
+with all retained routed batch/local tests. Two production coordinator/worker
+routers use independent real engine contexts over one synthetic temporary
+warehouse, a local RS256 issuer and the existing service credential trust. Tests
+check fanout success, one public UUID/no internal duplicates, renewed client
+stability, distinct clients/tenants/reader isolation, unsigned parent/header/body
+spoofs, direct external Arrow and internal non-observation, actual explicit
+dry-run execution versus delegated planning, batch-tier NDJSON versus actual
+records jobs, configured local cache/metadata/discovery fallback, real worker
+403/500, pre-body transparent timeout, actual owned-worker listener shutdown
+and self-shard fallback, NDJSON EOF and unpolled/partly-polled in-process body
+drop, queued delegated-job cancellation and real history-table-lock recovery
+with original UUID/effective tuple. The listener shutdown is intentionally
+induced connection refusal, not an external network-outage claim. Body drop is
+server-observed abandonment, NOT controlled TCP disconnect/cancel acknowledgement.
+
+v3 tests migrate real original observations on both v1 and v2, preserve every
+prior constraint/receipt/outcome and NULL old effective fields, recreate the
+reader, reject repeated migration and conflicting/cleared selection, and retain
+tenant RLS. A queue unit regression separately checks older retry coalescing
+and exact serialized-byte accounting. Retained local stream/job suites cover
+their detailed lifecycle races; this is not proof of remote per-worker metrics,
+mid-body timeout, true process-kill/commit-packet faults, arbitrary peer versions,
+DNS discovery operation, production roles/TLS/erasure, full CI, console/MCP chain
+or complete distributed/history coverage. Existing raw audit/job/parser logging
+remains unsanitized outside the new-store guarantee.
 
 ## API and ownership
 
@@ -158,8 +261,8 @@ not exact original event/completion times. Retries retain original receipt/expir
 Records wrappers own early `?` exits and finalize typed execution/render results
 before returning; this is not proof of network delivery. Local NDJSON transfers
 the same owner through source completion/error/truncation and body abandonment
-as described below. Configured distributed sources remain unobserved. Local
-batch now transfers the same execution UUID through the separate lifecycle below;
+as described below. Configured sources now use the same original owner and
+separately selected v3 effective semantics. Actual local batch transfers the same execution UUID through the separate lifecycle below;
 202/queued is not terminal success. Coordinator fanout must not produce duplicate
 public parents or trust client-provided parent IDs. These changes require branch
 and cancellation tests, and an explicitly reviewed legacy raw-audit/log cutover.
@@ -170,11 +273,13 @@ complete-roadmap, MCP-subprocess or console-chain claim is made.
 
 ## Local NDJSON ownership and typed evidence
 
-Only positively selected named-tenant, nonbatch, nonshard requests are included.
-Transparent `/sql` requires **no configured peer source**; explicit `/sql/local`
-remains local even with peers configured. Auth/extractor/default/shared paths,
-configured coordinator/fallback and explicit distributed NDJSON remain
-deferred/unobserved. Batch always renders records and has separate ownership below. No startup activation or URI resolution was added.
+Only positively selected named-tenant external requests are included. Explicit
+`/sql/local` remains local even with peers configured. Configured delegation uses
+this same source owner; actual coordinator NDJSON uses the already-rendered
+payload body described below. Auth/extractor/default/shared paths remain
+unobserved. Actual local jobs render records and have separate ownership below;
+explicit coordinated batch-tier work is not necessarily a job. No startup
+activation or URI resolution was added.
 
 The existing admission hook and verified principal create one external parent;
 `render_ndjson` transfers that same handle and original monotonic start into
@@ -345,7 +450,7 @@ history execution is seeded). It checks renewed same-client identity, distinct
 client/tenant/header tampering, reader tenant isolation, real cache miss/hit,
 planning-only dry-run/explain, parse/planning/catalog/execution/admission/timeout
 failures, count metadata completion, one UUID/owner, DB-admin privacy/NULL SQL/
-original expiry/counter inspection, auth/extractor/deferred/default non-observation,
+original expiry/counter inspection, auth/extractor/default non-observation,
 real PG table-lock write deadline/retry with original UUID, a history delay longer
 than the query budget without consuming it, and fixture-role no-receipt outage
 without changing real query results. It also checks observer clones surviving
@@ -369,7 +474,7 @@ late real-engine execution error encoded as JSON, actual row-cap truncation,
 existing pre-body timeout, and unpolled / partially-polled in-process Body drop.
 It also exercises renewed/two-tenant identities and spoofed headers, real PG lock
 outage with bounded start/drop and original-UUID recovery, no-receipt outage,
-configured-peer/default/explicit-distributed exclusions and owner shutdown with
+configured-peer local delegation, default exclusions, explicit no-membership rejection and owner shutdown with
 an outstanding body. Body-drop assertions are **not listening TCP disconnect
 proof**; the listening loopback server is used for completed stream/error cases.
 No deterministic listening-client backpressure/disconnect fault is claimed.
@@ -397,10 +502,13 @@ that never polls SQL stays not admitted. Existing syntax/read-only validation
 may reject before queue; semantic planning remains on the dedicated runtime and
 can fail after actual run admission. No planning or job behavior was moved.
 Requested batch NDJSON still executes/renders records, as it always did; history
-records the actual format. Transparent `/sql` with any configured peer source,
-explicit distributed batch, shards, coordinator identities and ambiguous/default
-routing remain unobserved; explicit `/sql/local` is positively local even with
-configured peers. Auth/extractor rejection remains outside observation.
+records the actual local-job format. Configured transparent `/sql` still takes
+this same local batch path. Explicit distributed requests transfer here ONLY
+when the existing routing decision actually delegates to local execution; a
+coordinated batch-tier request can instead return buffered records/NDJSON with
+no job. External direct shards return buffered Arrow even with batch priority;
+internal coordinator identities and ambiguous/default routing remain unobserved.
+Auth/extractor rejection remains outside observation.
 
 The job store adds only nullable internal `history_execution_id UUID` through
 its existing additive job migration seam. Old jobs remain NULL and unobserved,
@@ -493,6 +601,6 @@ proof. Wrong job/tenant/pointer resume fails closed. Controller/service recreati
 and lease recovery are **not SIGKILL/process-restart or commit-packet fault proof**.
 The job-store privilege-refusal test is not a transport outage; the real history
 lock and disconnected history-login tests are separately identified. No complete
-history, production startup activation, distributed coverage, legacy logging
+history, production startup activation, complete distributed coverage, legacy logging
 cutover, physical erasure, full CI, deploy, console/MCP chain or roadmap completion
 is claimed. All prior rollout/TLS/backup/erasure gates remain unchanged.

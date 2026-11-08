@@ -4492,19 +4492,26 @@ pub async fn handle(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let eligible = history_buffered::eligible(&req) && state.peers.is_none();
     let execution_id = siglake_storage::QueryExecutionId::next();
-    let mut result = siglake_storage::with_query_execution_id(
-        execution_id,
-        history_buffered::observe(
-            state,
-            identity,
-            req,
-            HistoryOperation::Sql,
-            eligible,
-            |state, identity, req| Box::pin(handle_scoped(state, identity, req)),
-        ),
-    )
+    let mut result = siglake_storage::with_query_execution_id(execution_id, async move {
+        if state.peers.is_some() {
+            history_buffered::observe_configured(state, identity, req, |state, identity, req| {
+                Box::pin(handle_scoped(state, identity, req))
+            })
+            .await
+        } else {
+            let eligible = history_buffered::eligible(&req);
+            history_buffered::observe(
+                state,
+                identity,
+                req,
+                HistoryOperation::Sql,
+                eligible,
+                |state, identity, req| Box::pin(handle_scoped(state, identity, req)),
+            )
+            .await
+        }
+    })
     .await;
     stamp_buffered_sql_headers(&mut result, format, started);
     result
@@ -4760,6 +4767,14 @@ async fn handle_local_inner(
         );
         return Err(ApiError::bad_request("query is empty"));
     }
+    history_buffered::effective(
+        if req.dry_run || req.priority == Priority::Batch || format == QueryFormat::Records {
+            crate::history::OutputFormat::Records
+        } else {
+            crate::history::OutputFormat::Ndjson
+        },
+        req.dry_run,
+    );
     let tier = state.limits.tier(req.priority);
     let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
     let clock = request_clock.unwrap_or(RequestClock {
@@ -18722,7 +18737,9 @@ pub async fn shard(
     let execution_id = siglake_storage::QueryExecutionId::next();
     siglake_storage::with_query_execution_id(
         execution_id,
-        Box::pin(shard_scoped(state, identity, req)),
+        history_buffered::observe_shard(state, identity, req, |state, identity, req| {
+            Box::pin(shard_scoped(state, identity, req))
+        }),
     )
     .await
 }
@@ -18735,6 +18752,8 @@ async fn shard_scoped(
     if req.query.trim().is_empty() {
         return Err(ApiError::bad_request("query is empty"));
     }
+    history_buffered::cache(HistoryCacheState::Bypass);
+    history_buffered::effective(crate::history::OutputFormat::Arrow, false);
     // Per-pod governance parity (#7): each worker enforces the mid-flight
     // rows-scanned breaker on *its* shard, so no single pod runs unbounded. The
     // cluster's aggregate ceiling is therefore N × the per-pod limit — which is
@@ -18822,6 +18841,7 @@ async fn shard_scoped(
             .await
             .map_err(ApiError::internal)
     });
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let query = under_shard_deadline!(rewrite_search_if_needed(&ice, &req.query));
     let preferred_scan_order = preferred_scan_order_for_sql(&ice, &query).await;
     // PER-REQUEST CANCELLATION, which this path never had. On the default chart
@@ -19050,6 +19070,7 @@ async fn shard_scoped(
         }
     }
     crate::udfs::register_udfs(&ctx);
+    history_buffered::phase(HistoryErrorCode::Planning);
     let df = under_shard_deadline!(async {
         plan_client_sql(&ctx, &query)
             .await
@@ -19087,6 +19108,8 @@ async fn shard_scoped(
     // wall clock: a scan can be slow without being large (a deep unconverged
     // layout, a stalled S3 fetch), and the row cap never fires for it.
     let collect = async {
+        // Execution starts here; workers intentionally have no reservation.
+        history_buffered::admit();
         let batches = if resolved.circuit_breakers {
             match crate::midflight::collect_plan_with_rows_scanned_cap(
                 plan.clone(),
@@ -19178,6 +19201,14 @@ async fn shard_scoped(
         axum::http::HeaderValue::from_bytes(&encoded_totals)
             .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?,
     );
+    history_buffered::records(
+        batches.iter().map(|batch| batch.num_rows()).sum(),
+        false,
+        (runtime.unsettled_partitions == 0 && runtime.leaf_rows_measured)
+            .then_some(runtime.leaf_output_rows),
+        (runtime.unsettled_partitions == 0 && runtime.scan_bytes_measured)
+            .then_some(runtime.bytes_scanned),
+    );
     Ok(resp)
 }
 
@@ -19250,36 +19281,25 @@ pub async fn distributed(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
-    // #967: the EXPLICIT endpoint reports that no membership is available
-    // rather than silently running single-pod — a caller who asked for the
-    // distributed path wants to know it did not happen. The transparent
-    // `/api/v1/sql` falls back to local instead (see `handle`).
-    let Some(peers) = state.peers.as_ref().and_then(|source| source.capture()) else {
-        let eligible = history_buffered::eligible(&req)
-            && (req.priority != Priority::Batch || req.dry_run)
-            && req.format.unwrap_or_default() == QueryFormat::Records;
-        return history_buffered::observe(
-            state,
-            identity,
-            req,
-            HistoryOperation::Sql,
-            eligible,
-            |_, _, _| async {
-                Err(ApiError::bad_request(
-                    "distributed query not configured, or peer discovery has not published a \
-             membership yet (set --query-peers, or --query-peer-discovery-srv and wait \
-             for the first answer)",
-                ))
-            },
-        )
-        .await;
-    };
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
+    // Capture at the original boundary, before any history await; telemetry
+    // must not change which discovery membership this request selected.
+    let peers = state.peers.as_ref().and_then(|source| source.capture());
     let execution_id = siglake_storage::QueryExecutionId::next();
     let mut result = siglake_storage::with_query_execution_id(
         execution_id,
-        Box::pin(distributed_inner(state, identity, req, None, None, peers)),
+        history_buffered::observe_configured(state, identity, req, |state, identity, req| async {
+            // Preserve the explicit endpoint's existing no-membership refusal.
+            let Some(peers) = peers else {
+                return Err(ApiError::bad_request(
+                    "distributed query not configured, or peer discovery has not published a \
+             membership yet (set --query-peers, or --query-peer-discovery-srv and wait \
+             for the first answer)",
+                ));
+            };
+            Box::pin(distributed_inner(state, identity, req, None, None, peers)).await
+        }),
     )
     .await;
     stamp_buffered_sql_headers(&mut result, format, started);
@@ -19400,10 +19420,13 @@ async fn distributed_inner(
 
     // Same pre-flight bytes breaker as the single-pod path — the estimate is on
     // the whole-table plan (total work), which is the right ceiling to enforce.
+    history_buffered::phase(HistoryErrorCode::Planning);
     let df = plan_client_sql(&planning, &effective_query.sql)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let cost = estimate(&df, &ice).await.map_err(ApiError::internal)?;
+    history_buffered::cost(&cost);
+    history_buffered::cache(HistoryCacheState::Bypass);
     let tier1_plan_micros = plan_started.elapsed().as_micros() as u64;
     // A ROW-LIMITED query is governed by the MID-FLIGHT breaker, not by this
     // one. `estimated_bytes_scanned` is an upper bound, and a `LIMIT` makes it
@@ -19604,6 +19627,10 @@ async fn distributed_inner(
         })
         .await?;
         if let Some(mut body) = served {
+            history_buffered::effective(crate::history::OutputFormat::Records, false);
+            history_buffered::admit();
+            // Some battery arms perform uninstrumented metadata/page work.
+            observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
             attach_fast_path_phases(
                 &mut body,
                 tier1_plan_micros,
@@ -19695,6 +19722,15 @@ async fn distributed_inner(
         .await;
     }
 
+    // Legacy explicit routing ignores dry_run and uses batch only as a tier
+    // on this branch. Record the chosen execution, not those request hints.
+    history_buffered::effective(
+        match format {
+            QueryFormat::Records => crate::history::OutputFormat::Records,
+            QueryFormat::Ndjson => crate::history::OutputFormat::Ndjson,
+        },
+        false,
+    );
     let pin_table = referenced_tables(&effective_query.sql)
         .and_then(|t| t.into_iter().next())
         .unwrap_or_else(|| "events".to_string());
@@ -19760,6 +19796,7 @@ async fn distributed_inner(
     // 2026-09-05 on a coordinator-plus-peer pair with a four-slot budget:
     // `/api/v1/sql` and `/api/v1/sql/local` both admit four and refuse the
     // fifth, and the peer trips admission zero times.
+    history_buffered::phase(HistoryErrorCode::Admission);
     let _admission = match acquire_admission(&state, &resolved, &cost).await {
         Ok(guard) => guard,
         Err(err) => {
@@ -19777,6 +19814,7 @@ async fn distributed_inner(
             return result;
         }
     };
+    history_buffered::admit();
     // #94: the coordinator itself is the failover target — it holds the full
     // file set, so a dead worker degrades one shard's latency, not the query.
     // The fallback posts to the coordinator's OWN /shard endpoint, so a
@@ -19811,7 +19849,11 @@ async fn distributed_inner(
             QueryFormat::Ndjson => {
                 let body =
                     crate::format::batches_to_ndjson(&batches).map_err(ApiError::internal)?;
-                let mut resp = Response::new(Body::from(body));
+                // Already-buffered coordinator payload: transfer delivery
+                // ownership without parsing/copying it or inventing scan data.
+                let rows = batches.iter().map(|batch| batch.num_rows()).sum();
+                let mut resp =
+                    Response::new(crate::format::rendered_ndjson_body(body, rows, false));
                 resp.headers_mut().insert(
                     header::CONTENT_TYPE,
                     axum::http::HeaderValue::from_static("application/x-ndjson"),
@@ -19837,6 +19879,9 @@ async fn distributed_inner(
                 )
                 .map_err(ApiError::internal)?;
                 body.cost = Some(cost.clone());
+                // x-siglake-scan is partial diagnostic attribution, not proof
+                // of complete measured counters across all worker attempts.
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 // #85: coordinator-side attribution — plan/classify, the
                 // buffer partial, each shard's wall (fan-out is concurrent,
                 // so the max is the fan-out cost), and the merge.

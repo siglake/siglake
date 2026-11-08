@@ -1,14 +1,15 @@
-# Query history storage/privacy foundations (not routed)
+# Query history storage/privacy foundations (explicit opt-in only)
 
 The [internal runtime core](query-history-runtime.md) now wraps these primitives
 when explicitly constructed (currently tests only); the storage/reader contract
-below is unchanged. Runtime scheduling, deadlines, retries and health are defined
-there, not in the bare store methods. No application startup/route is wired.
+below remains the foundation, with separately versioned v2/v3 dependencies.
+Runtime scheduling, deadlines, retries and health are defined there, not in the
+bare store methods. Optional application-state injection supports only the
+explicitly documented route matrix; no standalone startup is wired.
 
-This foundation is **not usable routed query history**. `siglake_query_server::history`
-exports internal Rust primitives only. Nothing calls these from routes/startup,
-creates a pool from environment, runs migrations, schedules cleanup, replaces
-legacy audit, or changes authentication. No console/public event-ingestion API.
+`siglake_query_server::history` exports internal Rust primitives. No environment
+pool resolver, runtime migration, legacy audit replacement or authentication
+change is introduced. No console/public event-ingestion API.
 The existing raw Iceberg audit and persistent jobs are untouched and are **not**
 privacy-compliant history projections.
 
@@ -20,6 +21,26 @@ explicitly `SET LOCAL ROLE qh_owner`, creates the engine-owned `query_history`
 schema, and grants the documented privileges. It does not create logins, change
 production grants automatically, or run in `HistoryWriter::connect`. It has only
 been applied to fresh disposable local fixtures.
+
+### Separately versioned metadata dependencies
+
+v1 is unchanged. Local jobs require the separate manual OWNER
+`schema-v2-batch.sql`. Configured peer/distributed/direct external shard
+observation additionally requires manual OWNER `schema-v3-effective.sql`, on v1
+or v2. v3 adds only nullable `effective_format`/`effective_dry_run`, a validated
+coherent-tuple check and immutable-once-selected trigger. It does not replace
+v1/v2 constraints, widen grants, backfill old rows or modify original receipts,
+terminals, RLS, row bounds or expiry. Both NULL is unresolved, not records/false.
+Legacy immutable receipt `format`/`dry_run` are request classification/hints,
+not effective execution guarantees for the existing explicit coordinator API.
+See the runtime document's prominent pre-existing dry-run/batch discrepancy.
+
+Migration requires reader/service pool recreation because existing PostgreSQL
+cached `SELECT *` plans cannot change result shape. A new engine reader projects
+optional v3 fields (NULL on old schema/rows). The console reader/JSON/UI needs a
+separately reviewed compatibility adapter before displaying these new variants;
+it must not label request hints as effective execution. This is a hard consumer/
+rollout gate, not authorization to alter production roles or apply DDL.
 
 Before any production integration, separately provision these fixed, distinct
 roles (names are a contract, not proof of isolation):

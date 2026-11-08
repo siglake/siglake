@@ -56,6 +56,7 @@ REVOKE ALL ON app_catalog.secrets FROM PUBLIC;
 SQL
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -f "$root/crates/siglake-query-server/src/history/schema.sql" >>"$work/setup.log"
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -f "$root/crates/siglake-query-server/src/history/schema-v2-batch.sql" >>"$work/setup.log"
+"$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_fixture -f "$root/crates/siglake-query-server/src/history/schema-v3-effective.sql" >>"$work/setup.log"
 # Separate v1 database for explicit migration/missing-v2 compatibility proof.
 "$pg/createdb" -h "$work" -U fixture_admin qh_batch_v1
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_batch_v1 >>"$work/setup.log" <<'SQL'
@@ -66,13 +67,26 @@ REVOKE ALL ON SCHEMA public FROM PUBLIC;
 GRANT USAGE,CREATE ON SCHEMA public TO qh_jobs;
 SQL
 "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d qh_batch_v1 -f "$root/crates/siglake-query-server/src/history/schema.sql" >>"$work/setup.log"
+for version in v1 v2; do
+  "$pg/createdb" -h "$work" -U fixture_admin "qh_effective_$version"
+  "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d "qh_effective_$version" >>"$work/setup.log" <<SQL
+REVOKE ALL ON DATABASE qh_effective_$version FROM PUBLIC;
+GRANT CONNECT ON DATABASE qh_effective_$version TO qh_writer,qh_reader;
+GRANT CREATE ON DATABASE qh_effective_$version TO qh_owner;
+REVOKE ALL ON SCHEMA public FROM PUBLIC;
+SQL
+  "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d "qh_effective_$version" -f "$root/crates/siglake-query-server/src/history/schema.sql" >>"$work/setup.log"
+  if [[ $version == v2 ]]; then
+    "$pg/psql" -X -v ON_ERROR_STOP=1 -h "$work" -U fixture_admin -d "qh_effective_$version" -f "$root/crates/siglake-query-server/src/history/schema-v2-batch.sql" >>"$work/setup.log"
+  fi
+done
 printf 'isolated-history-fixture-v1\n' > "$work/fixture-marker"
 export SIGLAKE_HISTORY_FIXTURE_DIR="$work"
 "$pg/postgres" --version
 cargo --version
 rustc --version
 cargo clippy --version
-timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test query_server oidc::buffered_history::batch_history:: -- --include-ignored --test-threads=1
+timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test query_server oidc::buffered_history:: -- --include-ignored --test-threads=1
 "$pg/createdb" -h "$work" -U fixture_admin qh_jobs_fixture
 export SIGLAKE_TEST_JOBS_POSTGRES_URI="postgresql://fixture_admin@localhost/qh_jobs_fixture?host=$work&sslmode=disable"
 timeout 600 cargo test --manifest-path "$root/Cargo.toml" --offline --locked -p siglake-query-server --test jobs_postgres_ownership -- --include-ignored --test-threads=1

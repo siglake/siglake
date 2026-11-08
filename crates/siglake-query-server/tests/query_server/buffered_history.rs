@@ -21,6 +21,8 @@ use uuid::Uuid;
 const CORRELATION: &str = "x-siglake-history-id";
 #[path = "batch_history.rs"]
 mod batch_history;
+#[path = "distributed_history.rs"]
+mod distributed_history;
 #[path = "ndjson_history.rs"]
 mod ndjson_history;
 
@@ -67,10 +69,11 @@ async fn row(db: &PgPool, id: Uuid) -> Value {
         if let Some(found) = found {
             return found;
         }
-        assert!(
-            Instant::now() < deadline,
-            "terminal observation did not persist"
-        );
+        if Instant::now() >= deadline {
+            // Fixed schema classifications only, never SQL/results/errors.
+            let state: Option<(String, Option<bool>, bool)> = sqlx::query_as("SELECT observation_state,execution_admitted,job_id IS NOT NULL FROM query_history.executions WHERE execution_id=$1").bind(id).fetch_optional(db).await.unwrap();
+            panic!("terminal observation did not persist; safe lifecycle facts: {state:?}");
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -418,15 +421,14 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
     let batch_row = row(&f.admin, batch_id).await;
     assert_eq!(batch_row["outcome"], "success");
     assert_eq!(batch_row["job_id"], batch["job_id"]);
-    // Configured coordinator fallback is explicitly deferred, even if it would
-    // execute locally. No nested wrapper may create a phantom parent.
+    // Configured local delegation retains one external parent.
     let coordinator = server(
         state
             .clone()
             .with_coordinator(vec!["http://127.0.0.1:1".into()], None),
     )
     .await;
-    unobserved(
+    observed(
         &coordinator,
         &t,
         &f.admin,
@@ -435,7 +437,7 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
         StatusCode::OK,
     )
     .await;
-    unobserved(
+    observed(
         &coordinator,
         &t,
         &f.admin,
@@ -507,8 +509,8 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
     let facts = sqlx::query("SELECT count(*) AS n, count(DISTINCT execution_id) AS ids, count(DISTINCT owner_uuid) AS owners, bool_and(redacted_sql IS NULL AND redaction_status='omitted' AND expires_at-received_at=interval '720 hours' AND admitted_at IS NULL AND finished_at IS NULL AND finished_observed_at IS NOT NULL AND duration_ms IS NOT NULL AND observation_state='terminal') AS safe FROM query_history.executions").fetch_one(&f.admin).await.unwrap();
     let n: i64 = facts.get("n");
     assert_eq!(
-        n, 19,
-        "the formerly deferred batch now adds one external parent"
+        n, 21,
+        "batch and configured local delegation each retain one parent"
     );
     assert_eq!(n, facts.get::<i64, _>("ids"));
     assert_eq!(facts.get::<i64, _>("owners"), 1);
@@ -647,7 +649,7 @@ async fn real_router_buffered_history_identity_lifecycle_privacy_and_outage() {
     )
     .await;
     issuer_task.abort();
-    eprintln!("Buffered/NDJSON real-router proof: 20 unique durable execution rows; one owner; safe NULL SQL/30-day expiry; renewed RS256 client; typed planning/cache/errors/admission; real PG lock/retry/no-receipt faults; auth/extractor/deferred/default routes add zero rows.");
+    eprintln!("Buffered/NDJSON real-router proof: 22 unique durable execution rows; one owner; safe NULL SQL/30-day expiry; renewed RS256 client; typed planning/cache/errors/admission; real PG lock/retry/no-receipt faults; auth/extractor/default routes add zero rows.");
 }
 
 #[tokio::test]
