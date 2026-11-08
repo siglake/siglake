@@ -7,6 +7,10 @@
 //! Client SQL is READ-ONLY on every entry point here — see [`read_only_sql`]
 //! for what that refuses and why the default was not safe.
 
+#[path = "sql_controlled_jobs.rs"]
+mod controlled_jobs;
+use controlled_jobs::submit_controlled_batch;
+
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -4423,6 +4427,7 @@ async fn controlled<F, W>(
     state: AppState,
     identity: CallerIdentity,
     req: SqlRequest,
+    handoff: bool,
     work: W,
 ) -> Result<Response, ApiError>
 where
@@ -4433,16 +4438,14 @@ where
     let caller = identity.clone();
     let limits = req.limits.clone();
     let priority = req.priority;
-    crate::query_controls::runtime::run(
-        authority,
-        caller,
-        limits,
-        priority,
-        // SQL's selected future is large. Keep one heap-owned future rather
-        // than embedding/copying it through each authority/deadline wrapper.
-        Box::pin(work(state, identity, req)),
-    )
-    .await
+    let handoff = handoff && priority == Priority::Batch && !req.dry_run;
+    let future = Box::pin(work(state, identity, req));
+    if handoff {
+        crate::query_controls::runtime::run_handoff(authority, caller, limits, priority, future)
+            .await
+    } else {
+        crate::query_controls::runtime::run(authority, caller, limits, priority, future).await
+    }
 }
 
 // The single-pod fallback is implemented by `handle_local`.
@@ -4532,7 +4535,7 @@ pub async fn handle(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let mut result = controlled(state, identity, req, handle_observed).await;
+    let mut result = controlled(state, identity, req, true, handle_observed).await;
     stamp_buffered_sql_headers(&mut result, format, started);
     result
 }
@@ -4752,7 +4755,7 @@ pub async fn handle_local(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let mut result = controlled(state, identity, req, handle_local_observed).await;
+    let mut result = controlled(state, identity, req, true, handle_local_observed).await;
     stamp_buffered_sql_headers(&mut result, format, started);
     result
 }
@@ -4860,9 +4863,6 @@ async fn handle_local_inner(
     let allow_approximate = AllowApproximate::for_request(&req);
     let unknown_cost = CostReport::unknown_after_timeout();
     let batch_submission = req.priority == Priority::Batch && !req.dry_run;
-    if state.query_controls.is_some() && batch_submission {
-        return Err(crate::query_controls::runtime::unsupported());
-    }
     let resolve_started = Instant::now();
     let resolve = async {
         match pre_resolved_ice {
@@ -5950,6 +5950,18 @@ async fn submit_batch(
     ice: Arc<siglake_storage::iceberg::IcebergContext>,
     effective_query: RewrittenQuery,
 ) -> Result<Response, ApiError> {
+    if let Some(authority) = state.query_controls.clone() {
+        return submit_controlled_batch(
+            state,
+            identity,
+            req,
+            resolved,
+            ice,
+            effective_query,
+            authority,
+        )
+        .await;
+    }
     // Batch planning happens on the dedicated runtime, so there is no cost
     // report yet. Reserve the batch tier's fixed share before creating the job
     // row; a saturated pod therefore answers 429 + Retry-After rather than
@@ -6047,6 +6059,7 @@ async fn submit_batch(
     });
 
     let body = crate::openapi_dto::BatchSubmitResponse {
+        controls: None,
         job_id: id.to_string(),
         status_url: format!("/api/v1/jobs/{id}"),
         result_url: format!("/api/v1/jobs/{id}/result"),
@@ -7308,7 +7321,7 @@ pub async fn explain(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
-    controlled(state, identity, req, explain_observed).await
+    controlled(state, identity, req, false, explain_observed).await
 }
 
 async fn explain_observed(
@@ -19439,7 +19452,7 @@ pub async fn distributed(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let mut result = controlled(state, identity, req, distributed_observed).await;
+    let mut result = controlled(state, identity, req, true, distributed_observed).await;
     stamp_buffered_sql_headers(&mut result, format, started);
     result
 }

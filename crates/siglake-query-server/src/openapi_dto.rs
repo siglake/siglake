@@ -69,6 +69,8 @@ impl MemoryPoolDebugResponse {
 /// admission budget returns `429` instead of creating a job.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BatchSubmitResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controls: Option<crate::query_controls::jobs::JobControls>,
     /// Job identifier (UUIDv7, so ids sort by submission time).
     pub job_id: String,
     /// Path to poll for status — `GET /api/v1/jobs/{id}`.

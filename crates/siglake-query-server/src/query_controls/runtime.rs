@@ -1,5 +1,5 @@
-//! Injection-only buffered request authority. No env/main activation or public
-//! enforcement metadata. Unsupported lifetimes refuse before unprotected work.
+//! Injection-only request and durable-job authority. No env/main activation.
+//! Unsupported lifetimes refuse before unprotected work.
 use super::{PolicyError, PolicyLookup, PolicyReader, PolicyState, RuntimeKey};
 use crate::{auth::CallerIdentity, error::ApiError, limits::*, ServerLimits};
 use axum::response::Response;
@@ -13,11 +13,12 @@ use std::{
 /// Configure AppState limits BEFORE injecting this authority. Neither request
 /// preferences nor history/cache metadata can construct or replace it.
 pub struct ControlsAuthority {
-    reader: Arc<PolicyReader>,
+    pub(super) reader: Arc<PolicyReader>,
     interactive: TierLimits,
-    batch: TierLimits,
-    generation: i64,
+    pub(super) batch: TierLimits,
+    pub(super) generation: i64,
     bodies: super::body::BodyTasks,
+    pub(crate) jobs: super::job_tasks::JobTasks,
 }
 impl ControlsAuthority {
     pub(crate) fn new(
@@ -36,11 +37,13 @@ impl ControlsAuthority {
             batch: limits.batch.clone(),
             generation,
             bodies: super::body::BodyTasks::default(),
+            jobs: super::job_tasks::JobTasks::default(),
         })
     }
-    /// Close the body generation and observe all producer joins. Cancelling
+    /// Close job/body generations and observe all retained joins. Cancelling
     /// this wait preserves handles; await it again before service teardown.
     pub async fn shutdown(&self) {
+        self.jobs.shutdown().await;
         self.bodies.shutdown().await;
     }
     fn tier(&self, priority: Priority) -> &TierLimits {
@@ -88,12 +91,12 @@ fn timeout(tier: &TierLimits, caller: &RequestLimits, policy: PolicyLookup) -> D
 pub(crate) struct RequestControls {
     pub(crate) started: Instant,
     pub(crate) deadline: tokio::time::Instant,
-    timeout: Duration,
-    state: PolicyState,
-    revision: Option<i64>,
-    generation: i64,
-    scan_warning: Option<i64>,
-    timeout_opt_out_ignored: bool,
+    pub(super) timeout: Duration,
+    pub(super) state: PolicyState,
+    pub(super) revision: Option<i64>,
+    pub(super) generation: i64,
+    pub(super) scan_warning: Option<i64>,
+    pub(super) timeout_opt_out_ignored: bool,
 }
 tokio::task_local! {
     static INGRESS: Instant;
@@ -126,7 +129,7 @@ fn unavailable() -> ApiError {
 pub(crate) fn unsupported() -> ApiError {
     ApiError::service_unavailable("query_controls_path_unavailable")
 }
-pub(super) fn expired() -> ApiError {
+pub(crate) fn expired() -> ApiError {
     ApiError {
         status: axum::http::StatusCode::GATEWAY_TIMEOUT,
         msg: "query deadline exceeded".into(),
@@ -154,12 +157,37 @@ where
 
 /// Scope includes observational history waits and fully buffered response
 /// rendering and independently owned body production. Native CPU work remains
-/// cooperative, not OS-preempted. Jobs/fanout/shards/Jaeger remain gated.
+/// cooperative, not OS-preempted. Fanout/shards/Jaeger remain gated.
 pub(crate) async fn run<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
     caller: RequestLimits,
     priority: Priority,
+    future: F,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+{
+    run_inner(authority, identity, caller, priority, false, future).await
+}
+pub(crate) async fn run_handoff<F>(
+    authority: Option<Arc<ControlsAuthority>>,
+    identity: CallerIdentity,
+    caller: RequestLimits,
+    priority: Priority,
+    future: F,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+{
+    run_inner(authority, identity, caller, priority, true, future).await
+}
+async fn run_inner<F>(
+    authority: Option<Arc<ControlsAuthority>>,
+    identity: CallerIdentity,
+    caller: RequestLimits,
+    priority: Priority,
+    handoff: bool,
     future: F,
 ) -> Result<Response, ApiError>
 where
@@ -172,7 +200,11 @@ where
     // permission to mint a fresh clock from supplied identity metadata.
     let started = INGRESS.try_with(|s| *s).map_err(|_| unavailable())?;
     let tier = authority.tier(priority);
-    let initial_timeout = timeout(tier, &caller, PolicyLookup::Absent);
+    let initial_timeout = if handoff {
+        tier.default_timeout
+    } else {
+        timeout(tier, &caller, PolicyLookup::Absent)
+    };
     let initial_deadline = tokio::time::Instant::from_std(
         started
             .checked_add(initial_timeout)
@@ -203,7 +235,13 @@ where
     let controls = RequestControls {
         started,
         deadline: tokio::time::Instant::from_std(
-            started.checked_add(timeout).ok_or_else(unavailable)?,
+            started
+                .checked_add(if handoff {
+                    tier.default_timeout
+                } else {
+                    timeout
+                })
+                .ok_or_else(unavailable)?,
         ),
         timeout,
         state: policy.state(),
@@ -241,7 +279,7 @@ where
         }
     }
 }
-fn runtime_key(identity: &CallerIdentity) -> Result<Option<RuntimeKey>, PolicyError> {
+pub(super) fn runtime_key(identity: &CallerIdentity) -> Result<Option<RuntimeKey>, PolicyError> {
     if identity.coordinator {
         return Err(PolicyError::Invalid);
     }

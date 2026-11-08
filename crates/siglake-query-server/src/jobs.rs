@@ -75,6 +75,9 @@ use sqlx::{PgPool, Row};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+#[path = "jobs_controlled.rs"]
+pub(crate) mod controlled;
+
 use crate::cost::CostReport;
 use crate::format::RecordsResponse;
 use crate::limits::Priority;
@@ -226,6 +229,8 @@ pub struct JobInfo {
     pub query: String,
     pub cost: Option<CostReport>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub controls: Option<crate::query_controls::jobs::JobControls>,
 }
 
 /// Ownership-scoped recovery policy for the Postgres backend, plus the one
@@ -527,6 +532,7 @@ struct InMemoryRow {
     info: JobInfo,
     owner: String,
     history_execution_id: Option<Uuid>,
+    controls: Option<crate::query_controls::jobs::JobContext>,
     result: Option<RecordsResponse>,
     expires_at: Option<Instant>,
 }
@@ -642,6 +648,10 @@ pub struct JobStore {
     /// row after it was deleted and strand this incarnation's jobs for a full
     /// lease again.
     owner_upkeep: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    reconcile_tasks: crate::query_controls::job_tasks::JobTasks,
+    uncertain_commits: Arc<Mutex<HashMap<JobId, controlled::CommitState>>>,
+    #[cfg(test)]
+    commit_hook: Mutex<Option<controlled::CommitHook>>,
     /// This process incarnation's execution-owner id. Stamped on every row
     /// this store submits and the one value recovery must never act on.
     /// Unique per process, so a restarted pod does not inherit ownership of
@@ -885,6 +895,10 @@ impl JobStore {
             batch_runtime: Arc::new(BatchRuntime::new(batch_runtime_threads)),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             owner_upkeep: Mutex::new(None),
+            reconcile_tasks: Default::default(),
+            uncertain_commits: Default::default(),
+            #[cfg(test)]
+            commit_hook: Default::default(),
             owner: new_owner_id(),
             recovery: JobRecoveryPolicy::default(),
             finished_unpersisted: Arc::new(Mutex::new(FinishedUnpersisted::default())),
@@ -944,6 +958,10 @@ impl JobStore {
             batch_runtime: Arc::new(BatchRuntime::new(batch_runtime_threads)),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             owner_upkeep: Mutex::new(None),
+            reconcile_tasks: Default::default(),
+            uncertain_commits: Default::default(),
+            #[cfg(test)]
+            commit_hook: Default::default(),
             owner,
             recovery,
             finished_unpersisted: Arc::new(Mutex::new(FinishedUnpersisted::default())),
@@ -992,6 +1010,10 @@ impl JobStore {
             batch_runtime: Arc::new(BatchRuntime::new(batch_runtime_threads)),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             owner_upkeep: Mutex::new(None),
+            reconcile_tasks: Default::default(),
+            uncertain_commits: Default::default(),
+            #[cfg(test)]
+            commit_hook: Default::default(),
             owner: new_owner_id(),
             recovery: other.recovery,
             finished_unpersisted: Arc::new(Mutex::new(FinishedUnpersisted::default())),
@@ -1135,6 +1157,7 @@ impl JobStore {
             );
         }
 
+        self.reconcile_tasks.shutdown().await;
         let upkeep = self.owner_upkeep.lock().unwrap().take();
         if let Some(upkeep) = upkeep {
             upkeep.abort();
@@ -1341,6 +1364,7 @@ impl JobStore {
             query,
             cost: None,
             error: None,
+            controls: None,
         };
         match &self.backend {
             Backend::InMemory(map) => {
@@ -1350,6 +1374,7 @@ impl JobStore {
                         info,
                         owner: self.owner.clone(),
                         history_execution_id,
+                        controls: None,
                         result: None,
                         expires_at: None,
                     },
@@ -1392,6 +1417,7 @@ impl JobStore {
                 let Some(row) = map.get_mut(&id) else {
                     return Ok(CompletionOutcome::Vanished);
                 };
+                anyhow::ensure!(row.controls.is_none(), "controlled job start rejected");
                 if row.info.status.is_terminal() {
                     return Ok(CompletionOutcome::Superseded {
                         status: row.info.status,
@@ -1599,6 +1625,7 @@ impl JobStore {
             ttl: self.ttl,
             finished_unpersisted: self.finished_unpersisted.clone(),
             history: self.history.clone(),
+            uncertain_commits: self.uncertain_commits.clone(),
         }
     }
 
@@ -1607,10 +1634,10 @@ impl JobStore {
     /// this loop — down.
     fn spawn_reconcile(&self) {
         let reconciler = self.reconciler();
-        self.batch_runtime.spawn(async move {
+        self.reconcile_tasks.reserve().expect("one reconciliation owner").start_on(&self.batch_runtime,move |mut stop| async move {
             loop {
-                tokio::time::sleep(RECONCILE_INTERVAL).await;
-                let outcome = reconciler.pass().await;
+                tokio::select!{biased; _=stop.changed()=>return,_=tokio::time::sleep(RECONCILE_INTERVAL)=>{}}
+                let outcome = tokio::select!{biased; _=stop.changed()=>return,r=reconciler.pass()=>r};
                 if outcome.installed > 0 || outcome.preserved > 0 || outcome.gone > 0 {
                     tracing::info!(
                         installed = outcome.installed,
@@ -1942,6 +1969,7 @@ struct Reconciler {
     ttl: Duration,
     finished_unpersisted: Arc<Mutex<FinishedUnpersisted>>,
     history: Arc<JobHistory>,
+    uncertain_commits: Arc<Mutex<HashMap<JobId, controlled::CommitState>>>,
 }
 
 /// Per-write bound inside a reconciliation pass. A store that accepts the
@@ -1959,7 +1987,14 @@ impl Reconciler {
             let parked = self.finished_unpersisted.lock().unwrap();
             parked.computed.iter().map(|(id, s)| (*id, *s)).collect()
         };
-        let mut outcome = ReconcileOutcome::default();
+        let mut outcome = controlled::reconcile_uncertain(
+            &self.backend,
+            &self.owner,
+            self.ttl,
+            &self.uncertain_commits,
+            &self.history,
+        )
+        .await;
         for (id, computed) in parked {
             let terminal = reconciled_terminal(computed);
             let write = install_failed(
@@ -2315,6 +2350,7 @@ async fn read_info(pool: &PgPool, id: JobId) -> Result<Option<JobInfo>> {
         query: row.try_get("query")?,
         cost,
         error: row.try_get("error")?,
+        controls: controlled::optional_public_controls(pool, id).await?,
     }))
 }
 
@@ -2471,7 +2507,7 @@ const CANCELLED_AMONG_SQL: &str = "SELECT job_id FROM siglake_query_jobs
 
 /// Publish `running` before the work runs. `COALESCE` because `started_at` is
 /// the moment execution began: a republication must not move it forward.
-const SET_RUNNING_SQL: &str = "UPDATE siglake_query_jobs
+pub(crate) const SET_RUNNING_SQL: &str = "UPDATE siglake_query_jobs
      SET status = 'running', started_at = COALESCE(started_at, NOW())
      WHERE job_id = $1 AND status IN ('pending', 'running')";
 
