@@ -50,9 +50,11 @@ use crate::audit::{AuditRow, AuditStatus, AuditWriter};
 use crate::auth::CallerIdentity;
 use crate::cost::{estimate, extract_exact_time_bounds_from_expr, CostReport};
 use crate::error::ApiError;
+#[cfg(test)]
+use crate::format::batches_to_records;
 #[allow(unused_imports)] // referenced by the `#[utoipa::path]` response bodies
 use crate::format::RecordsResponse;
-use crate::format::{batches_to_records, NdjsonStream, QueryFormat};
+use crate::format::{NdjsonStream, QueryFormat};
 use crate::history::{
     buffered as history_buffered, CacheState as HistoryCacheState, ErrorCode as HistoryErrorCode,
     Operation as HistoryOperation,
@@ -12219,19 +12221,27 @@ async fn render_records(
     // Keep upstream's empty-result schema and controlled cooperative conversion.
     let mut body = if crate::query_controls::runtime::current().is_some() {
         let mut body = crate::format::batches_to_records_cooperative(
-            &batches, Some(resolved.max_rows_returned),
-        ).await.map_err(ApiError::internal)?;
+            &batches,
+            Some(resolved.max_rows_returned),
+        )
+        .await
+        .map_err(ApiError::internal)?;
         if batches.is_empty() {
-            body.columns = plan.schema().fields().iter().map(|f| f.name().clone()).collect();
+            body.columns = plan
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
         }
         body
     } else {
         crate::format::batches_to_records_with_schema(
-        &batches,
-        Some(resolved.max_rows_returned),
-        Some(plan.schema().as_ref()),
-    )
-    .map_err(ApiError::internal)?
+            &batches,
+            Some(resolved.max_rows_returned),
+            Some(plan.schema().as_ref()),
+        )
+        .map_err(ApiError::internal)?
     };
     let render_elapsed = render_started.elapsed();
     record_phase_metric("sql", "render_records", render_elapsed);
@@ -12324,7 +12334,9 @@ async fn render_records(
     // and has to be named here to be named at all (#7456).
     let serialize_started = Instant::now();
     let mut response = crate::format::records_response_with_cap(
-        status, Arc::clone(&body), Some(resolved.max_rows_returned),
+        status,
+        Arc::clone(&body),
+        Some(resolved.max_rows_returned),
     );
     set_result_cache_header(&mut response, cache_outcome);
     let serialize_elapsed = serialize_started.elapsed();
@@ -19617,14 +19629,19 @@ pub async fn distributed(
     // Pin actual membership before primary/history waits.
     let peers = state.peers.as_ref().and_then(|source| source.capture());
     // Flags cannot prove which branch classification/Tier1 will select.
-    let mut result = if state.query_controls.as_ref().is_some_and(|c| c.distributed.is_none())
-        && req.priority == Priority::Batch && !req.dry_run
+    let mut result = if state
+        .query_controls
+        .as_ref()
+        .is_some_and(|c| c.distributed.is_none())
+        && req.priority == Priority::Batch
+        && !req.dry_run
     {
         Err(crate::query_controls::runtime::unsupported())
     } else {
         controlled(state, identity, req, false, move |state, identity, req| {
             distributed_observed(state, identity, req, peers)
-        }).await
+        })
+        .await
     };
     stamp_buffered_sql_headers(&mut result, format, started);
     result

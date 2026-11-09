@@ -480,7 +480,8 @@ impl HttpShardRunner {
             resp.headers()
                 .get("x-siglake-scan-stats")
                 .map(|header| header.as_bytes()),
-        ).map_err(decode_error)?;
+        )
+        .map_err(decode_error)?;
         let bytes = resp
             .bytes()
             .await

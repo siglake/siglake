@@ -178,7 +178,8 @@ pub async fn result(
                     records: body,
                     controls: info.controls,
                 }),
-            ).into_response();
+            )
+                .into_response();
             crate::sql::set_handler_micros_header(&mut response, started);
             crate::sql::set_result_cache_header(&mut response, "off");
             Ok(response)
