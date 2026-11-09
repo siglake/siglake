@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import datetime as dt
 import io
 import importlib.util
@@ -252,6 +253,77 @@ class IsolationTests(unittest.TestCase):
                 'siglake/siglake', source, 'linux', 'amd64', source
             )
 
+    def test_candidate_pull_accepts_only_verified_classic_or_containerd_identity(self):
+        graph = {
+            'image': 'ghcr.io/siglake/siglake@sha256:' + 'a' * 64,
+            'manifest_digest': 'sha256:' + 'a' * 64,
+            'config_digest': 'sha256:' + 'b' * 64,
+            'source_revision': 'c' * 7,
+        }
+        classic = {
+            'Id': graph['config_digest'], 'RepoDigests': [graph['image']],
+            'Os': 'linux', 'Architecture': 'amd64',
+            'Config': {'Labels': {
+                'org.opencontainers.image.source': v.OCI_SOURCE,
+                'org.opencontainers.image.revision': graph['source_revision'],
+            }},
+        }
+        modern = copy.deepcopy(classic)
+        modern.update(Id=graph['manifest_digest'], Descriptor={
+            'digest': graph['manifest_digest'],
+            'mediaType': 'application/vnd.oci.image.manifest.v1+json',
+        })
+        for doc, identity in ((classic, 'config'), (modern, 'manifest')):
+            self.assertEqual(
+                v.verify_candidate_pull(doc, graph, 'linux', 'amd64')['store_identity'],
+                identity,
+            )
+        mutations = (
+            ('foreign ID', lambda d: d.update(Id='sha256:' + 'd' * 64)),
+            ('missing descriptor', lambda d: d.pop('Descriptor')),
+            ('foreign descriptor', lambda d: d['Descriptor'].update(digest='sha256:' + 'd' * 64)),
+            ('index descriptor', lambda d: d['Descriptor'].update(mediaType='application/vnd.oci.image.index.v1+json')),
+            ('wrong repository', lambda d: d.update(RepoDigests=[graph['image'].replace('siglake/siglake', 'foreign/siglake')])),
+            ('wrong platform', lambda d: d.update(Architecture='arm64')),
+            ('foreign source', lambda d: d['Config']['Labels'].update({'org.opencontainers.image.source': 'https://example.invalid'})),
+            ('foreign revision', lambda d: d['Config']['Labels'].update({'org.opencontainers.image.revision': 'd' * 7})),
+        )
+        for name, mutate in mutations:
+            doc = copy.deepcopy(modern)
+            mutate(doc)
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                v.verify_candidate_pull(doc, graph, 'linux', 'amd64')
+        bad_classic = copy.deepcopy(classic)
+        bad_classic['Id'] = 'sha256:' + 'd' * 64
+        with self.assertRaises(ValueError):
+            v.verify_candidate_pull(bad_classic, graph, 'linux', 'amd64')
+
+    def test_candidate_prepare_retains_raw_inspect_before_identity_refusal(self):
+        source = 'a' * 40
+        graph = {'image': 'ghcr.io/siglake/siglake@sha256:' + 'b' * 64,
+                 'manifest_digest': 'sha256:' + 'b' * 64,
+                 'config_digest': 'sha256:' + 'c' * 64,
+                 'source_revision': source[:7]}
+        inspected = {'Id': 'sha256:' + 'd' * 64, 'RepoDigests': [graph['image']]}
+        with tempfile.TemporaryDirectory() as temp:
+            out = Path(temp) / 'candidate'
+            args = v.parse_arguments([
+                '--version', 'v0.4.1', '--profile', 'smoke', '--out', str(out),
+                '--candidate-source', source,
+                '--candidate-engine-image', 'ghcr.io/siglake/siglake:' + source,
+                '--candidate-operator-image', 'ghcr.io/siglake/siglake-operator:' + source,
+            ])
+            run = v.Run(args)
+            replies = [source, 'e' * 40, source, '', 'linux/amd64', '',
+                       v.json.dumps([inspected])]
+            with patch.object(v, 'run_command', side_effect=replies) as command, patch.object(
+                v, 'resolve_candidate_manifest', return_value=graph
+            ), self.assertRaisesRegex(ValueError, 'foreign image identity'):
+                run.prepare()
+            self.assertEqual(v.json.loads((out / 'engine-image-inspect.json').read_text()), inspected)
+            self.assertFalse(run.mutated)
+            self.assertFalse(any(c.args[0][:2] == ['docker', 'run'] for c in command.call_args_list))
+
     def test_candidate_workflow_keeps_inputs_out_of_shell_source(self):
         workflow = (
             Path(__file__).resolve().parents[2]
@@ -283,6 +355,7 @@ class IsolationTests(unittest.TestCase):
         shell_source = '\n'.join(run_blocks)
         self.assertNotIn('${{ inputs.candidate_', shell_source)
         self.assertIn('--candidate-source "$CANDIDATE_SOURCE"', shell_source)
+        self.assertNotIn('ref: ${{ inputs.candidate_source }}', workflow)
 
     def test_optional_feature_defaults_are_absent_from_packaged_workloads(self):
         root = Path(__file__).resolve().parents[2]

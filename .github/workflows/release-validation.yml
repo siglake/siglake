@@ -81,7 +81,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.candidate_source }}
+          # Run the reviewed workflow revision's harness. The candidate source,
+          # Compose contract and images remain independently pinned below.
           fetch-depth: 0
           persist-credentials: false
       - name: Validate exact pre-tag candidate

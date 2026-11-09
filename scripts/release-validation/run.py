@@ -357,6 +357,38 @@ def resolve_candidate_manifest(repo, reference, os_name, architecture, source_co
     }
 
 
+
+def verify_candidate_pull(inspected, graph, os_name, architecture):
+    """Bind a pulled platform image under classic or containerd Docker stores."""
+    if graph['image'] not in (inspected.get('RepoDigests') or []):
+        raise ValueError('candidate pull lacks the exact repository/platform digest')
+    image_id = inspected.get('Id')
+    descriptor = inspected.get('Descriptor')
+    if descriptor is not None and (
+        not isinstance(descriptor, dict)
+        or descriptor.get('digest') != graph['manifest_digest']
+        or descriptor.get('mediaType') not in OCI_MANIFEST_TYPES
+    ):
+        raise ValueError('candidate pull has a foreign platform descriptor')
+    if image_id == graph['config_digest']:
+        store_identity = 'config'
+    elif image_id == graph['manifest_digest'] and descriptor is not None:
+        store_identity = 'manifest'
+    else:
+        raise ValueError('candidate pull has a foreign image identity')
+    if normalize_platform(inspected.get('Os'), inspected.get('Architecture')) != (
+        os_name, architecture
+    ):
+        raise ValueError('candidate pull has a foreign platform')
+    labels = (inspected.get('Config') or {}).get('Labels') or {}
+    if (
+        labels.get('org.opencontainers.image.source') != OCI_SOURCE
+        or labels.get('org.opencontainers.image.revision') != graph['source_revision']
+    ):
+        raise ValueError('candidate pull has foreign source labels')
+    return {'store_identity': store_identity, 'image_id': image_id}
+
+
 def anonymous_manifest(repo, version):
     url = 'https://ghcr.io/token?service=ghcr.io&scope=repository:' + repo + ':pull'
     token = http(url, token=None)['token']
@@ -522,13 +554,9 @@ class Run:
                     run_command(['docker', 'image', 'inspect', image], self.env)
                 )[0]
                 graph = resolved[role]
-                if inspected.get('Id') != graph['config_digest']:
-                    raise ValueError(f'candidate {role} pull has a foreign image config')
-                inspected_platform = normalize_platform(
-                    inspected.get('Os'), inspected.get('Architecture')
-                )
-                if inspected_platform != (os_name, architecture):
-                    raise ValueError(f'candidate {role} pull has a foreign platform')
+                write_json(self.out / f'{role}-image-inspect.json', inspected)
+                identity = verify_candidate_pull(inspected, graph, os_name, architecture)
+                self.summary.setdefault('product_pull_identity', {})[role] = identity
                 output = run_command(
                     ['docker', 'run', '--rm', '--network', 'none', '--pull', 'never', image, '--version'],
                     self.env,
