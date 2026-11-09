@@ -62,6 +62,11 @@ pub struct CostReport {
     #[serde(skip)]
     #[schema(ignore)]
     pub estimate_complete: bool,
+    /// A live estimator actually inspected the inventory. Distinguishes a
+    /// trusted incomplete inventory from untrusted/deserialized cached cost.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub estimate_inventory_trusted: bool,
     /// Live files considered BEFORE the manifest time-bounds prune —
     /// `files_considered - files_to_scan` is planning-time pruning's win.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -91,6 +96,7 @@ impl CostReport {
         Self {
             files_to_scan: None,
             estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: None,
             estimated_bytes_scanned: 0,
             estimated_rows_processed: 0,
@@ -214,6 +220,7 @@ pub async fn estimate(df: &DataFrame, ice: &Arc<IcebergContext>) -> anyhow::Resu
     Ok(CostReport {
         files_to_scan: Some(total.files),
         estimate_complete,
+        estimate_inventory_trusted: true,
         files_considered: had_known_scan.then_some(total.files_considered),
         estimated_bytes_scanned: total.bytes,
         estimated_rows_processed: total.rows,

@@ -329,6 +329,7 @@ mod tests {
         let cost = crate::cost::CostReport {
             files_to_scan: None,
             estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: None,
             estimated_bytes_scanned: u64::MAX / 8,
             estimated_rows_processed: 0,
@@ -368,6 +369,7 @@ mod tests {
             controller.reservation_bytes(&CostReport {
                 files_to_scan: Some(1),
                 estimate_complete: false,
+                estimate_inventory_trusted: false,
                 files_considered: None,
                 estimated_bytes_scanned: 1,
                 estimated_rows_processed: 1,
@@ -382,6 +384,7 @@ mod tests {
             controller.reservation_bytes(&CostReport {
                 files_to_scan: Some(32),
                 estimate_complete: false,
+                estimate_inventory_trusted: false,
                 files_considered: None,
                 estimated_bytes_scanned: 512 * 1024 * 1024,
                 estimated_rows_processed: 1,
@@ -404,6 +407,7 @@ mod tests {
             controller.reservation_bytes(&CostReport {
                 files_to_scan: Some(64),
                 estimate_complete: false,
+                estimate_inventory_trusted: false,
                 files_considered: None,
                 estimated_bytes_scanned: 2 * 1024 * 1024 * 1024,
                 estimated_rows_processed: 1,

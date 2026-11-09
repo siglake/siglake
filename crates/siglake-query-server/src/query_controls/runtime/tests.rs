@@ -10,6 +10,7 @@ fn policy(revision: i64, timeout: Option<i64>, warning: Option<i64>) -> PolicyLo
 fn snapshot(budget: Duration) -> RequestControls {
     let started = Instant::now();
     RequestControls {
+        priority: Priority::Interactive,
         started,
         deadline: tokio::time::Instant::from_std(started + budget),
         timeout: budget,

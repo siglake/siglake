@@ -59,6 +59,8 @@ enum OidcProfile {
     after_help = "Optional query history: set dedicated SIGLAKE_QUERY_HISTORY_DATABASE_URL and explicitly disable legacy audit with --audit-disabled. Fixed qh_writer; verified v3 schema required. Absent configuration makes no history connections. Up to 8 bounded preflight attempts; exhaustion requires restart. History degradation never changes SQL liveness/readiness. See docs/query-history-runtime.md."
 )]
 struct Cli {
+    #[command(flatten)]
+    controls: siglake_query_server::query_controls::startup::ControlsArgs,
     /// Address to bind the HTTP API.
     #[arg(long, default_value = "0.0.0.0:8089", env = "SIGLAKE_QUERY_BIND")]
     bind: SocketAddr,
@@ -423,6 +425,52 @@ async fn main() -> Result<()> {
             anyhow::bail!(message);
         }
     }
+    let configured = cli.controls.prepare(
+        !cli.query_peers.is_empty() || cli.query_peer_discovery_srv.is_some(),
+        cli.query_coordinator_token.as_deref(),
+    )?;
+    if configured.is_some() {
+        let claim = oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref());
+        let allowed = allowed_tenants_from(cli.allowed_tenants.as_deref())
+            .map_err(|message| anyhow::anyhow!(message))?;
+        if let Some(message) = query_oidc_config_error(
+            cli.oidc_profile,
+            cli.oidc_issuer.as_deref(),
+            cli.oidc_audience.as_deref(),
+            claim,
+            allowed.is_some(),
+        ) {
+            anyhow::bail!(message);
+        }
+        // Validate static peer configuration, not discovery or query work.
+        discovery::peer_scheme_from(cli.query_peer_scheme.as_deref())
+            .map_err(|_| anyhow::anyhow!("invalid controlled peer configuration"))?;
+        let peers =
+            discovery::peer_config_from(&cli.query_peers, cli.query_peer_discovery_srv.as_deref())
+                .map_err(|_| anyhow::anyhow!("invalid controlled peer configuration"))?;
+        if let discovery::PeerConfig::Static(urls) = &peers {
+            siglake_query_server::query_controls::startup::validate_peer_urls(urls)?;
+        }
+        if matches!(peers, discovery::PeerConfig::Srv(_))
+            && cli
+                .query_peer_self_name
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            && std::env::var("HOSTNAME")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            anyhow::bail!("controlled peer discovery requires self name");
+        }
+    }
+    // Fail closed before unrelated startup, including telemetry or catalog IO.
+    let authority = match configured {
+        Some(config) => Some(config.connect().await?),
+        None => None,
+    };
     // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
     // console layer always stays on, and stays on stderr, matching the siglake
     // CLI and the rest of the workspace's binaries.
@@ -431,12 +479,18 @@ async fn main() -> Result<()> {
     // startup error, a bad flag — so the flush happens once, here, on all of
     // them. The providers live in a `OnceLock` that never drops, so nothing
     // else would flush them. No-op when OTel is off.
-    let result = run(cli).await;
+    let result = run(cli, authority.clone()).await;
+    if let Some(authority) = authority {
+        siglake_query_server::query_controls::startup::shutdown_owned(&authority).await;
+    }
     siglake_core::telemetry::shutdown();
     result
 }
 
-async fn run(cli: Cli) -> Result<()> {
+async fn run(
+    cli: Cli,
+    authority: Option<Arc<siglake_query_server::query_controls::ControlsAuthority>>,
+) -> Result<()> {
     // Dedicated env-only resolver: absent is disabled; invalid syntax or an
     // enabled legacy raw audit rejects before any catalog/OIDC/listener work.
     let history_config = HistoryConfig::from_env(cli.audit_disabled)?;
@@ -652,6 +706,7 @@ async fn run(cli: Cli) -> Result<()> {
     let peer_source = build_peer_source(&cli)?;
     let mut state = AppState::new(ice.clone(), auth)
         .with_limits(limits)
+        .with_controls_authority(authority)
         .with_jobs(jobs)
         .with_query_scan(query_scan)
         .with_wal_buffer_dir(cli.query_wal_buffer_dir.clone())

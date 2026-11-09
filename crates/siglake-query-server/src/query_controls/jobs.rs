@@ -224,6 +224,7 @@ impl JobContext {
         started: Instant,
     ) -> RequestControls {
         RequestControls {
+            priority: crate::Priority::Batch,
             started,
             deadline,
             timeout: Duration::from_millis(snapshot.effective_timeout_ms as u64),

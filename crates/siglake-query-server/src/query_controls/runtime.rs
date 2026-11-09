@@ -1,4 +1,4 @@
-//! Injection-only request and durable-job authority. No env/main activation.
+//! Request and durable-job authority; optional startup lives in `startup`.
 //! Unsupported lifetimes refuse before unprotected work.
 use super::{PolicyError, PolicyLookup, PolicyReader, PolicyState, RuntimeKey};
 use crate::{auth::CallerIdentity, error::ApiError, limits::*, ServerLimits};
@@ -19,6 +19,7 @@ pub struct ControlsAuthority {
     pub(super) generation: i64,
     pub(crate) distributed: Option<super::wire::DistributedControlsConfig>,
     bodies: super::body::BodyTasks,
+    admitting: std::sync::atomic::AtomicBool,
     pub(crate) jobs: super::job_tasks::JobTasks,
 }
 impl ControlsAuthority {
@@ -27,18 +28,32 @@ impl ControlsAuthority {
         limits: &ServerLimits,
         generation: i64,
     ) -> Result<Self, PolicyError> {
-        validate_tier(&limits.interactive)?;
-        validate_tier(&limits.batch)?;
+        Self::from_tiers(
+            reader,
+            limits.interactive.clone(),
+            limits.batch.clone(),
+            generation,
+        )
+    }
+    pub(super) fn from_tiers(
+        reader: Arc<PolicyReader>,
+        interactive: TierLimits,
+        batch: TierLimits,
+        generation: i64,
+    ) -> Result<Self, PolicyError> {
+        validate_tier(&interactive)?;
+        validate_tier(&batch)?;
         if generation <= 0 {
             return Err(PolicyError::Configuration);
         }
         Ok(Self {
             reader,
             distributed: None,
-            interactive: limits.interactive.clone(),
-            batch: limits.batch.clone(),
+            interactive,
+            batch,
             generation,
             bodies: super::body::BodyTasks::default(),
+            admitting: std::sync::atomic::AtomicBool::new(true),
             jobs: super::job_tasks::JobTasks::default(),
         })
     }
@@ -46,9 +61,24 @@ impl ControlsAuthority {
     pub(super) fn owned_body_counts(&self) -> (usize, usize, usize) {
         self.bodies.owned_counts()
     }
+    pub(crate) async fn ready(&self) -> Result<(), PolicyError> {
+        if !self.is_admitting() {
+            return Err(PolicyError::Unavailable);
+        }
+        self.reader.preflight().await
+    }
+    pub(crate) fn stop_admissions(&self) {
+        self.admitting
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn is_admitting(&self) -> bool {
+        self.admitting.load(std::sync::atomic::Ordering::Acquire)
+    }
     /// Close job/body generations and observe all retained joins. Cancelling
-    /// this wait preserves handles; await it again before service teardown.
+    /// this wait preserves handles. Injected readers remain owned by their
+    /// caller (which may share them between authorities).
     pub async fn shutdown(&self) {
+        self.stop_admissions();
         self.jobs.shutdown().await;
         self.bodies.shutdown().await;
     }
@@ -59,7 +89,7 @@ impl ControlsAuthority {
         }
     }
 }
-fn validate_tier(tier: &TierLimits) -> Result<(), PolicyError> {
+pub(super) fn validate_tier(tier: &TierLimits) -> Result<(), PolicyError> {
     for duration in [tier.default_timeout, tier.ceiling_timeout] {
         if duration.as_millis() == 0
             || duration.as_millis() > i64::MAX as u128
@@ -73,7 +103,7 @@ fn validate_tier(tier: &TierLimits) -> Result<(), PolicyError> {
     }
     Ok(())
 }
-fn timeout(tier: &TierLimits, caller: &RequestLimits, policy: PolicyLookup) -> Duration {
+pub(super) fn timeout(tier: &TierLimits, caller: &RequestLimits, policy: PolicyLookup) -> Duration {
     let policy_timeout = match policy {
         PolicyLookup::Found(p) => p
             .settings()
@@ -96,6 +126,7 @@ fn timeout(tier: &TierLimits, caller: &RequestLimits, policy: PolicyLookup) -> D
 #[derive(Clone, Copy)]
 pub(crate) struct RequestControls {
     pub(crate) started: Instant,
+    pub(crate) priority: Priority,
     pub(crate) deadline: tokio::time::Instant,
     pub(super) timeout: Duration,
     pub(super) state: PolicyState,
@@ -124,6 +155,9 @@ pub(crate) async fn ingress<F: Future>(started: Instant, future: F) -> F::Output
     INGRESS_UNIX_MS
         .scope(unix_ms, INGRESS.scope(started, future))
         .await
+}
+pub(super) fn ingress_started() -> Result<Instant, ApiError> {
+    INGRESS.try_with(|s| *s).map_err(|_| unavailable())
 }
 pub(crate) fn current() -> Option<RequestControls> {
     CONTROLS
@@ -164,7 +198,7 @@ pub(crate) fn expired() -> ApiError {
         headers: vec![],
     }
 }
-async fn until<F, T>(deadline: tokio::time::Instant, future: F) -> Result<T, ApiError>
+pub(super) async fn until<F, T>(deadline: tokio::time::Instant, future: F) -> Result<T, ApiError>
 where
     F: Future<Output = Result<T, ApiError>>,
 {
@@ -395,6 +429,9 @@ where
         let Some(authority) = authority else {
             return future.await;
         };
+        if !authority.is_admitting() {
+            return Err(unavailable());
+        }
         // A missing authenticated ingress scope is an infrastructure failure, not
         // permission to mint a fresh clock from supplied identity metadata.
         let started = INGRESS.try_with(|s| *s).map_err(|_| unavailable())?;
@@ -434,6 +471,7 @@ where
         let timeout = timeout(tier, &caller, policy);
         let controls = RequestControls {
             started,
+            priority,
             deadline: tokio::time::Instant::from_std(
                 started
                     .checked_add(if handoff {
@@ -495,7 +533,12 @@ where
         let timeout = controls.timeout;
         let started = controls.started;
         let headers = match native {
-            NativeResponse::Sql => None,
+            NativeResponse::Sql => Some(
+                super::presentation::headers(super::presentation::snapshot_from_request(
+                    controls, priority,
+                )?)
+                .map_err(|_| super::presentation::invalid())?,
+            ),
             NativeResponse::Jaeger => Some(jaeger_headers(controls)?),
             NativeResponse::Shard => Some(unestimated_headers(controls, priority)?),
         };
@@ -537,8 +580,12 @@ where
         match headers {
             Some(headers) => match result {
                 Ok(mut response) => {
-                    for (name, value) in headers {
-                        response.headers_mut().insert(name, value);
+                    if response.status() != axum::http::StatusCode::ACCEPTED
+                        && !response.headers().contains_key("x-siglake-query-controls")
+                    {
+                        for (name, value) in headers {
+                            response.headers_mut().insert(name, value);
+                        }
                     }
                     Ok(response)
                 }
@@ -715,6 +762,7 @@ pub(crate) async fn body_scope<F: Future>(controls: RequestControls, future: F) 
 pub(crate) fn test_controls(budget: Duration) -> RequestControls {
     RequestControls {
         started: Instant::now(),
+        priority: Priority::Interactive,
         deadline: tokio::time::Instant::now() + budget,
         timeout: budget,
         state: PolicyState::Inherited,

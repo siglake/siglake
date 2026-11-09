@@ -274,7 +274,7 @@ pub struct AppState {
     pub audit: Option<AuditWriter>,
     /// Opt-in observation; the source never owns a collector/runtime task.
     pub history: Option<history::HistoryObserverSource>,
-    /// Injection-only partial controls. Never activated by main/environment.
+    /// Optional explicit controls authority; disabled creates no policy connection.
     pub(crate) query_controls: Option<Arc<query_controls::ControlsAuthority>>,
     /// Per-request tenant routing. `None` ⇒ every request routes
     /// through `ice` (the v0 single-tenant behavior).
@@ -414,10 +414,9 @@ impl AppState {
         self
     }
 
-    /// Local/test server-side injection only. Captures validated operator timeout
-    /// settings; configure limits before calling. Unsupported lifetimes fail
-    /// closed until job/Jaeger/shard gates are implemented and reviewed.
-    /// No env/CLI/main activation or successful enforcement labels are provided.
+    /// Explicit server-side injection. Captures validated operator timeouts;
+    /// configure limits first. Source CLI wiring is separately opt-in; this
+    /// constructor neither provisions schema/roles nor activates a deployment.
     pub fn with_query_controls(
         mut self,
         reader: Arc<query_controls::PolicyReader>,
@@ -431,7 +430,7 @@ impl AppState {
         Ok(self)
     }
 
-    /// Explicit injection-only wirev2 configuration. Configure limits first.
+    /// Explicit wirev2 configuration. Configure limits first.
     /// The skew bound is an operator assumption, not measured synchronization.
     pub fn with_distributed_query_controls(
         mut self,
@@ -676,6 +675,7 @@ fn api_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(debug_routes::memory_pool))
         .routes(routes!(sql::handle))
         .routes(routes!(sql::explain))
+        .routes(routes!(query_controls::effective::get))
         // Distributed query (#7): `/api/v1/sql` coordinates transparently when
         // peers are configured; `/local` always runs single-pod (the preserved
         // pre-distribution behavior); `/distributed` forces coordination;
@@ -1332,6 +1332,7 @@ pub fn spawn_query_cache_warmer(ice: Arc<IcebergContext>) {
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     spawn_hot_cache_refresher(&state);
     let jobs = state.jobs.clone();
+    let controls = state.query_controls.clone();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -1343,11 +1344,20 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
         tls = false,
         "siglake-query-server listening"
     );
+    let stopping = controls.clone();
     let serve_result = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(c) = stopping {
+                c.stop_admissions();
+            }
+        })
         .await;
     tracing::info!("siglake-query-server stopped accepting connections");
     shutdown_jobs(&jobs).await;
+    if let Some(controls) = controls {
+        controls.shutdown().await;
+    }
     serve_result.context("axum::serve")
 }
 
@@ -1402,6 +1412,7 @@ async fn shutdown_signal() {
 pub async fn serve_tls(addr: SocketAddr, state: AppState, tls: TlsConfig) -> Result<()> {
     spawn_hot_cache_refresher(&state);
     let jobs = state.jobs.clone();
+    let controls = state.query_controls.clone();
     // axum-server's `from_pem_file` uses rustls which requires a
     // crypto provider installed in the process. Install aws-lc-rs
     // (the one we already pull in transitively via sqlx) if no
@@ -1430,8 +1441,12 @@ pub async fn serve_tls(addr: SocketAddr, state: AppState, tls: TlsConfig) -> Res
     );
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
+    let stopping = controls.clone();
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
+        if let Some(c) = stopping {
+            c.stop_admissions();
+        }
         shutdown_handle.graceful_shutdown(None);
     });
     let serve_result = axum_server::bind_rustls(addr, rustls_config)
@@ -1439,7 +1454,11 @@ pub async fn serve_tls(addr: SocketAddr, state: AppState, tls: TlsConfig) -> Res
         .serve(router(state).into_make_service())
         .await;
     signal_task.abort();
+    let _ = signal_task.await;
     shutdown_jobs(&jobs).await;
+    if let Some(controls) = controls {
+        controls.shutdown().await;
+    }
     serve_result.context("axum_server::serve")
 }
 

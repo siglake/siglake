@@ -1,16 +1,19 @@
-//! Policy store and injection-only request/job authority. No env/main
-//! activation. Public job snapshots are explanatory. Supplied metadata constructors
+//! Policy store and optional explicit request/job authority. Public job snapshots
+//! are explanatory. Supplied metadata constructors
 //! are NOT authentication proof; runtime derives keys from verified identity.
 mod audit;
 pub use audit::*;
 pub(crate) mod body;
 mod config;
 mod dto;
+pub(crate) mod effective;
 pub(crate) mod job_tasks;
 pub(crate) mod jobs;
 mod owned;
+pub(crate) mod presentation;
 mod role;
 pub(crate) mod runtime;
+pub mod startup;
 pub(crate) mod wire;
 pub use wire::DistributedControlsConfig;
 mod store;

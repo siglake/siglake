@@ -75,10 +75,21 @@ pub(super) async fn post(base: &str, token: &str, route: &str, body: Value) -> r
 async fn status(base: &str, token: &str, route: &str, body: Value, expected: StatusCode) -> Value {
     let response = post(base, token, route, body).await;
     assert_eq!(response.status(), expected);
-    assert!(!response.headers().contains_key("x-siglake-query-controls"));
-    assert!(!response.headers().contains_key("x-siglake-query-warnings"));
+    // 5C adds response-only presentation; retain all original status/authority
+    // oracles and independently bound any newly resolved snapshot.
+    let header = response.headers().get("x-siglake-query-controls").cloned();
+    if let Some(h) = &header {
+        assert!(h.as_bytes().is_ascii() && h.as_bytes().len() <= 1024);
+    }
+    if let Some(h) = response.headers().get("x-siglake-query-warnings") {
+        assert!(h.as_bytes().is_ascii() && h.as_bytes().len() <= 512);
+    }
     let value: Value = response.json().await.unwrap();
-    assert!(value.get("controls").is_none());
+    if let Some(c) = value.get("controls") {
+        assert_eq!(c["version"], 1);
+        assert!(serde_json::to_vec(c).unwrap().len() <= 4096);
+        assert!(header.is_some());
+    }
     value
 }
 fn cache_counts(s: &Snapshotter) -> std::collections::HashMap<String, u64> {
@@ -465,8 +476,10 @@ async fn real_signed_primary_buffered_cache_planning_delegation_and_coverage_gua
             .filter(|line| !line.is_empty())
             .map(|line| serde_json::from_slice(line).unwrap())
             .collect();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["raw"], "synthetic-row");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["_meta"], "controls");
+        assert_eq!(rows[1]["raw"], "synthetic-row");
+        assert_eq!(rows[2]["_meta"], "complete");
     }
     // Real authenticated Axum route + PG primary, with a body the transport
     // NEVER polls. The primary lock spends 700ms of the ORIGINAL 1s budget.

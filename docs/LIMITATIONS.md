@@ -63,14 +63,18 @@ in [`ARCHITECTURE.md`](ARCHITECTURE.md).
   refused and takes the ordinary plan. The qualification protocol is in
   [`DESIGN_numeric_topk.md`](DESIGN_numeric_topk.md) and `SIGLAKE_NUMERIC_TOPK=0`
   turns the route off at process startup.
-- **Query controls remain injection-only and incomplete.** Ordinary external
-  SQL shards now resolve their own fresh primary controls and retain the original
-  deadline through Arrow/body production. Configured coordinator-authenticated
-  shards still refuse before work: trusted controlled wire/fanout/expiry/skew is
-  not implemented. No production activation or global Arrow output/scan-byte cap
-  is implied. Native library work is cooperative, not OS-preempted; synchronous
-  Drop is abort-only, not joined cleanup. See
-  [the bounded slice 4A contract](query-controls-shard-arrow.md).
+- **Query controls have optional source wiring, not production activation.**
+  The dedicated query server can explicitly configure a primary reader, finite
+  operator bounds and (for controlled wire-v2 fanout) a clock-skew assumption.
+  Caller-only effective defaults and bounded records/planning/NDJSON metadata do
+  not preview another credential or future worker/caller overlays. Scan warning
+  thresholds are not hard actual-byte budgets; distributed NDJSON and Arrow
+  fragments have no universal output-cap claim. Native work is cooperative, not
+  OS-preempted; final Drop remains abort-only and delivery is not guaranteed.
+  Manual schema/roles, TLS/operator/fleet qualification, exact-head integration
+  and customer rollout remain separate gates. Offline `siglake query` is outside
+  the authenticated engine-API enforcement claim. See the
+  [runtime surface and remaining gates](query-controls-runtime-surface.md).
 - **The persistent ingest lane cap has no timed reclamation.** Once
   `ingester.maxLanes` admits a `(tenant, index)` lane, an empty queue does not
   release its slot; only process shutdown drains the map. A novel key past the

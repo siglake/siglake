@@ -687,10 +687,30 @@ pub(crate) fn records_response(
     status: axum::http::StatusCode,
     body: std::sync::Arc<RecordsResponse>,
 ) -> axum::response::Response {
+    records_response_with_cap(status, body, None)
+}
+pub(crate) fn records_response_with_cap(
+    status: axum::http::StatusCode,
+    body: std::sync::Arc<RecordsResponse>,
+    cap: Option<usize>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if crate::query_controls::runtime::current().is_none() {
+    let Some(current) = crate::query_controls::runtime::current() else {
         return (status, axum::Json(body.as_ref())).into_response();
-    }
+    };
+    let dto = match crate::query_controls::presentation::snapshot(
+        body.cost.as_ref(),
+        current.priority,
+        false,
+        cap,
+    ) {
+        Ok(Some(dto)) => dto,
+        _ => return crate::query_controls::presentation::invalid().into_response(),
+    };
+    let encoded = match dto.json() {
+        Ok(bytes) => bytes,
+        Err(_) => return crate::query_controls::presentation::invalid().into_response(),
+    };
     let stream = async_stream::try_stream! {
         yield Bytes::from_static(b"{\"columns\":");
         yield checked_json(&body.columns)?;
@@ -709,16 +729,22 @@ pub(crate) fn records_response(
         if let Some(stats) = &body.stats { yield Bytes::from_static(b",\"stats\":"); yield checked_json(stats)?; }
         if let Some(approximation) = &body.approximation { yield Bytes::from_static(b",\"approximation\":"); yield checked_json(approximation)?; }
         crate::query_controls::runtime::render_check()?;
+        yield Bytes::from_static(b",\"controls\":");
+        yield Bytes::from(encoded);
         yield Bytes::from_static(b"}");
     };
-    (
+    let mut response = (
         status,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
         axum::body::Body::from_stream(
             Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>
         ),
     )
-        .into_response()
+        .into_response();
+    if let Err(error) = crate::query_controls::presentation::attach(&mut response, dto) {
+        return error.into_response();
+    }
+    response
 }
 /// Already-buffered nonfanout metadata rows, encoded one at a time. History
 /// success stays deferred until the OUTER body consumes EOF.
@@ -732,7 +758,11 @@ pub(crate) fn records_ndjson_body(body: RecordsResponse, no_data_scan: bool) -> 
             yield checked_json(row)?;
             yield Bytes::from_static(b"\n");
         }
-        if let Some(o) = &mut observation { o.complete(rows.len(), false, None, None); }
+        if let Some(o) = &mut observation { o.complete(rows.len(), body.truncated, None, None); }
+        if crate::query_controls::runtime::current().is_some() {
+            crate::query_controls::runtime::render_check()?;
+            yield if body.truncated { make_truncation_marker(rows.len(), body.max_rows.unwrap_or(rows.len())) } else { complete_marker(rows.len()) };
+        }
     };
     axum::body::Body::from_stream(
         Box::pin(stream) as std::pin::Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>
@@ -971,16 +1001,18 @@ pub(crate) fn rendered_ndjson_body(
     no_data_scan: bool,
 ) -> axum::body::Body {
     let observation = crate::history::streaming::rendered_observation(no_data_scan);
-    if observation.is_none() {
+    if observation.is_none() && crate::query_controls::runtime::current().is_none() {
         return axum::body::Body::from(payload);
     }
     axum::body::Body::from_stream(RenderedNdjsonStream {
         payload: Some(Bytes::from(payload)),
         rows,
         observation,
+        controlled: crate::query_controls::runtime::current().is_some(),
     })
 }
 struct RenderedNdjsonStream {
+    controlled: bool,
     payload: Option<Bytes>,
     rows: usize,
     observation: Option<crate::history::streaming::StreamObservation>,
@@ -994,6 +1026,13 @@ impl Stream for RenderedNdjsonStream {
         let rows = self.rows;
         if let Some(o) = &mut self.observation {
             o.complete(rows, false, None, None);
+        }
+        if self.controlled {
+            self.controlled = false;
+            if let Err(e) = crate::query_controls::runtime::render_check() {
+                return Poll::Ready(Some(Err(e)));
+            }
+            return Poll::Ready(Some(Ok(complete_marker(rows))));
         }
         Poll::Ready(None)
     }
@@ -1025,6 +1064,7 @@ pub struct NdjsonStream {
     finished: bool,
     trailer: Option<Bytes>,
     pending_batch: Option<(DfRecordBatch, usize, bool)>,
+    controlled: bool,
     history: Option<(
         crate::history::streaming::StreamObservation,
         std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
@@ -1044,6 +1084,7 @@ impl NdjsonStream {
             trailer: None,
             history: None,
             pending_batch: None,
+            controlled: crate::query_controls::runtime::current().is_some(),
         }
     }
 
@@ -1117,7 +1158,14 @@ impl Stream for NdjsonStream {
             None => {
                 self.finished = true;
                 self.complete_history(false);
-                Poll::Ready(None)
+                if self.controlled {
+                    if let Err(e) = crate::query_controls::runtime::render_check() {
+                        return Poll::Ready(Some(Err(e)));
+                    }
+                    Poll::Ready(Some(Ok(complete_marker(self.rows_emitted))))
+                } else {
+                    Poll::Ready(None)
+                }
             }
             Some(Err(e)) => {
                 self.finished = true;
@@ -1223,6 +1271,11 @@ fn render_batch_ndjson(batch: &DfRecordBatch) -> Result<Bytes> {
     Ok(Bytes::from(buf))
 }
 
+pub(crate) fn complete_marker(rows: usize) -> Bytes {
+    Bytes::from(format!(
+        "{{\"_meta\":\"complete\",\"row_count\":{rows},\"truncated\":false}}\n"
+    ))
+}
 fn make_truncation_marker(rows_emitted: usize, max_rows: usize) -> Bytes {
     let line = serde_json::json!({
         "_meta": "truncated",
@@ -1788,12 +1841,26 @@ mod controlled_render_tests {
             let bytes = axum::body::to_bytes(response.into_body(), 1024)
                 .await
                 .unwrap();
-            assert_eq!(bytes, expected_bytes);
+            let mut actual_value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let controls = actual_value
+                .as_object_mut()
+                .unwrap()
+                .remove("controls")
+                .unwrap();
+            assert_eq!(controls["version"], 1);
+            assert_eq!(controls["estimate_status"], "unavailable");
+            assert!(serde_json::to_vec(&controls).unwrap().len() <= 4096);
+            assert_eq!(
+                actual_value,
+                serde_json::from_slice::<serde_json::Value>(&expected_bytes).unwrap()
+            );
             let expected_ndjson = b"{\"v\":\"quoted\\\"\\\\\\n\"}\n{}\n";
             let bytes = axum::body::to_bytes(records_ndjson_body(expected, false), 1024)
                 .await
                 .unwrap();
-            assert_eq!(&bytes[..], expected_ndjson);
+            let mut with_terminal = expected_ndjson.to_vec();
+            with_terminal.extend_from_slice(&make_truncation_marker(2, 2));
+            assert_eq!(&bytes[..], with_terminal);
         })
         .await;
     }
@@ -1846,6 +1913,9 @@ mod controlled_render_tests {
                     bytes
                 })
                 .await;
+                if cap == 3 && scan_cap.is_none() {
+                    expected.extend_from_slice(&complete_marker(3));
+                }
                 assert_eq!(actual, expected);
             }
         }

@@ -242,6 +242,7 @@ fn retained_heap_bytes_tracks_the_allocator() {
         response.cost = Some(CostReport {
             files_to_scan: Some(12),
             estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: Some(40),
             estimated_bytes_scanned: 1 << 20,
             estimated_rows_processed: 4096,

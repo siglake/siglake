@@ -306,6 +306,7 @@ where
     .ok_or_else(expired)?;
     let budget = Duration::from_millis(remaining as u64);
     let controls = RequestControls {
+        priority: context.priority(),
         started,
         deadline: tokio::time::Instant::from_std(
             started.checked_add(budget).ok_or_else(unsupported)?,

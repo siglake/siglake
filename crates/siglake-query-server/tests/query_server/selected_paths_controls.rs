@@ -189,6 +189,8 @@ async fn signed_selected_paths_priority_format_dry_run_history_and_original_cloc
                     } else {
                         format
                     };
+                    let controls_header =
+                        response.headers().get("x-siglake-query-controls").cloned();
                     let bytes = response.bytes().await.unwrap();
                     if durable {
                         let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -199,6 +201,9 @@ async fn signed_selected_paths_priority_format_dry_run_history_and_original_cloc
                         let body: Value = serde_json::from_slice(&bytes).unwrap();
                         assert!(body.get("estimated_bytes_scanned").is_some());
                         assert!(body.get("job_id").is_none());
+                        assert_eq!(body["controls"]["mode"], "planning");
+                        assert_eq!(body["controls"]["effective_timeout_ms"], 1000);
+                        assert!(controls_header.is_some());
                     } else if selected_format == "ndjson" {
                         let lines: Vec<Value> = bytes
                             .split(|b| *b == b'\n')
@@ -206,10 +211,20 @@ async fn signed_selected_paths_priority_format_dry_run_history_and_original_cloc
                             .map(|b| serde_json::from_slice(b).unwrap())
                             .collect();
                         assert!(!lines.is_empty());
+                        assert_eq!(lines[0]["_meta"], "controls");
+                        assert_eq!(lines[0]["controls"]["effective_timeout_ms"], 1000);
+                        assert_eq!(lines.last().unwrap()["_meta"], "complete");
+                        assert!(controls_header.is_some());
+                        if shape == "fanout" {
+                            assert_eq!(lines[0]["controls"]["output_cap_enforced"], false);
+                        }
                     } else {
                         let body: Value = serde_json::from_slice(&bytes).unwrap();
                         assert_eq!(body["row_count"], 1);
                         assert!(body.get("job_id").is_none());
+                        assert_eq!(body["controls"]["effective_timeout_ms"], 1000);
+                        assert_eq!(body["controls"]["priority"], priority);
+                        assert!(controls_header.is_some());
                         if shape == "tier1" {
                             assert_eq!(
                                 body["stats"]["phases"]["distributed"]["mode"],

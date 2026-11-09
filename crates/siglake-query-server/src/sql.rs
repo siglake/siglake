@@ -5736,7 +5736,7 @@ async fn handle_local_inner(
     let mut execute_elapsed = std::time::Duration::ZERO;
     let result = if req.dry_run {
         history_buffered::planned();
-        Ok((StatusCode::OK, Json(cost.clone())).into_response())
+        crate::query_controls::presentation::planning_response(cost.clone(), req.priority)
     } else {
         let execute_started = Instant::now();
         let result = execute_with_limits(
@@ -7368,7 +7368,7 @@ async fn explain_inner(
     history_buffered::cost(&cost);
     history_buffered::admit();
     history_buffered::planned();
-    Ok((StatusCode::OK, Json(cost)).into_response())
+    crate::query_controls::presentation::planning_response(cost, req.priority)
 }
 
 #[derive(Debug, Clone)]
@@ -7630,17 +7630,17 @@ fn try_count_fast_path_response(
                     row_count: 1,
                     truncated: false,
                     max_rows: None,
-                    cost: None,
+                    cost: Some(cost),
                     stats: None,
                     approximation: None,
                 };
-                return Ok(Some(
-                    (
-                        [(header::CONTENT_TYPE, "application/x-ndjson")],
-                        crate::format::records_ndjson_body(body, true),
-                    )
-                        .into_response(),
-                ));
+                let cost = body.cost.clone();
+                return Ok(Some(crate::query_controls::presentation::ndjson_response(
+                    crate::format::records_ndjson_body(body, true),
+                    cost.as_ref(),
+                    crate::query_controls::runtime::current().unwrap().priority,
+                    None,
+                )?));
             }
             let line = serde_json::to_vec(&row).map_err(ApiError::internal)?;
             let mut resp = Response::new(crate::format::rendered_ndjson_body(
@@ -8828,13 +8828,13 @@ async fn try_group_count_fast_path_response_with_bindings(
         ))),
         QueryFormat::Ndjson => {
             if crate::query_controls::runtime::current().is_some() {
-                return Ok(Some(
-                    (
-                        [(header::CONTENT_TYPE, "application/x-ndjson")],
-                        crate::format::records_ndjson_body(body, false),
-                    )
-                        .into_response(),
-                ));
+                let cost = body.cost.clone();
+                return Ok(Some(crate::query_controls::presentation::ndjson_response(
+                    crate::format::records_ndjson_body(body, false),
+                    cost.as_ref(),
+                    crate::query_controls::runtime::current().unwrap().priority,
+                    None,
+                )?));
             }
             let rows = body.rows.as_array().ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!("group fast path rows must be an array"))
@@ -9511,13 +9511,13 @@ async fn try_date_histogram_fast_path_response(
         ))),
         QueryFormat::Ndjson => {
             if crate::query_controls::runtime::current().is_some() {
-                return Ok(Some(
-                    (
-                        [(header::CONTENT_TYPE, "application/x-ndjson")],
-                        crate::format::records_ndjson_body(body, false),
-                    )
-                        .into_response(),
-                ));
+                let cost = body.cost.clone();
+                return Ok(Some(crate::query_controls::presentation::ndjson_response(
+                    crate::format::records_ndjson_body(body, false),
+                    cost.as_ref(),
+                    crate::query_controls::runtime::current().unwrap().priority,
+                    None,
+                )?));
             }
             let rows = body.rows.as_array().ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!(
@@ -11911,7 +11911,9 @@ async fn execute_with_limits(
             }
             // Ndjson hands the guard to the body; Records keeps it in this
             // scope, where it covers the collect and fires on the timeout.
-            QueryFormat::Ndjson => render_ndjson(df, &resolved_inner, admission, cancel).await,
+            QueryFormat::Ndjson => {
+                render_ndjson(df, &resolved_inner, &cost, admission, cancel).await
+            }
         }
     };
     apply_timeout(inner, resolved, &cost_for_timeout, deadline, started).await
@@ -12270,7 +12272,9 @@ async fn render_records(
     // encodes the body eagerly, so its cost is inside the handler's `total_ms`
     // and has to be named here to be named at all (#7456).
     let serialize_started = Instant::now();
-    let mut response = crate::format::records_response(status, Arc::clone(&body));
+    let mut response = crate::format::records_response_with_cap(
+        status, Arc::clone(&body), Some(resolved.max_rows_returned),
+    );
     set_result_cache_header(&mut response, cache_outcome);
     let serialize_elapsed = serialize_started.elapsed();
     tracing::info!(
@@ -12301,6 +12305,7 @@ async fn render_records(
 async fn render_ndjson(
     df: DataFrame,
     resolved: &ResolvedLimits,
+    cost: &CostReport,
     admission: Option<crate::admission::AdmissionGuard>,
     cancel: Option<siglake_storage::CancelOnDrop>,
 ) -> Result<Response, ApiError> {
@@ -12323,13 +12328,12 @@ async fn render_ndjson(
         _cancel: cancel,
         inner: ndjson,
     });
-    let mut resp = Response::new(body);
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/x-ndjson"),
-    );
-    *resp.status_mut() = StatusCode::OK;
-    Ok(resp)
+    crate::query_controls::presentation::ndjson_response(
+        body,
+        Some(cost),
+        resolved.priority,
+        Some(resolved.max_rows_returned),
+    )
 }
 
 fn record_metrics(
@@ -13782,6 +13786,7 @@ mod tests {
         let base = CostReport {
             files_to_scan: Some(2),
             estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: None,
             estimated_bytes_scanned: 1024,
             estimated_rows_processed: 500,
@@ -20175,13 +20180,12 @@ async fn distributed_inner(
                 // Already-buffered coordinator payload: transfer delivery
                 // ownership without parsing/copying it or inventing scan data.
                 let rows = batches.iter().map(|batch| batch.num_rows()).sum();
-                let mut resp =
-                    Response::new(crate::format::rendered_ndjson_body(body, rows, false));
-                resp.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/x-ndjson"),
-                );
-                Ok(resp)
+                crate::query_controls::presentation::ndjson_response(
+                    crate::format::rendered_ndjson_body(body, rows, false),
+                    Some(&cost),
+                    resolved.priority,
+                    None,
+                )
             }
             QueryFormat::Records => {
                 let render_started = Instant::now();
@@ -20247,7 +20251,11 @@ async fn distributed_inner(
                     .saturating_add(merge_micros);
                 phases.execution_micros = Some(execution_micros);
                 phases.other_micros = Some(execution_remainder(execution_micros, named_micros));
-                Ok((StatusCode::OK, Json(body)).into_response())
+                Ok(crate::format::records_response_with_cap(
+                    StatusCode::OK,
+                    Arc::new(body),
+                    Some(resolved.max_rows_returned),
+                ))
             }
         }
     }
@@ -21504,6 +21512,7 @@ mod batch_lifecycle_tests {
         CostReport {
             files_to_scan: Some(1),
             estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: Some(1),
             estimated_bytes_scanned: 4096,
             estimated_rows_processed: 10,

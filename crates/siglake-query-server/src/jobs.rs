@@ -3005,6 +3005,7 @@ mod cancellation_tests {
         CostReport {
             files_to_scan: Some(1),
             estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: Some(1),
             estimated_bytes_scanned: 1,
             estimated_rows_processed: 1,
