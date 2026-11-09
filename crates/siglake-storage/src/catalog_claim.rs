@@ -2008,12 +2008,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mode, "wal");
-        sqlx::query("CREATE TABLE sqlite_patch_probe (value INTEGER NOT NULL)")
+        sqlx::query("CREATE TABLE binding_patch_probe (value INTEGER NOT NULL)")
             .execute(&claim.pool)
             .await
             .unwrap();
         let exact = 9_007_199_254_741_791_i64;
-        sqlx::query("INSERT INTO sqlite_patch_probe (value) VALUES (?)")
+        sqlx::query("INSERT INTO binding_patch_probe (value) VALUES (?)")
             .bind(exact)
             .execute(&claim.pool)
             .await
@@ -2023,7 +2023,7 @@ mod tests {
         let reopened = SqlSegmentClaim::connect(&uri, "patched-reopen")
             .await
             .unwrap();
-        let value: i64 = sqlx::query_scalar("SELECT value FROM sqlite_patch_probe")
+        let value: i64 = sqlx::query_scalar("SELECT value FROM binding_patch_probe")
             .fetch_one(&reopened.pool)
             .await
             .unwrap();
