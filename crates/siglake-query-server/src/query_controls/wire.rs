@@ -344,4 +344,6 @@ where
 #[cfg(test)]
 mod owned_tests;
 #[cfg(test)]
+mod redirect_tests;
+#[cfg(test)]
 mod tests;

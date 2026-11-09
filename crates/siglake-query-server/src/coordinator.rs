@@ -183,16 +183,27 @@ impl HttpShardRunner {
             // 2.4s). Healthy intra-VPC connects are sub-ms; 250ms is
             // generous. Legacy v1 has no overall timeout; explicitly controlled
             // v2 below covers send, response pumping and decode by original expiry.
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_millis(250))
-                .build()
-                .expect("reqwest client"),
+            client: Self::http_client(false),
             peers,
             auth,
             pin: None,
             tenant: None,
             controls: None,
         }
+    }
+
+    fn http_client(controlled: bool) -> reqwest::Client {
+        let builder =
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(250));
+        // A redirect can resend authenticated POST/body to permissive v1 before
+        // any final-URL check. Only controlled transport forbids all redirects;
+        // retain the existing TLS/proxy/connect defaults and legacy behavior.
+        let builder = if controlled {
+            builder.redirect(reqwest::redirect::Policy::none())
+        } else {
+            builder
+        };
+        builder.build().expect("reqwest client")
     }
 
     /// Forward `tenant` (the original caller's) on every shard request.
@@ -217,6 +228,9 @@ impl HttpShardRunner {
         mut self,
         controls: Option<crate::query_controls::wire::Dispatch>,
     ) -> Self {
+        if controls.is_some() != self.controls.is_some() {
+            self.client = Self::http_client(controls.is_some());
+        }
         self.controls = controls;
         self
     }
@@ -433,6 +447,13 @@ impl HttpShardRunner {
         // single-node deployment would — `error_for_status()` erases it, which
         // surfaced every breaker 413 to clients as an opaque 500.
         let status = resp.status();
+        if self.controls.is_some() && status.is_redirection() {
+            // 3xx is not rejected by error_for_status. Refuse before Arrow/body
+            // handling; never expose Location or classify this as retryable.
+            return Err(controlled_shard_error(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
         if !status.is_success() {
             let body = if self.controls.is_some() {
                 // Do not reflect private context or arbitrary remote diagnostics.
