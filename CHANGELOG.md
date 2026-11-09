@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- **Attribute lookup performance:** JSON string scanning uses vectorized quote
+  and escape search. Dotted-key precedence and lookup results are unchanged.
+  Further reductions in repeated object traversal are under investigation;
+  no general query speedup is claimed.
+
+- **WAL fallback diagnostics:** committed-only query fallbacks record the
+  stage and reason in a bounded-label counter and a matching tracing event.
+  This makes the existing fallback observable; it does not change freshness
+  behavior or resolve the previously reported omitted-WARN incident. See
+  [the attribution contract](docs/DESIGN_wal_committed_only_attribution.md).
+
+- **Dependency security:** update Parquet to 58.4.1 and Thrift to 0.23.0 to
+  address the Thrift allocation advisory.
+
 ## 0.4.0
 
 - **Query correctness and bounded fallback:** empty records responses retain
