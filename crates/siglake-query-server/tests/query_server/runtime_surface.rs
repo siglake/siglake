@@ -10,6 +10,38 @@ use siglake_storage::iceberg::IcebergContext;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use uuid::Uuid;
 
+// Snapshotter counters use swap(0), so a snapshot immediately before a
+// request drains prior activity; the next snapshot is that request's delta.
+fn cache_metrics() -> &'static metrics_util::debugging::Snapshotter {
+    static METRICS: std::sync::OnceLock<metrics_util::debugging::Snapshotter> =
+        std::sync::OnceLock::new();
+    METRICS.get_or_init(|| {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::set_global_recorder(recorder).unwrap();
+        snapshotter
+    })
+}
+fn cache_counter_window() -> std::collections::HashMap<String, u64> {
+    let mut counters = std::collections::HashMap::new();
+    for (key, _, _, value) in cache_metrics().snapshot().into_vec() {
+        if key.key().name() == "siglake_query_sql_result_cache_requests_total" {
+            if let (Some(outcome), metrics_util::debugging::DebugValue::Counter(n)) =
+                (key.key().labels().find(|l| l.key() == "outcome"), value)
+            {
+                *counters.entry(outcome.value().to_owned()).or_default() += n;
+            }
+        }
+    }
+    counters
+}
+fn assert_cache_delta(expected: &str) {
+    let delta = cache_counter_window();
+    assert_eq!(delta.get(expected).copied().unwrap_or(0), 1, "{delta:?}");
+    let other = if expected == "hit" { "miss" } else { "hit" };
+    assert_eq!(delta.get(other).copied().unwrap_or(0), 0, "{delta:?}");
+}
+
 async fn effective(base: &str, token: &str, suffix: &str) -> (StatusCode, Value) {
     let response = reqwest::Client::new()
         .get(format!("{base}/api/v1/query-controls/effective{suffix}"))
@@ -42,9 +74,7 @@ async fn effective(base: &str, token: &str, suffix: &str) -> (StatusCode, Value)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "owned synthetic primary/JWT/STDIO fixture; check-runtime-surface.sh"]
 async fn caller_effective_formats_primary_readiness_and_actual_stdio() {
-    let recorder = metrics_util::debugging::DebuggingRecorder::new();
-    let metrics = recorder.snapshotter();
-    metrics::set_global_recorder(recorder).unwrap();
+    cache_metrics();
     let (socket, admin) = fixture().await;
     let manager = PolicyManager::connect(policy_config(&socket, false))
         .await
@@ -206,8 +236,9 @@ async fn caller_effective_formats_primary_readiness_and_actual_stdio() {
         assert_eq!(lines[1]["n"], 1);
         assert_eq!(lines.last().unwrap()["_meta"], "complete");
     }
-    // Same tenant/result controls, distinct verified binding: a shared payload
-    // hit still carries the NEW caller's freshly read primary snapshot.
+    // Different revisions are different cache keys even with compatible caps.
+    // Prove the new caller's primary revision/key isolation first; only a
+    // subsequent matching-key request may claim an observed cache hit.
     ice.for_namespace("tenant_acme")
         .await
         .unwrap()
@@ -216,6 +247,7 @@ async fn caller_effective_formats_primary_readiness_and_actual_stdio() {
         .unwrap();
     siglake_query_server::reset_result_cache_for_test().await;
     let cache_query = json!({"query":"SELECT raw FROM events WHERE host = 'localhost' LIMIT 10", "default_order":false});
+    cache_counter_window();
     let response = post(
         &s.base,
         &credential,
@@ -225,6 +257,8 @@ async fn caller_effective_formats_primary_readiness_and_actual_stdio() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let first: Value = response.json().await.unwrap();
+    assert_eq!(first["controls"]["policy_revision"], 2);
+    assert_cache_delta("miss");
     let next_binding = ManagementBinding::from_trusted_metadata(
         RuntimeKey::from_trusted_metadata("acme", &issuer, "new-cache-client").unwrap(),
         Uuid::new_v4(),
@@ -247,28 +281,40 @@ async fn caller_effective_formats_primary_readiness_and_actual_stdio() {
         )
         .await
         .unwrap();
+    manager
+        .save(
+            &next_binding,
+            &actor,
+            SaveRequest::new(2, SavedSettings::new(Some(2), Some(1)).unwrap()).unwrap(),
+        )
+        .await
+        .unwrap();
     let next_token = token(&issuer, "acme", "new-cache-client");
-    let response = post(&s.base, &next_token, "/api/v1/sql/local", cache_query).await;
+    cache_counter_window();
+    let response = post(
+        &s.base,
+        &next_token,
+        "/api/v1/sql/local",
+        cache_query.clone(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let second: Value = response.json().await.unwrap();
     assert_eq!(first["rows"], second["rows"]);
-    assert_eq!(second["controls"]["policy_revision"], 2);
+    assert_eq!(second["controls"]["policy_revision"], 3);
     assert_eq!(second["controls"]["effective_timeout_ms"], 2000);
-    assert!(
-        metrics
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .any(|(key, _, _, value)| {
-                key.key().name() == "siglake_query_sql_result_cache_requests_total"
-                    && key
-                        .key()
-                        .labels()
-                        .any(|label| label.key() == "outcome" && label.value() == "hit")
-                    && matches!(value, metrics_util::debugging::DebugValue::Counter(n) if n > 0)
-            }),
-        "expected independently observed fresh-caller cache hit"
-    );
+    assert_cache_delta("miss");
+    cache_counter_window();
+    let response = post(&s.base, &next_token, "/api/v1/sql/local", cache_query).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let hit: Value = response.json().await.unwrap();
+    assert_eq!(hit["rows"], second["rows"]);
+    assert_eq!(hit["controls"]["policy_revision"], 3);
+    assert_cache_delta("hit");
+    // Equal revision/timeout values on this matching key alone cannot
+    // observationally distinguish fresh encoding from cached metadata. The
+    // private cache unit test proves structurally that the stored native
+    // payload contains no controls.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let python =
         std::env::var("SIGLAKE_SYNTHETIC_MCP_PYTHON").expect("explicit cached MCP Python required");
@@ -508,5 +554,165 @@ async fn optional_binary_startup_valid_and_fail_closed_secret_canaries() {
         .unwrap()
         .unwrap()
         .success());
+    admin.close().await;
+}
+
+async fn cap_fixture() -> (
+    Server,
+    Server,
+    Arc<PolicyReader>,
+    sqlx::PgPool,
+    tempfile::TempDir,
+) {
+    cache_metrics();
+    let (socket, admin) = fixture().await;
+    let reader = Arc::new(
+        PolicyReader::connect(policy_config(&socket, true))
+            .await
+            .unwrap(),
+    );
+    let (issuer, task) = spawn_fake_idp().await;
+    let idp = Server {
+        base: issuer.clone(),
+        task,
+        state: None,
+    };
+    let auth = AuthConfig::from_oidc(
+        OidcVerifier::from_cognito_access_issuer(issuer, "custom:org_id".into())
+            .await
+            .unwrap(),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let ice = Arc::new(IcebergContext::open(tmp.path()).await.unwrap());
+    let mut a = siglake_core::Event::now("cap-a");
+    a.host = "host-a".into();
+    let mut b = siglake_core::Event::now("cap-b");
+    b.host = "host-b".into();
+    ice.for_namespace("tenant_acme")
+        .await
+        .unwrap()
+        .append_events(&[a, b])
+        .await
+        .unwrap();
+    let mut limits = ServerLimits::default();
+    limits.interactive.default_timeout = Duration::from_secs(3);
+    limits.interactive.ceiling_timeout = Duration::from_secs(4);
+    let state = AppState::new(ice.clone(), auth)
+        .with_tenants(TenantRegistry::new(ice))
+        .with_limits(limits)
+        .with_query_controls(reader.clone(), 1)
+        .unwrap();
+    siglake_query_server::reset_result_cache_for_test().await;
+    (serve(state).await, idp, reader, admin, tmp)
+}
+async fn records_cap(response: reqwest::Response, rows: usize, cap: Option<usize>) {
+    assert_eq!(
+        response.status(),
+        if cap.is_some() {
+            StatusCode::PAYLOAD_TOO_LARGE
+        } else {
+            StatusCode::OK
+        }
+    );
+    let headers = response.headers().clone();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["row_count"], rows);
+    assert_eq!(body["rows"].as_array().unwrap().len(), rows);
+    let c = &body["controls"];
+    let h = headers["x-siglake-query-controls"].to_str().unwrap();
+    let expected_rows = cap.map(|n| n.to_string()).unwrap_or_else(|| "na".into());
+    println!("native_rows={rows} JSON={} header={h}", c);
+    assert_eq!(
+        c["effective_output_rows"],
+        serde_json::to_value(cap).unwrap()
+    );
+    assert_eq!(c["output_cap_enforced"], cap.is_some());
+    assert!(h.contains(&format!(
+        ";output_rows={expected_rows};output_enforced={};",
+        u8::from(cap.is_some())
+    )));
+    if cap.is_none() {
+        assert!(c["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("output_cap_unavailable")));
+        assert!(headers["x-siglake-query-warnings"]
+            .to_str()
+            .unwrap()
+            .split(',')
+            .any(|w| w == "output_cap_unavailable"));
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "owned primary/signed fixture; check-runtime-surface.sh"]
+async fn controlled_group_fast_path_miss_and_hit_do_not_attest_unclipped_cap() {
+    let (s, idp, reader, admin, _warehouse) = cap_fixture().await;
+    let jwt = token(&idp.base, "acme", "cap-client");
+    let query = json!({"query":"SELECT host, count(*) AS n FROM events GROUP BY host", "default_order":false, "limits":{"max_rows_returned":1}});
+    cache_counter_window();
+    let first = post(&s.base, &jwt, "/api/v1/sql/local", query.clone()).await;
+    records_cap(first, 2, None).await;
+    assert_cache_delta("miss");
+    cache_counter_window();
+    let second = post(&s.base, &jwt, "/api/v1/sql/local", query).await;
+    assert_cache_delta("hit");
+    records_cap(second, 2, None).await;
+    s.shutdown().await;
+    idp.shutdown().await;
+    reader.close();
+    admin.close().await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "owned primary/signed fixture; check-runtime-surface.sh"]
+async fn controlled_whole_count_zero_cap_does_not_attest_unclipped_cap() {
+    let (s, idp, reader, admin, _warehouse) = cap_fixture().await;
+    let jwt = token(&idp.base, "acme", "cap-client");
+    let response = post(
+        &s.base,
+        &jwt,
+        "/api/v1/sql/local",
+        json!({"query":"SELECT count(*) AS n FROM events", "limits":{"max_rows_returned":0}}),
+    )
+    .await;
+    records_cap(response, 1, None).await;
+    s.shutdown().await;
+    idp.shutdown().await;
+    reader.close();
+    admin.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "owned primary/signed fixture; check-runtime-surface.sh"]
+async fn controlled_selected_records_and_local_ndjson_clipping_remain_attested() {
+    let (s, idp, reader, admin, _warehouse) = cap_fixture().await;
+    let jwt = token(&idp.base, "acme", "cap-client");
+    let query = "SELECT 1 AS n UNION ALL SELECT 2 AS n";
+    let response = post(
+        &s.base,
+        &jwt,
+        "/api/v1/sql/local",
+        json!({"query":query,"default_order":false,"limits":{"max_rows_returned":1}}),
+    )
+    .await;
+    records_cap(response, 1, Some(1)).await;
+    let response = post(&s.base, &jwt, "/api/v1/sql/local", json!({"query":query,"default_order":false,"format":"ndjson","limits":{"max_rows_returned":1}})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()["x-siglake-query-controls"]
+        .to_str()
+        .unwrap()
+        .contains(";output_rows=1;output_enforced=1;"));
+    let text = response.text().await.unwrap();
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines[0]["_meta"], "controls");
+    assert_eq!(lines[0]["controls"]["effective_output_rows"], 1);
+    assert_eq!(lines[0]["controls"]["output_cap_enforced"], true);
+    assert_eq!(lines.iter().filter(|v| v.get("_meta").is_none()).count(), 1);
+    assert_eq!(lines.last().unwrap()["_meta"], "truncated");
+    s.shutdown().await;
+    idp.shutdown().await;
+    reader.close();
     admin.close().await;
 }

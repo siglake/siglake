@@ -3886,6 +3886,53 @@ mod result_cache_accounting_tests {
         );
     }
 
+    /// A private construction test, NOT an assertion that different controls
+    /// share a production key: cache_discriminator intentionally isolates them.
+    /// The store retains only native payload; response-scoped controls never
+    /// mutate it, even when the SAME Arc is rendered in different scopes.
+    #[tokio::test]
+    async fn cached_native_payload_never_retains_current_controls() {
+        use crate::query_controls::runtime::{body_scope, test_controls};
+        let stored = Arc::new(name_list(2));
+        let original = serde_json::to_value(stored.as_ref()).unwrap();
+        let mut cache = SqlResultCache::default();
+        cache.insert(
+            "private-structural-key".into(),
+            CachedSqlResult {
+                bytes: crate::format::retained_heap_bytes(&stored),
+                body: CachedBody::Records(stored.clone()),
+            },
+        );
+        for seconds in [2, 3] {
+            let hit = cache
+                .get("private-structural-key")
+                .unwrap()
+                .expect_records();
+            assert!(Arc::ptr_eq(&hit, &stored));
+            body_scope(
+                test_controls(std::time::Duration::from_secs(seconds)),
+                async {
+                    let response = crate::format::records_response(StatusCode::OK, hit);
+                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(value["controls"]["effective_timeout_ms"], seconds * 1000);
+                    assert_eq!(value["controls"]["output_cap_enforced"], false);
+                },
+            )
+            .await;
+            let native = cache
+                .get("private-structural-key")
+                .unwrap()
+                .expect_records();
+            let serialized = serde_json::to_value(native.as_ref()).unwrap();
+            assert_eq!(serialized, original);
+            assert!(serialized.get("controls").is_none());
+            assert!(Arc::ptr_eq(&native, &stored));
+        }
+    }
+
     /// THE FIFO DEFECT (#2452). A hit used to leave the key at its insertion
     /// position, so the next insert evicted a hot key before an older un-hit
     /// one. A hit now promotes the key while keeping stale recency markers
@@ -5044,6 +5091,8 @@ async fn handle_local_inner(
             } else {
                 StatusCode::OK
             };
+            // Native cache entries include unclipped fast paths; no selected
+            // clipping provenance is retained by CachedBody.
             let mut response = crate::format::records_response(status, Arc::clone(&body));
             set_result_cache_header(&mut response, "hit");
             let result_meta: Result<Response, ApiError> = Ok(response);
@@ -5286,6 +5335,8 @@ async fn handle_local_inner(
                 } else {
                     StatusCode::OK
                 };
+                // Whole-table count returns its native one row even at cap zero;
+                // this fast path did not apply the selected records clipper.
                 let result_meta: Result<Response, ApiError> =
                     Ok(render_fast_path_records(body, status, cache_ctx.clone()).await);
                 emit_terminal_audit(
