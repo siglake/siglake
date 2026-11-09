@@ -386,69 +386,75 @@ where
     .await
 }
 
-pub(super) async fn execute<F>(
+pub(super) fn execute<F>(
     authority: Arc<ControlsAuthority>,
     controls: RequestControls,
     native: NativeResponse,
     priority: Priority,
     future: F,
-) -> Result<Response, ApiError>
+) -> impl Future<Output = Result<Response, ApiError>>
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
-    let timeout = controls.timeout;
-    let started = controls.started;
-    let headers = match native {
-        NativeResponse::Sql => None,
-        NativeResponse::Jaeger => Some(jaeger_headers(controls)?),
-        NativeResponse::Shard => Some(unestimated_headers(controls, priority)?),
-    };
-    if tokio::time::Instant::now() >= controls.deadline {
-        return Err(with_headers(
-            native.timeout(expired(), timeout, started, priority),
-            &headers,
-        ));
-    }
-    let body_slot = authority
-        .bodies
-        .reserve()
-        .map_err(|e| with_headers(e, &headers))?;
-    let (result, history) = BODY_HISTORY
-        .scope(std::cell::RefCell::new(None), async {
-            let result = CONTROLS
-                .scope(controls, until(controls.deadline, future))
-                .await;
-            (result, BODY_HISTORY.with(|h| h.take()))
-        })
-        .await;
-    let result = match result {
-        Ok(response) => body_slot.start(response, controls, history),
-        Err(error) => {
-            if let Some(h) = history {
-                if tokio::time::Instant::now() >= controls.deadline {
-                    h.timed_out();
-                } else {
-                    h.failed();
-                }
-            }
-            Err(error)
+    // Box before constructing the shared body/dispatch wrappers. Jaeger and
+    // selected SQL futures are large; copying them through another async frame
+    // can exhaust a native executor stack even before its first await.
+    let future = Box::pin(future);
+    async move {
+        let timeout = controls.timeout;
+        let started = controls.started;
+        let headers = match native {
+            NativeResponse::Sql => None,
+            NativeResponse::Jaeger => Some(jaeger_headers(controls)?),
+            NativeResponse::Shard => Some(unestimated_headers(controls, priority)?),
+        };
+        if tokio::time::Instant::now() >= controls.deadline {
+            return Err(with_headers(
+                native.timeout(expired(), timeout, started, priority),
+                &headers,
+            ));
         }
-    };
-    match headers {
-        Some(headers) => match result {
-            Ok(mut response) => {
-                for (name, value) in headers {
-                    response.headers_mut().insert(name, value);
-                }
-                Ok(response)
-            }
+        let body_slot = authority
+            .bodies
+            .reserve()
+            .map_err(|e| with_headers(e, &headers))?;
+        let (result, history) = BODY_HISTORY
+            .scope(std::cell::RefCell::new(None), async {
+                let result = CONTROLS
+                    .scope(controls, until(controls.deadline, future))
+                    .await;
+                (result, BODY_HISTORY.with(|h| h.take()))
+            })
+            .await;
+        let result = match result {
+            Ok(response) => body_slot.start(response, controls, history),
             Err(error) => {
-                let mut error = native.timeout(error, timeout, started, priority);
-                error.headers.extend(headers);
+                if let Some(h) = history {
+                    if tokio::time::Instant::now() >= controls.deadline {
+                        h.timed_out();
+                    } else {
+                        h.failed();
+                    }
+                }
                 Err(error)
             }
-        },
-        None => result,
+        };
+        match headers {
+            Some(headers) => match result {
+                Ok(mut response) => {
+                    for (name, value) in headers {
+                        response.headers_mut().insert(name, value);
+                    }
+                    Ok(response)
+                }
+                Err(error) => {
+                    let mut error = native.timeout(error, timeout, started, priority);
+                    error.headers.extend(headers);
+                    Err(error)
+                }
+            },
+            None => result,
+        }
     }
 }
 /// Pre-header Jaeger wire compatibility only. Keep the original anchor and
