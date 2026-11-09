@@ -179,7 +179,9 @@ fn scan_value_with_lookup<'a>(
         let end = if let Some((_, tail)) =
             path.filter(|(head, _)| first_head.is_none() && member_key == Some(*head))
         {
-            let (end, value) = scan_value_with_lookup(json, i, tail)?;
+            let Some((end, value)) = scan_value_with_lookup(json, i, tail) else {
+                return scan_container_end(b, i, 1).map(|end| (end, first_head.flatten()));
+            };
             first_head = Some(value);
             end
         } else {
@@ -502,6 +504,7 @@ mod tests {
     fn fused_lookup_preserves_nested_duplicates_numbers_and_malformed_boundaries() {
         let cases = [
             r#"{"a":{"b":{},"b":{"c":4}}}"#,
+            r#"{"a":{"b":,"b.c":5},"a.b.c":7}"#,
             r#"{"a":{"b":{"c":4},"b.c":null}}"#,
             r#"{"a":{"b":{"c":4},"b.c":}}"#,
             r#"{"a":{"b":{"c":4},"b.c":"unterminated}}"#,
