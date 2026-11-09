@@ -23,13 +23,13 @@ use std::{
 };
 use uuid::Uuid;
 
-struct Server {
-    base: String,
-    task: tokio::task::JoinHandle<()>,
-    state: Option<AppState>,
+pub(super) struct Server {
+    pub(super) base: String,
+    pub(super) task: tokio::task::JoinHandle<()>,
+    pub(super) state: Option<AppState>,
 }
 impl Server {
-    async fn shutdown(mut self) {
+    pub(super) async fn shutdown(mut self) {
         if let Some(state) = self.state.take() {
             state.shutdown_query_controls().await;
         }
@@ -42,7 +42,7 @@ impl Drop for Server {
         self.task.abort();
     }
 }
-async fn serve(state: AppState) -> Server {
+pub(super) async fn serve(state: AppState) -> Server {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let service_state = state.clone();
@@ -54,13 +54,13 @@ async fn serve(state: AppState) -> Server {
         state: Some(state),
     }
 }
-fn token(issuer: &str, tenant: &str, client: &str) -> String {
+pub(super) fn token(issuer: &str, tenant: &str, client: &str) -> String {
     let mut claims = access_claims(issuer);
     claims["custom:org_id"] = json!(tenant);
     claims["client_id"] = json!(client);
     sign_claims(&claims, Algorithm::RS256, Some(TEST_KID))
 }
-async fn post(base: &str, token: &str, route: &str, body: Value) -> reqwest::Response {
+pub(super) async fn post(base: &str, token: &str, route: &str, body: Value) -> reqwest::Response {
     reqwest::Client::new()
         .post(format!("{base}{route}"))
         .bearer_auth(token)
@@ -106,7 +106,7 @@ async fn wait_cache(s: &Snapshotter, outcome: &str) {
     .await
     .expect("expected bounded cache phase not reached");
 }
-fn policy_config(socket: &std::path::Path, reader: bool) -> PolicyConfig {
+pub(super) fn policy_config(socket: &std::path::Path, reader: bool) -> PolicyConfig {
     let encoded = socket.to_str().unwrap().replace('/', "%2F");
     let role = if reader { "qp_reader" } else { "qp_manager" };
     let uri = format!("postgres://{role}:@{encoded}:5432/qh_fixture?sslmode=disable");
@@ -121,7 +121,7 @@ fn policy_config(socket: &std::path::Path, reader: bool) -> PolicyConfig {
     }
     .unwrap()
 }
-async fn fixture() -> (PathBuf, PgPool) {
+pub(super) async fn fixture() -> (PathBuf, PgPool) {
     let socket = PathBuf::from(
         std::env::var("SIGLAKE_POLICY_FIXTURE_DIR").expect("use check-query-policy.sh"),
     );
@@ -919,7 +919,7 @@ async fn real_signed_explicit_distributed_batch_refuses_before_work_not_handoff(
 }
 
 #[path = "fanout_controls.rs"]
-mod fanout_controls;
+pub(super) mod fanout_controls;
 #[path = "jaeger_controls.rs"]
 mod jaeger_controls;
 #[path = "shard_controls.rs"]

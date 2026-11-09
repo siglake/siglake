@@ -836,3 +836,6 @@ mod startup_history;
 
 #[path = "cognito_mixed.rs"]
 mod cognito_mixed;
+
+#[path = "selected_paths_controls.rs"]
+mod selected_paths_controls;

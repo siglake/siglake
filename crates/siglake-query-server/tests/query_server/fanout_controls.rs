@@ -9,19 +9,20 @@ use axum::{
 };
 use std::sync::Mutex;
 const V2: &str = "/api/v2/internal/sql/shard";
-const SQL: &str = "SELECT host, count(*) AS n FROM events WHERE raw LIKE '%wire%' GROUP BY host";
+pub(in super::super) const SQL: &str =
+    "SELECT host, count(*) AS n FROM events WHERE raw LIKE '%wire%' GROUP BY host";
 #[derive(Clone, Copy)]
-enum Mode {
+pub(in super::super) enum Mode {
     Normal,
     Refuse(u16),
     Transit(u64),
     StallBody,
 }
-struct Trace {
-    mode: Mutex<Mode>,
-    requests: Mutex<Vec<Value>>,
-    completed: Mutex<Vec<(u16, String)>>,
-    stalled_sources: Arc<AtomicUsize>,
+pub(in super::super) struct Trace {
+    pub(in super::super) mode: Mutex<Mode>,
+    pub(in super::super) requests: Mutex<Vec<Value>>,
+    pub(in super::super) completed: Mutex<Vec<(u16, String)>>,
+    pub(in super::super) stalled_sources: Arc<AtomicUsize>,
 }
 impl Default for Trace {
     fn default() -> Self {
@@ -76,7 +77,7 @@ async fn trace(trace: Arc<Trace>, request: Request, next: Next) -> Response {
     }
     response
 }
-async fn engine(
+pub(in super::super) async fn engine(
     listener: tokio::net::TcpListener,
     state: AppState,
     trace_state: Arc<Trace>,
@@ -92,7 +93,7 @@ async fn engine(
         state: Some(state),
     }
 }
-fn limits(ms: u64) -> ServerLimits {
+pub(in super::super) fn limits(ms: u64) -> ServerLimits {
     let mut limits = ServerLimits::default();
     limits.interactive.default_timeout = Duration::from_millis(ms);
     limits.interactive.ceiling_timeout = Duration::from_millis(ms);
@@ -396,8 +397,9 @@ async fn signed_two_node_wire_fanout_clamps_refusals_retry_and_http_pump_deadlin
         before,
         "zero ingress budget dispatched remote work"
     );
-    // Selected nondistributable local delegation and explicit batch dry-run
-    // synchronous fanout preserve original behavior. Actual batch stays fenced.
+    // Selected nondistributable local delegation and coordinated batch/dry-run
+    // remain synchronous with explicit wire authority. The separate named
+    // no-distributed-configuration refusal regression remains unchanged.
     assert_eq!(
         post(
             &a.base,
@@ -420,17 +422,18 @@ async fn signed_two_node_wire_fanout_clamps_refusals_retry_and_http_pump_deadlin
         .status(),
         200
     );
-    assert_eq!(
-        post(
-            &a.base,
-            &jwt,
-            "/api/v1/sql/distributed",
-            json!({"query":SQL,"priority":"batch"})
-        )
-        .await
-        .status(),
-        503
-    );
+    let batch = post(
+        &a.base,
+        &jwt,
+        "/api/v1/sql/distributed",
+        json!({"query":SQL,"priority":"batch"}),
+    )
+    .await;
+    assert_eq!(batch.status(), 200);
+    let body: Value = batch.json().await.unwrap();
+    assert_eq!(body["rows"][0]["n"], 3);
+    assert!(body.get("job_id").is_none());
+    assert_eq!(state_a.jobs.active_count().await, 0);
     for state in [&state_a, &state_b] {
         tokio::time::timeout(Duration::from_secs(1), state.admission.acquire(1))
             .await

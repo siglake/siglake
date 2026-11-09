@@ -108,6 +108,10 @@ tokio::task_local! {
     static INGRESS: Instant;
     static INGRESS_UNIX_MS: Option<i64>;
     static CONTROLS: RequestControls;
+    // Only actual local durable selection may transfer the active lifetime.
+    // The snapshot/run budget above is immutable; this is an ingress-anchored
+    // handoff deadline, not a new admission or a second policy lookup.
+    static LOCAL_HANDOFF: std::cell::Cell<Option<tokio::time::Instant>>;
     static BODY_HISTORY: std::cell::RefCell<Option<crate::history::streaming::DeliveryObservation>>;
 }
 pub(crate) async fn ingress<F: Future>(started: Instant, future: F) -> F::Output {
@@ -122,7 +126,15 @@ pub(crate) async fn ingress<F: Future>(started: Instant, future: F) -> F::Output
         .await
 }
 pub(crate) fn current() -> Option<RequestControls> {
-    CONTROLS.try_with(|c| *c).ok()
+    CONTROLS
+        .try_with(|c| {
+            let mut c = *c;
+            if let Ok(Some(deadline)) = LOCAL_HANDOFF.try_with(std::cell::Cell::get) {
+                c.deadline = deadline;
+            }
+            c
+        })
+        .ok()
 }
 /// Transfer observation delivery ownership without making history an authority.
 pub(crate) fn defer_history(observation: &mut crate::history::streaming::StreamObservation) {
@@ -168,6 +180,80 @@ where
         return Err(expired());
     }
     result
+}
+
+/// Called only at the explicit router's proven local-durable branches, before
+/// local preparation/admission. Classification still spends REQUEST time. A
+/// late-ready selection cannot erase expiry, and the handoff uses ORIGINAL
+/// ingress plus the existing operator budget, never the short run budget.
+pub(crate) fn select_local_durable(authority: Option<&ControlsAuthority>) -> Result<(), ApiError> {
+    let Some(authority) = authority else {
+        return Ok(());
+    };
+    transfer_local_durable(authority.batch.default_timeout)
+}
+fn transfer_local_durable(handoff_budget: Duration) -> Result<(), ApiError> {
+    let controls = current().ok_or_else(unavailable)?;
+    if tokio::time::Instant::now() >= controls.deadline {
+        return Err(expired());
+    }
+    let deadline = tokio::time::Instant::from_std(
+        controls
+            .started
+            .checked_add(handoff_budget)
+            .ok_or_else(unavailable)?,
+    );
+    LOCAL_HANDOFF
+        .try_with(|phase| {
+            if phase.get().is_some() {
+                return Err(unavailable());
+            }
+            // Actual selection is this synchronous phase transfer. Check BOTH
+            // original request and handoff immediately before changing phase.
+            let selected_at = tokio::time::Instant::now();
+            if selected_at >= controls.deadline || selected_at >= deadline {
+                return Err(expired());
+            }
+            phase.set(Some(deadline));
+            Ok(())
+        })
+        .map_err(|_| unavailable())?
+}
+
+/// Poll a single owned continuation under the currently selected deadline.
+/// Unlike a fixed outer timeout, every enclosing phase observes the transfer
+/// during the SAME poll. Checks on both sides refuse late native/ready work;
+/// the timer still independently wakes a pending continuation.
+async fn until_selected<F, T>(future: F) -> Result<T, ApiError>
+where
+    F: Future<Output = Result<T, ApiError>>,
+{
+    use std::task::Poll;
+    let mut future = Box::pin(future);
+    let Some(controls) = current() else {
+        return future.await;
+    };
+    let mut timer = Box::pin(tokio::time::sleep_until(controls.deadline));
+    std::future::poll_fn(|cx| {
+        if tokio::time::Instant::now() >= current().unwrap().deadline {
+            return Poll::Ready(Err(expired()));
+        }
+        let result = future.as_mut().poll(cx);
+        let deadline = current().unwrap().deadline;
+        if tokio::time::Instant::now() >= deadline {
+            return Poll::Ready(Err(expired()));
+        }
+        if result.is_ready() {
+            return result;
+        }
+        timer.as_mut().reset(deadline);
+        if timer.as_mut().poll(cx).is_ready() {
+            Poll::Ready(Err(expired()))
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 /// Scope includes observational history waits and fully buffered response
@@ -423,13 +509,17 @@ where
             .bodies
             .reserve()
             .map_err(|e| with_headers(e, &headers))?;
-        let (result, history) = BODY_HISTORY
-            .scope(std::cell::RefCell::new(None), async {
-                let result = CONTROLS
-                    .scope(controls, until(controls.deadline, future))
-                    .await;
-                (result, BODY_HISTORY.with(|h| h.take()))
-            })
+        let (result, history, controls) = LOCAL_HANDOFF
+            .scope(
+                std::cell::Cell::new(None),
+                BODY_HISTORY.scope(
+                    std::cell::RefCell::new(None),
+                    CONTROLS.scope(controls, async {
+                        let result = until_selected(future).await;
+                        (result, BODY_HISTORY.with(|h| h.take()), current().unwrap())
+                    }),
+                ),
+            )
             .await;
         let result = match result {
             Ok(response) => body_slot.start(response, controls, history),
@@ -576,7 +666,7 @@ where
     let future = Box::pin(future);
     async move {
         match current() {
-            Some(c) => until(c.deadline, future).await,
+            Some(_) => until_selected(future).await,
             None => future.await,
         }
     }

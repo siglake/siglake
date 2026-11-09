@@ -893,3 +893,90 @@ async fn request_entry_boxes_large_work_before_constructing_lifetime_future() {
         work()
     ));
 }
+
+#[tokio::test]
+async fn selected_local_durable_transfers_all_enclosing_timers_without_resetting_snapshot() {
+    let controls = snapshot(Duration::from_millis(100));
+    CONTROLS
+        .scope(
+            controls,
+            LOCAL_HANDOFF.scope(std::cell::Cell::new(None), async {
+                let result = until_selected(phase(async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    transfer_local_durable(Duration::from_millis(300))?;
+                    assert_eq!(current().unwrap().started, controls.started);
+                    assert_eq!(current().unwrap().timeout, controls.timeout);
+                    assert_eq!(
+                        current().unwrap().deadline,
+                        tokio::time::Instant::from_std(
+                            controls.started + Duration::from_millis(300)
+                        )
+                    );
+                    assert!(
+                        transfer_local_durable(Duration::from_secs(1)).is_err(),
+                        "no second transfer"
+                    );
+                    // Remains inside BOTH wrappers beyond the original request/run budget.
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Ok(())
+                }))
+                .await;
+                result.unwrap();
+                // Remaining handoff, not another full budget from selection/completion.
+                assert_eq!(
+                    until_selected(async { std::future::pending::<Result<(), ApiError>>().await })
+                        .await
+                        .unwrap_err()
+                        .status,
+                    504
+                );
+            }),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn selected_local_durable_cannot_upgrade_zero_or_late_ready_classification() {
+    for budget in [Duration::ZERO, Duration::from_millis(20)] {
+        let controls = snapshot(budget);
+        CONTROLS
+            .scope(
+                controls,
+                LOCAL_HANDOFF.scope(std::cell::Cell::new(None), async {
+                    let result = until_selected(async {
+                        // Late-ready native classification cannot replace an expired clock.
+                        std::thread::sleep(Duration::from_millis(40));
+                        assert_eq!(
+                            transfer_local_durable(Duration::from_secs(1))
+                                .unwrap_err()
+                                .status,
+                            504
+                        );
+                        assert!(LOCAL_HANDOFF.with(std::cell::Cell::get).is_none());
+                        Ok(())
+                    })
+                    .await;
+                    assert_eq!(result.unwrap_err().status, 504);
+                    assert!(LOCAL_HANDOFF.with(std::cell::Cell::get).is_none());
+                }),
+            )
+            .await;
+    }
+    // Even a timely selection cannot renew the already-spent original handoff.
+    let mut controls = snapshot(Duration::from_secs(1));
+    controls.started = Instant::now() - Duration::from_millis(100);
+    CONTROLS
+        .scope(
+            controls,
+            LOCAL_HANDOFF.scope(std::cell::Cell::new(None), async {
+                assert_eq!(
+                    transfer_local_durable(Duration::from_millis(50))
+                        .unwrap_err()
+                        .status,
+                    504
+                );
+                assert!(LOCAL_HANDOFF.with(std::cell::Cell::get).is_none());
+            }),
+        )
+        .await;
+}

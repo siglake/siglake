@@ -19558,11 +19558,17 @@ pub async fn distributed(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    // Refuse before constructing/polling work, including nondistributable batch.
-    let mut result = if state.query_controls.is_some() && req.priority == Priority::Batch && !req.dry_run {
+    // Pin actual membership before primary/history waits.
+    let peers = state.peers.as_ref().and_then(|source| source.capture());
+    // Flags cannot prove which branch classification/Tier1 will select.
+    let mut result = if state.query_controls.as_ref().is_some_and(|c| c.distributed.is_none())
+        && req.priority == Priority::Batch && !req.dry_run
+    {
         Err(crate::query_controls::runtime::unsupported())
     } else {
-        controlled(state, identity, req, false, distributed_observed).await
+        controlled(state, identity, req, false, move |state, identity, req| {
+            distributed_observed(state, identity, req, peers)
+        }).await
     };
     stamp_buffered_sql_headers(&mut result, format, started);
     result
@@ -19572,10 +19578,8 @@ async fn distributed_observed(
     state: AppState,
     identity: CallerIdentity,
     req: SqlRequest,
+    peers: Option<Arc<crate::discovery::PeerSnapshot>>,
 ) -> Result<Response, ApiError> {
-    // Capture at the original boundary, before any history await; telemetry
-    // must not change which discovery membership this request selected.
-    let peers = state.peers.as_ref().and_then(|source| source.capture());
     let execution_id = siglake_storage::QueryExecutionId::next();
     siglake_storage::with_query_execution_id(
         execution_id,
@@ -19639,7 +19643,13 @@ async fn distributed_inner(
         Some([t]) => ice.is_managed_index(t).await.unwrap_or(false),
         _ => false,
     };
+    #[cfg(test)]
+    selected_path_controls_tests::checkpoint(selected_path_controls_tests::Point::Classification)
+        .await;
     if !distributable {
+        if req.priority == Priority::Batch && !req.dry_run {
+            crate::query_controls::runtime::select_local_durable(state.query_controls.as_deref())?;
+        }
         return Box::pin(handle_local_inner(
             state,
             identity,
@@ -19998,7 +20008,12 @@ async fn distributed_inner(
         }
         _ => false,
     };
+    #[cfg(test)]
+    selected_path_controls_tests::checkpoint(selected_path_controls_tests::Point::ScanLocal).await;
     if scan_local {
+        if req.priority == Priority::Batch && !req.dry_run {
+            crate::query_controls::runtime::select_local_durable(state.query_controls.as_deref())?;
+        }
         metrics::counter!("siglake_query_coordinator_total", "mode" => "scan_local").increment(1);
         let local_execution_id = siglake_storage::QueryExecutionId::next();
         return siglake_storage::with_query_execution_id(
@@ -23393,3 +23408,7 @@ mod history_scan_availability_tests {
 #[cfg(test)]
 #[path = "sql/shard_controls_tests.rs"]
 pub(crate) mod shard_controls_tests;
+
+#[cfg(test)]
+#[path = "sql/selected_path_controls_tests.rs"]
+mod selected_path_controls_tests;

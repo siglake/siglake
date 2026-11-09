@@ -32,16 +32,29 @@ Jaeger/wire proofs precede any enablement.
 
 ## Lifetime and ownership
 
-Only actual main/local durable selection uses operator-default handoff rather
-than the run budget. Controlled explicit `/api/v1/sql/distributed` batch execution
-(`priority=batch`, `dry_run=false`) is temporarily unavailable BEFORE work,
-including Tier1 metadata execution and nondistributable fallback. That endpoint
-never selects handoff from request flags: interactive/dry-run work retains its
-original request clock. Actual selected-path support awaits the distributed/wire
-slice; absent-authority explicit behavior is unchanged.
+Actual main/local durable selection uses operator-default handoff rather than
+the run budget. With explicit distributed controls configuration, explicit
+`/api/v1/sql/distributed` starts under the effective REQUEST deadline: primary,
+history, catalog, classification, planning, Tier1 and coordinated work all
+spend time from original authenticated ingress. Coordinated batch is still a
+synchronous resource tier; requested dry-run may still execute. Neither hint
+selects handoff. Only a proven nondistributable/scan_local local-durable branch
+may transfer the single owned continuation to HANDOFF, checking the request is
+not already expired. All enclosing timers observe that transfer; no dispatch
+restart, second primary read, receipt or admission is introduced. Handoff is
+bounded by the existing operator default from the SAME original ingress. The
+immutable policy/caller run budget is preserved for durable acceptance.
 
-Request policy/history/rewrite/admission/store waits remain within that
-original ingress handoff clock. Accepted queue+run timestamps, expiry and snapshot
+Without distributed configuration, explicit non-dry batch retains its named
+pre-work conservative refusal. Absent-authority behavior/defaults are unchanged.
+Main/local selection known before work may accept zero run budgets; explicit
+work needing classification cannot upgrade an expired/zero request to handoff.
+After genuine durable selection, remaining policy/history/rewrite/admission/store
+waits stay within the original ingress handoff clock. Existing history receipts
+still normalize format to records for requested batch/dry-run; that field is
+not a lossless raw-format preference. Actual effective fields remain separate
+observations and neither field is lifetime authority. No receipt is replaced.
+Accepted queue+run timestamps, expiry and snapshot
 are immutable; private binding contains only trusted tenant/issuer/client, never
 sub/token. Public accepted/execution metadata has no binding or owner.
 
