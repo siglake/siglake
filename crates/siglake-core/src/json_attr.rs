@@ -41,23 +41,37 @@ pub struct PreparedDottedJsonAttrKey<'a> {
     key: &'a str,
     head: &'a str,
     tail: &'a str,
+    literal_first: bool,
 }
 
 impl<'a> PreparedDottedJsonAttrKey<'a> {
     /// Prepare a dotted key without allocating. A flat key returns `None`.
     pub fn new(key: &'a str) -> Option<Self> {
         let (head, tail) = key.split_once('.')?;
-        Some(Self { key, head, tail })
+        Some(Self {
+            key,
+            head,
+            tail,
+            literal_first: false,
+        })
+    }
+
+    /// Choose a traversal using a representative row, without changing results.
+    ///
+    /// Literal projections often follow a large nested envelope. Prefer the
+    /// original literal-first lookup for those batches, avoiding speculative
+    /// nested work. A false hit, escaped key, or different layout in another
+    /// row only affects cost: both traversals retain full per-row semantics.
+    /// Sample once per batch so the substring search is amortized.
+    pub fn with_sample(mut self, attributes: &str) -> Self {
+        self.literal_first =
+            memchr::memmem::find(attributes.as_bytes(), self.key.as_bytes()).is_some();
+        self
     }
 
     /// Look up this prepared dotted key while preserving legacy results.
     pub fn lookup(&self, attributes: &str) -> Option<String> {
-        // A literal dotted projection can follow a large nested envelope. In
-        // that case speculative nested lookup is wasted: the literal wins.
-        // This SIMD substring check is only a performance hint. False hits
-        // (including keys inside string values) use the original lookup, and
-        // escaped literal keys missed by the hint still use the full scanner.
-        if memchr::memmem::find(attributes.as_bytes(), self.key.as_bytes()).is_some() {
+        if self.literal_first {
             return json_attr_lookup(attributes, self.key);
         }
         let raw = match find_dotted_top_level_value(attributes, self.key, self.head, self.tail) {
@@ -468,11 +482,13 @@ mod tests {
 
     fn assert_prepared_parity(json: &str, key: &str) {
         let prepared = PreparedDottedJsonAttrKey::new(key).expect("test key must be dotted");
-        assert_eq!(
-            prepared.lookup(json),
-            reference::json_attr_lookup(json, key),
-            "json={json:?} key={key:?}"
-        );
+        for sample in [json, key, "{}"] {
+            assert_eq!(
+                prepared.with_sample(sample).lookup(json),
+                reference::json_attr_lookup(json, key),
+                "json={json:?} key={key:?} sample={sample:?}"
+            );
+        }
     }
 
     #[test]

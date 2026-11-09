@@ -118,6 +118,14 @@ impl ScalarUDFImpl for AttrGetUdf {
             let attrs = arg_as_str_array(&args.args[0], n, "attributes")?;
             let mut builder = StringBuilder::with_capacity(n, n * 16);
             if let Some(prepared) = key.and_then(PreparedDottedJsonAttrKey::new) {
+                // A batch sample selects only the traversal strategy. Every
+                // row still gets complete literal/duplicate/fallback handling.
+                let prepared = attrs
+                    .iter()
+                    .take(n)
+                    .flatten()
+                    .next()
+                    .map_or(prepared, |sample| prepared.with_sample(sample));
                 for i in 0..n {
                     if attrs.is_null(i) {
                         builder.append_null();
@@ -1301,6 +1309,51 @@ mod tests {
             attr_scalar_key_values(output, 2),
             vec![Some("nested-source".to_owned()); 2]
         );
+    }
+
+    #[test]
+    fn attr_scalar_key_batch_sample_preserves_mixed_layouts() {
+        let rows = [
+            Some(r#"{"a":{"b":"nested"},"a.b":"literal"}"#),
+            Some(r#"{"a":{"b":9007199254741791}}"#),
+            Some(r#"{"note":"a.b","a":{"b":"false-hit"}}"#),
+            Some(r#"{"a":{},"a":{"b":"second-head"}}"#),
+            Some(r#"{"a":{"b":"nested"},"a\u002eb":"escaped"}"#),
+            Some(r#"{"a":{"b":},"a.b":"outer-wins"}"#),
+            Some(r#"{"a":{"b":"nested"},"a.b":null}"#),
+            None,
+        ];
+        // Rotate the first non-null row so both strategy choices, false hits,
+        // and malformed samples are exercised against every other row layout.
+        for offset in 0..rows.len() {
+            let mut batch = vec![None];
+            batch.extend(rows.iter().cycle().skip(offset).take(rows.len()).copied());
+            let expected: Vec<_> = batch
+                .iter()
+                .map(|row| row.and_then(|json| attr_owned_baseline::json_attr_lookup(json, "a.b")))
+                .collect();
+            let n = batch.len();
+            let attrs = ColumnarValue::Array(Arc::new(StringArray::from(batch)));
+            let actual = invoke_attr_scalar_key(
+                true,
+                attrs,
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".into()))),
+                n,
+            )
+            .unwrap();
+            assert_eq!(attr_scalar_key_values(actual, n), expected);
+        }
+        for n in [0, 3] {
+            let attrs = ColumnarValue::Array(Arc::new(StringArray::from(vec![None::<&str>; n])));
+            let actual = invoke_attr_scalar_key(
+                true,
+                attrs,
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some("a.b".into()))),
+                n,
+            )
+            .unwrap();
+            assert_eq!(attr_scalar_key_values(actual, n), vec![None; n]);
+        }
     }
 
     #[test]
