@@ -843,3 +843,55 @@ async fn shard_primary_precedes_work_original_clock_zero_false_and_coordinator_g
     assert_eq!(response.status(), 200);
     authority.shutdown().await;
 }
+
+#[tokio::test]
+async fn request_entry_boxes_large_work_before_constructing_lifetime_future() {
+    let work = || {
+        let payload = [0u8; 64 * 1024];
+        async move {
+            std::hint::black_box(payload);
+            Ok(Response::new(axum::body::Body::empty()))
+        }
+    };
+    let work_size = std::mem::size_of_val(&work());
+    macro_rules! checked_entry {
+        ($future:expr) => {{
+            let entry = $future;
+            assert!(
+                std::mem::size_of_val(&entry) < work_size,
+                "request lifetime frame retained inline work instead of an owned box"
+            );
+            assert_eq!(entry.await.unwrap().status(), 200);
+        }};
+    }
+    checked_entry!(run_inner(
+        None,
+        CallerIdentity::default(),
+        RequestLimits::default(),
+        Priority::Interactive,
+        false,
+        NativeResponse::Sql,
+        work()
+    ));
+    checked_entry!(run(
+        None,
+        CallerIdentity::default(),
+        RequestLimits::default(),
+        Priority::Interactive,
+        work()
+    ));
+    checked_entry!(run_handoff(
+        None,
+        CallerIdentity::default(),
+        RequestLimits::default(),
+        Priority::Batch,
+        work()
+    ));
+    checked_entry!(run_jaeger(None, CallerIdentity::default(), work()));
+    checked_entry!(run_shard(
+        None,
+        CallerIdentity::default(),
+        Priority::Interactive,
+        work()
+    ));
+}

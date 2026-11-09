@@ -313,19 +313,23 @@ impl ShardRunner for HttpShardRunner {
                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
             ));
         }
+        // Construct/box once before adding timer/branch frames. The native
+        // HTTP send/response future is large even on legacy v1; embedding it
+        // in both arms can overflow a caller's executor stack.
+        let future = Box::pin(self.send_detailed(sql, shard));
         if let Some(controls) = &self.controls {
             let deadline = controls.deadline();
             if tokio::time::Instant::now() >= deadline {
                 return Err(controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT));
             }
-            let result = tokio::time::timeout_at(deadline, self.send_detailed(sql, shard)).await;
+            let result = tokio::time::timeout_at(deadline, future).await;
             // Includes response pump, Arrow decode, and late-ready success.
             if tokio::time::Instant::now() >= deadline {
                 return Err(controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT));
             }
             result.map_err(|_| controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT))?
         } else {
-            self.send_detailed(sql, shard).await
+            future.await
         }
     }
 }

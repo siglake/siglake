@@ -173,13 +173,13 @@ where
 /// Scope includes observational history waits and fully buffered response
 /// rendering and independently owned body production. Native CPU work remains
 /// cooperative, not OS-preempted. Fanout requires explicit wirev2 configuration.
-pub(crate) async fn run<F>(
+pub(crate) fn run<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
     caller: RequestLimits,
     priority: Priority,
     future: F,
-) -> Result<Response, ApiError>
+) -> impl Future<Output = Result<Response, ApiError>>
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
@@ -192,15 +192,14 @@ where
         NativeResponse::Sql,
         future,
     )
-    .await
 }
-pub(crate) async fn run_handoff<F>(
+pub(crate) fn run_handoff<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
     caller: RequestLimits,
     priority: Priority,
     future: F,
-) -> Result<Response, ApiError>
+) -> impl Future<Output = Result<Response, ApiError>>
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
@@ -213,14 +212,13 @@ where
         NativeResponse::Sql,
         future,
     )
-    .await
 }
 /// Jaeger keeps native JSON, with fixed typed response-only metadata.
-pub(crate) async fn run_jaeger<F>(
+pub(crate) fn run_jaeger<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
     future: F,
-) -> Result<Response, ApiError>
+) -> impl Future<Output = Result<Response, ApiError>>
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
@@ -233,24 +231,21 @@ where
         NativeResponse::Jaeger,
         future,
     )
-    .await
 }
 
 /// Direct external v1 shards resolve their own identity. Controlled coordinator
 /// forwarding uses the distinct authenticated v2 route, never permissive v1.
-pub(crate) async fn run_shard<F>(
+pub(crate) fn run_shard<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
     priority: Priority,
     future: F,
-) -> Result<Response, ApiError>
+) -> impl Future<Output = Result<Response, ApiError>>
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
-    if authority.is_some() && identity.coordinator {
-        return Err(unsupported());
-    }
-    run_inner(
+    let unsupported_coordinator = authority.is_some() && identity.coordinator;
+    let future = run_inner(
         authority,
         identity,
         RequestLimits::default(),
@@ -258,8 +253,13 @@ where
         false,
         NativeResponse::Shard,
         future,
-    )
-    .await
+    );
+    async move {
+        if unsupported_coordinator {
+            return Err(unsupported());
+        }
+        future.await
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -290,7 +290,7 @@ impl NativeResponse {
     }
 }
 
-async fn run_inner<F>(
+fn run_inner<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
     caller: RequestLimits,
@@ -298,92 +298,97 @@ async fn run_inner<F>(
     handoff: bool,
     native: NativeResponse,
     future: F,
-) -> Result<Response, ApiError>
+) -> impl Future<Output = Result<Response, ApiError>>
 where
     F: Future<Output = Result<Response, ApiError>>,
 {
-    let Some(authority) = authority else {
-        return future.await;
-    };
-    // A missing authenticated ingress scope is an infrastructure failure, not
-    // permission to mint a fresh clock from supplied identity metadata.
-    let started = INGRESS.try_with(|s| *s).map_err(|_| unavailable())?;
-    let tier = authority.tier(priority);
-    let initial_timeout = if handoff {
-        tier.default_timeout
-    } else {
-        timeout(tier, &caller, PolicyLookup::Absent)
-    };
-    let initial_deadline = tokio::time::Instant::from_std(
-        started
-            .checked_add(initial_timeout)
-            .ok_or_else(unavailable)?,
-    );
-    let policy = until(
-        initial_deadline,
-        Box::pin(async {
-            match runtime_key(&identity).map_err(|_| unavailable())? {
-                Some(key) => authority
-                    .reader
-                    .lookup(&key)
-                    .await
-                    .map_err(|_| unavailable()),
-                None => {
-                    authority
-                        .reader
-                        .preflight()
-                        .await
-                        .map_err(|_| unavailable())?;
-                    Ok(PolicyLookup::Absent)
-                }
-            }
-        }),
-    )
-    .await
-    .map_err(|error| native.timeout(error, initial_timeout, started, priority))?;
-    let timeout = timeout(tier, &caller, policy);
-    let controls = RequestControls {
-        started,
-        deadline: tokio::time::Instant::from_std(
+    // The legacy/disabled branch must not retain a second inline copy of a
+    // large native work future either. Box BEFORE constructing this frame.
+    let future = Box::pin(future);
+    async move {
+        let Some(authority) = authority else {
+            return future.await;
+        };
+        // A missing authenticated ingress scope is an infrastructure failure, not
+        // permission to mint a fresh clock from supplied identity metadata.
+        let started = INGRESS.try_with(|s| *s).map_err(|_| unavailable())?;
+        let tier = authority.tier(priority);
+        let initial_timeout = if handoff {
+            tier.default_timeout
+        } else {
+            timeout(tier, &caller, PolicyLookup::Absent)
+        };
+        let initial_deadline = tokio::time::Instant::from_std(
             started
-                .checked_add(if handoff {
-                    tier.default_timeout
-                } else {
-                    timeout
-                })
+                .checked_add(initial_timeout)
                 .ok_or_else(unavailable)?,
-        ),
-        timeout,
-        state: policy.state(),
-        revision: policy.revision(),
-        generation: authority.generation,
-        scan_warning: match policy {
-            PolicyLookup::Found(p) => p.settings().scan_bytes_warning(),
-            PolicyLookup::Absent => None,
-        },
-        timeout_opt_out_ignored: caller.circuit_breakers == Some(false),
-    };
-    let dispatch = match authority.distributed {
-        Some(config) if !handoff && tokio::time::Instant::now() < controls.deadline => {
-            Some(super::wire::Dispatch::admitted(
-                config,
-                &identity,
-                controls,
-                priority,
-                INGRESS_UNIX_MS
-                    .try_with(|n| *n)
-                    .ok()
-                    .flatten()
+        );
+        let policy = until(
+            initial_deadline,
+            Box::pin(async {
+                match runtime_key(&identity).map_err(|_| unavailable())? {
+                    Some(key) => authority
+                        .reader
+                        .lookup(&key)
+                        .await
+                        .map_err(|_| unavailable()),
+                    None => {
+                        authority
+                            .reader
+                            .preflight()
+                            .await
+                            .map_err(|_| unavailable())?;
+                        Ok(PolicyLookup::Absent)
+                    }
+                }
+            }),
+        )
+        .await
+        .map_err(|error| native.timeout(error, initial_timeout, started, priority))?;
+        let timeout = timeout(tier, &caller, policy);
+        let controls = RequestControls {
+            started,
+            deadline: tokio::time::Instant::from_std(
+                started
+                    .checked_add(if handoff {
+                        tier.default_timeout
+                    } else {
+                        timeout
+                    })
                     .ok_or_else(unavailable)?,
-            )?)
-        }
-        _ => None,
-    };
-    super::wire::dispatch_scope(
-        dispatch,
-        execute(authority, controls, native, priority, future),
-    )
-    .await
+            ),
+            timeout,
+            state: policy.state(),
+            revision: policy.revision(),
+            generation: authority.generation,
+            scan_warning: match policy {
+                PolicyLookup::Found(p) => p.settings().scan_bytes_warning(),
+                PolicyLookup::Absent => None,
+            },
+            timeout_opt_out_ignored: caller.circuit_breakers == Some(false),
+        };
+        let dispatch = match authority.distributed {
+            Some(config) if !handoff && tokio::time::Instant::now() < controls.deadline => {
+                Some(super::wire::Dispatch::admitted(
+                    config,
+                    &identity,
+                    controls,
+                    priority,
+                    INGRESS_UNIX_MS
+                        .try_with(|n| *n)
+                        .ok()
+                        .flatten()
+                        .ok_or_else(unavailable)?,
+                )?)
+            }
+            _ => None,
+        };
+        super::wire::dispatch_scope(
+            dispatch,
+            execute(authority, controls, native, priority, future),
+        )
+        .await
+    }
 }
 
 pub(super) fn execute<F>(
