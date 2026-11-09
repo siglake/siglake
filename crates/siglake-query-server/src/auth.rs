@@ -175,12 +175,16 @@ pub async fn middleware(
     // chart supports therefore broke every scanning query on the default
     // topology.
     //
-    // Scoped to `/api/v1/sql/shard`, the only thing this token is for. It is a
+    // Scoped to the exact v1/v2 shard paths, the only use of this token. It is a
     // cluster-internal secret, but that is a reason to keep its reach narrow
     // rather than to widen it: nothing else should be reachable by presenting
     // it.
     if let Some(expected) = state.coordinator_token.as_deref() {
-        if request.uri().path() == "/api/v1/sql/shard"
+        if matches!(
+            request.uri().path(),
+            "/api/v1/sql/shard" | crate::query_controls::wire::PATH
+        ) && (request.uri().path() != crate::query_controls::wire::PATH
+            || !expected.trim().is_empty())
             && extract_bearer(request.extensions(), request.headers()) == Some(expected)
         {
             request

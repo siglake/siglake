@@ -18924,6 +18924,64 @@ pub async fn shard(
     .await
 }
 
+/// Strict internal envelope; forwarded authority never becomes a verified JWT
+/// identity. Tenancy still passes through the existing coordinator shard checks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControlledShardRequest {
+    query: String,
+    shard: Option<ShardParam>,
+    pin: Option<ShardPin>,
+    controls: crate::query_controls::wire::Context,
+}
+pub(crate) async fn shard_v2(
+    State(state): State<AppState>,
+    axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
+    req: Result<Json<ControlledShardRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ApiError> {
+    if !identity.coordinator {
+        return Err(ApiError::forbidden("coordinator authentication required"));
+    }
+    // Serde's native errors can echo invalid enum values/field names. Never
+    // reflect private forwarded context, SQL or arbitrary peer input.
+    let Json(req) = req.map_err(|_| {
+        ApiError::new_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "controlled shard context invalid",
+        )
+    })?;
+    let shard = ShardQueryRequest {
+        query: req.query,
+        shard: req.shard,
+        pin: req.pin,
+        priority: req.controls.priority(),
+        tenant: req.controls.tenant(),
+    };
+    crate::query_controls::wire::run_forwarded(
+        state.query_controls.clone(),
+        &identity,
+        &req.controls,
+        async {
+            let execution_id = siglake_storage::QueryExecutionId::next();
+            siglake_storage::with_query_execution_id(
+                execution_id,
+                history_buffered::observe_shard(
+                    state,
+                    identity.clone(),
+                    shard,
+                    |state, identity, req| {
+                        Box::pin(crate::query_controls::runtime::phase(shard_scoped(
+                            state, identity, req,
+                        )))
+                    },
+                ),
+            )
+            .await
+        },
+    )
+    .await
+}
+
 async fn shard_scoped(
     state: AppState,
     identity: CallerIdentity,
@@ -19069,6 +19127,8 @@ async fn shard_scoped(
     // handler returns.
     let cancel = siglake_storage::QueryCancel::new();
     let _cancel_guard = siglake_storage::CancelOnDrop(cancel.clone());
+    #[cfg(test)]
+    shard_controls_tests::capture_cancel(&cancel);
     // A worker's shard is its own execution, with its own id in ITS pod's log.
     // The coordinator's id is not carried across the hop: the shard body is a
     // versioned wire contract and a pod-local counter would not be comparable
@@ -19955,9 +20015,16 @@ async fn distributed_inner(
         .await;
     }
 
-    // The actual coordinated path needs trusted worker/wire lifetimes, not a
-    // second local timer. Refuse before admission, partial scans or dispatch.
-    if state.query_controls.is_some() {
+    // Enabled controls require explicitly configured v2 authority AND service
+    // authentication. Never silently dispatch legacy/uncontrolled fragments.
+    let controlled_dispatch = crate::query_controls::wire::current_dispatch();
+    if state.query_controls.is_some()
+        && (controlled_dispatch.is_none()
+            || state
+                .coordinator_token
+                .as_deref()
+                .is_none_or(|t| t.trim().is_empty()))
+    {
         return Err(crate::query_controls::runtime::unsupported());
     }
 
@@ -20026,7 +20093,8 @@ async fn distributed_inner(
         state.coordinator_token.clone(),
     )
     .with_tenant(identity.tenant.clone())
-    .with_pin(pin_table.clone(), pin_generation.clone());
+    .with_pin(pin_table.clone(), pin_generation.clone())
+    .with_controls(controlled_dispatch.clone());
     // The ONLY admission reservation a distributed query takes: one share on
     // this coordinator, priced from the whole-query estimate and held through
     // fan-out and merge. Workers admit nothing (see `shard`: admitting a
@@ -20072,7 +20140,8 @@ async fn distributed_inner(
         state.coordinator_token.clone(),
     )
     .with_tenant(identity.tenant.clone())
-    .with_pin(pin_table.clone(), pin_generation);
+    .with_pin(pin_table.clone(), pin_generation)
+    .with_controls(controlled_dispatch);
     let result: Result<Response, ApiError> = async {
         let (batches, coord_stats) = crate::coordinator::coordinate_with_failover(
             &planning,
@@ -23323,4 +23392,4 @@ mod history_scan_availability_tests {
 
 #[cfg(test)]
 #[path = "sql/shard_controls_tests.rs"]
-mod shard_controls_tests;
+pub(crate) mod shard_controls_tests;

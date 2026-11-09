@@ -103,6 +103,20 @@ impl Life {
     }
 }
 impl BodyTasks {
+    #[cfg(test)]
+    pub(super) fn owned_counts(&self) -> (usize, usize, usize) {
+        let mut registry = self.state.lock().unwrap();
+        self.reap(&mut registry);
+        (
+            registry.reserved,
+            registry
+                .tasks
+                .iter()
+                .filter(|(_, life)| life.outcome.load(Ordering::Acquire) == LIVE)
+                .count(),
+            registry.tasks.len(),
+        )
+    }
     fn reap(&self, registry: &mut Registry) {
         let waker = futures::task::waker_ref(&self.joined);
         let mut cx = Context::from_waker(&waker);

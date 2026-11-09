@@ -426,6 +426,21 @@ impl AppState {
         Ok(self)
     }
 
+    /// Explicit injection-only wirev2 configuration. Configure limits first.
+    /// The skew bound is an operator assumption, not measured synchronization.
+    pub fn with_distributed_query_controls(
+        mut self,
+        reader: Arc<query_controls::PolicyReader>,
+        operator_generation: i64,
+        config: query_controls::DistributedControlsConfig,
+    ) -> Result<Self, query_controls::PolicyError> {
+        let mut authority =
+            query_controls::ControlsAuthority::new(reader, &self.limits, operator_generation)?;
+        authority.distributed = Some(config);
+        self.query_controls = Some(Arc::new(authority));
+        Ok(self)
+    }
+
     /// Local/test service lifecycle: retain the state/authority until this
     /// completes. Cancelling the wait does not discard producer ownership.
     pub async fn shutdown_query_controls(&self) {
@@ -669,8 +684,8 @@ fn api_routes() -> OpenApiRouter<AppState> {
 
 /// The OpenAPI 3.1 document for the query HTTP API.
 ///
-/// Built from the same route-set constructors [`router`] uses, so a route that
-/// exists cannot go undocumented. Takes no [`AppState`]: layers contribute
+/// Built from the public route-set constructors [`router`] uses. The internal
+/// coordinator-only versioned shard route is intentionally not a public API. Takes no [`AppState`]: layers contribute
 /// nothing to the document, and `split_for_parts` leaves the state generic.
 pub fn openapi() -> utoipa::openapi::OpenApi {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
@@ -685,6 +700,12 @@ pub fn router(state: AppState) -> Router {
     let api = api_routes()
         .split_for_parts()
         .0
+        // Distinct authenticated route: old workers return 404, never execute
+        // an unknown controls field through the permissive legacy DTO.
+        .route(
+            query_controls::wire::PATH,
+            axum::routing::post(sql::shard_v2),
+        )
         .route_layer(middleware::from_fn(track_in_flight))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

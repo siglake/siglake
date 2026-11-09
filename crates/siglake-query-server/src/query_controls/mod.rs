@@ -9,6 +9,8 @@ pub(crate) mod jobs;
 mod owned;
 mod role;
 pub(crate) mod runtime;
+pub(crate) mod wire;
+pub use wire::DistributedControlsConfig;
 mod store;
 pub use config::{ConnectionBounds, PolicyConfig};
 pub use dto::*;

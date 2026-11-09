@@ -14,8 +14,20 @@ pub(super) enum Point {
     Render,
 }
 tokio::task_local! {
+    static CAPTURE_CANCEL: Arc<std::sync::Mutex<Option<siglake_storage::QueryCancel>>>;
     static DELAY: Point;
     static VISITED: std::cell::RefCell<Vec<Point>>;
+}
+pub(crate) async fn capture<F: std::future::Future>(
+    cancel: Arc<std::sync::Mutex<Option<siglake_storage::QueryCancel>>>,
+    future: F,
+) -> F::Output {
+    CAPTURE_CANCEL
+        .scope(cancel, DELAY.scope(Point::Collect, future))
+        .await
+}
+pub(super) fn capture_cancel(cancel: &siglake_storage::QueryCancel) {
+    let _ = CAPTURE_CANCEL.try_with(|slot| *slot.lock().unwrap() = Some(cancel.clone()));
 }
 pub(super) async fn checkpoint(point: Point) {
     let _ = VISITED.try_with(|v| v.borrow_mut().push(point));

@@ -17,6 +17,7 @@ pub struct ControlsAuthority {
     interactive: TierLimits,
     pub(super) batch: TierLimits,
     pub(super) generation: i64,
+    pub(crate) distributed: Option<super::wire::DistributedControlsConfig>,
     bodies: super::body::BodyTasks,
     pub(crate) jobs: super::job_tasks::JobTasks,
 }
@@ -33,6 +34,7 @@ impl ControlsAuthority {
         }
         Ok(Self {
             reader,
+            distributed: None,
             interactive: limits.interactive.clone(),
             batch: limits.batch.clone(),
             generation,
@@ -40,13 +42,17 @@ impl ControlsAuthority {
             jobs: super::job_tasks::JobTasks::default(),
         })
     }
+    #[cfg(test)]
+    pub(super) fn owned_body_counts(&self) -> (usize, usize, usize) {
+        self.bodies.owned_counts()
+    }
     /// Close job/body generations and observe all retained joins. Cancelling
     /// this wait preserves handles; await it again before service teardown.
     pub async fn shutdown(&self) {
         self.jobs.shutdown().await;
         self.bodies.shutdown().await;
     }
-    fn tier(&self, priority: Priority) -> &TierLimits {
+    pub(super) fn tier(&self, priority: Priority) -> &TierLimits {
         match priority {
             Priority::Interactive => &self.interactive,
             Priority::Batch => &self.batch,
@@ -100,11 +106,20 @@ pub(crate) struct RequestControls {
 }
 tokio::task_local! {
     static INGRESS: Instant;
+    static INGRESS_UNIX_MS: Option<i64>;
     static CONTROLS: RequestControls;
     static BODY_HISTORY: std::cell::RefCell<Option<crate::history::streaming::DeliveryObservation>>;
 }
 pub(crate) async fn ingress<F: Future>(started: Instant, future: F) -> F::Output {
-    INGRESS.scope(started, future).await
+    // Wall sampled before elapsed subtraction: conversion errs earlier, never
+    // later. Stable relative clocks are an explicit distributed prerequisite.
+    let wall = std::time::SystemTime::now();
+    let unix_ms = wall
+        .checked_sub(started.elapsed())
+        .and_then(super::wire::unix_ms_floor);
+    INGRESS_UNIX_MS
+        .scope(unix_ms, INGRESS.scope(started, future))
+        .await
 }
 pub(crate) fn current() -> Option<RequestControls> {
     CONTROLS.try_with(|c| *c).ok()
@@ -157,7 +172,7 @@ where
 
 /// Scope includes observational history waits and fully buffered response
 /// rendering and independently owned body production. Native CPU work remains
-/// cooperative, not OS-preempted. Fanout/coordinator shards remain gated.
+/// cooperative, not OS-preempted. Fanout requires explicit wirev2 configuration.
 pub(crate) async fn run<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
@@ -221,8 +236,8 @@ where
     .await
 }
 
-/// Direct external shards resolve their own identity. Coordinator forwarding is
-/// deliberately unsupported until the separately reviewed controlled wire exists.
+/// Direct external v1 shards resolve their own identity. Controlled coordinator
+/// forwarding uses the distinct authenticated v2 route, never permissive v1.
 pub(crate) async fn run_shard<F>(
     authority: Option<Arc<ControlsAuthority>>,
     identity: CallerIdentity,
@@ -248,7 +263,7 @@ where
 }
 
 #[derive(Clone, Copy)]
-enum NativeResponse {
+pub(super) enum NativeResponse {
     Sql,
     Jaeger,
     Shard,
@@ -348,6 +363,41 @@ where
         },
         timeout_opt_out_ignored: caller.circuit_breakers == Some(false),
     };
+    let dispatch = match authority.distributed {
+        Some(config) if !handoff && tokio::time::Instant::now() < controls.deadline => {
+            Some(super::wire::Dispatch::admitted(
+                config,
+                &identity,
+                controls,
+                priority,
+                INGRESS_UNIX_MS
+                    .try_with(|n| *n)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(unavailable)?,
+            )?)
+        }
+        _ => None,
+    };
+    super::wire::dispatch_scope(
+        dispatch,
+        execute(authority, controls, native, priority, future),
+    )
+    .await
+}
+
+pub(super) async fn execute<F>(
+    authority: Arc<ControlsAuthority>,
+    controls: RequestControls,
+    native: NativeResponse,
+    priority: Priority,
+    future: F,
+) -> Result<Response, ApiError>
+where
+    F: Future<Output = Result<Response, ApiError>>,
+{
+    let timeout = controls.timeout;
+    let started = controls.started;
     let headers = match native {
         NativeResponse::Sql => None,
         NativeResponse::Jaeger => Some(jaeger_headers(controls)?),

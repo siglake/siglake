@@ -918,6 +918,8 @@ async fn real_signed_explicit_distributed_batch_refuses_before_work_not_handoff(
     issuer_owner.shutdown().await;
 }
 
+#[path = "fanout_controls.rs"]
+mod fanout_controls;
 #[path = "jaeger_controls.rs"]
 mod jaeger_controls;
 #[path = "shard_controls.rs"]
