@@ -29,7 +29,7 @@ The 72h profile records an intermediate 24h checkpoint; it is not a separately
 cleaned-up 24h run. Setup and final restart/cleanup time are outside the duration.
 A directory must be new: a failure or retry never overwrites earlier evidence.
 
-## Run an exact pre-tag v0.4.0 candidate
+## Run an exact pre-tag v0.4.1 candidate
 
 Candidate mode accepts only the smoke profile, anonymous public dependencies,
 one full lowercase source commit and the two public images named by that same
@@ -41,11 +41,11 @@ source commit. No tag, branch or fallback checkout is used.
 ```sh
 candidate_source=0123456789abcdef0123456789abcdef01234567
 python3 scripts/release-validation/run.py \
-  --version v0.4.0 --profile smoke \
+  --version v0.4.1 --profile smoke \
   --candidate-source "$candidate_source" \
   --candidate-engine-image "ghcr.io/siglake/siglake:$candidate_source" \
   --candidate-operator-image "ghcr.io/siglake/siglake-operator:$candidate_source" \
-  --out "$HOME/siglake-validation/v0.4.0-candidate-$(date -u +%Y%m%dT%H%M%SZ)"
+  --out "$HOME/siglake-validation/v0.4.1-candidate-$(date -u +%Y%m%dT%H%M%SZ)"
 ```
 
 The three candidate inputs are all-or-none. Candidate mode refuses `24h`,

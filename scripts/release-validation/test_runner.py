@@ -33,17 +33,17 @@ class IsolationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             v.isolated_config(config, 'release')
 
-    def test_version_selection_keeps_historical_checks_and_adds_0_4_0(self):
+    def test_version_selection_keeps_historical_checks_and_adds_0_4_1(self):
         self.assertEqual(
             v.SUPPORTED_VERSIONS,
-            ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0', 'v0.4.0'),
+            ('v0.1.0', 'v0.2.0', 'v0.2.1', 'v0.3.0', 'v0.4.0', 'v0.4.1'),
         )
-        self.assertEqual(v.PROVENANCE_VERSIONS, {'v0.2.1', 'v0.3.0', 'v0.4.0'})
+        self.assertEqual(v.PROVENANCE_VERSIONS, {'v0.2.1', 'v0.3.0', 'v0.4.0', 'v0.4.1'})
         self.assertEqual(
             v.QUERY_AUDIT_AGGREGATE_VERSIONS,
-            {'v0.2.1', 'v0.3.0', 'v0.4.0'},
+            {'v0.2.1', 'v0.3.0', 'v0.4.0', 'v0.4.1'},
         )
-        for version in ('v0.2.1', 'v0.3.0', 'v0.4.0'):
+        for version in ('v0.2.1', 'v0.3.0', 'v0.4.0', 'v0.4.1'):
             args = v.argument_parser().parse_args([
                 '--version', version, '--profile', 'smoke', '--out', '/unused'
             ])
@@ -58,25 +58,26 @@ class IsolationTests(unittest.TestCase):
         engine = f'ghcr.io/siglake/siglake:{source}'
         operator = f'ghcr.io/siglake/siglake-operator:{source}'
         self.assertEqual(
-            v.candidate_config('v0.4.0', 'smoke', 'public', source, engine, operator),
+            v.candidate_config('v0.4.1', 'smoke', 'public', source, engine, operator),
             {
                 'source_commit': source,
                 'images': {'engine': engine, 'operator': operator},
             },
         )
         refusals = (
-            ('v0.4.0', 'smoke', 'public', source, '', ''),
+            ('v0.4.1', 'smoke', 'public', source, '', ''),
             ('v0.3.0', 'smoke', 'public', source, engine, operator),
-            ('v0.4.0', '24h', 'public', source, engine, operator),
-            ('v0.4.0', '72h', 'public', source, engine, operator),
-            ('v0.4.0', 'smoke', 'cached-diagnostic', source, engine, operator),
-            ('v0.4.0', 'smoke', 'public', source[:-1], engine, operator),
+            ('v0.4.0', 'smoke', 'public', source, engine, operator),
+            ('v0.4.1', '24h', 'public', source, engine, operator),
+            ('v0.4.1', '72h', 'public', source, engine, operator),
+            ('v0.4.1', 'smoke', 'cached-diagnostic', source, engine, operator),
+            ('v0.4.1', 'smoke', 'public', source[:-1], engine, operator),
             (
-                'v0.4.0', 'smoke', 'public', source,
+                'v0.4.1', 'smoke', 'public', source,
                 f'ghcr.io/foreign/siglake:{source}', operator,
             ),
             (
-                'v0.4.0', 'smoke', 'public', source,
+                'v0.4.1', 'smoke', 'public', source,
                 'ghcr.io/siglake/siglake:0.4.0', operator,
             ),
         )
@@ -105,7 +106,7 @@ class IsolationTests(unittest.TestCase):
             ):
                 out = Path(temp) / f'refused-{index}'
                 argv = [
-                    '--version', 'v0.4.0',
+                    '--version', 'v0.4.1',
                     '--profile', 'smoke',
                     '--candidate-source', candidate_source,
                     '--candidate-engine-image', candidate_engine,
@@ -131,12 +132,12 @@ class IsolationTests(unittest.TestCase):
         engine = f'ghcr.io/siglake/siglake:{source}'
         operator = f'ghcr.io/siglake/siglake-operator:{source}'
         selections = (
-            ([], None, 'v0.4.0^{commit}'),
+            ([], None, 'v0.4.1^{commit}'),
             ([
                 '--candidate-source', '',
                 '--candidate-engine-image', '',
                 '--candidate-operator-image', '',
-            ], None, 'v0.4.0^{commit}'),
+            ], None, 'v0.4.1^{commit}'),
             ([
                 '--candidate-source', source,
                 '--candidate-engine-image', engine,
@@ -149,7 +150,7 @@ class IsolationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             for index, (candidate_args, expected_candidate, expected_ref) in enumerate(selections):
                 argv = [
-                    '--version', 'v0.4.0',
+                    '--version', 'v0.4.1',
                     '--profile', 'smoke',
                     '--out', str(Path(temp) / f'run-{index}'),
                     *candidate_args,
@@ -257,7 +258,7 @@ class IsolationTests(unittest.TestCase):
             / '.github/workflows/release-validation.yml'
         ).read_text()
         self.assertIn(
-            'version: [v0.1.0, v0.2.0, v0.2.1, v0.3.0, v0.4.0]',
+            'version: [v0.1.0, v0.2.0, v0.2.1, v0.3.0, v0.4.0, v0.4.1]',
             workflow,
         )
         for name in (
