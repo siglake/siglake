@@ -40,7 +40,12 @@ pub mod postgres_trust;
 
 #[cfg(test)]
 mod postgres_trust_tests;
+// One private signing fixture shared by Controls and batch-ownership tests.
 pub mod query_controls;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../siglake-ingest/tests/ingest/fake_idp.rs"]
+mod signing_fixture;
 mod sql;
 pub mod tenants;
 pub mod udfs;

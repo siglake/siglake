@@ -3,6 +3,8 @@ use crate::history::postgres_tests::{expire, fixture, json_row, options, termina
 use sqlx::Row;
 use std::future::Future;
 
+#[path = "batch_ownership_tests.rs"]
+mod batch_ownership_tests;
 #[path = "terminal_diagnosis_tests.rs"]
 mod terminal_diagnosis_tests;
 

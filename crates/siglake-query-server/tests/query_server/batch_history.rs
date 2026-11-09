@@ -975,6 +975,29 @@ async fn real_router_batch_v1_v2_owner_migration_binding_and_store_fault_compati
     issuer_task.abort();
 }
 
+// B: bounded live delivery observation, not the ownership oracle. A separately
+// exercises the actual router/driver with the queue consumer stopped and checks
+// its original selected terminal (history/runtime/batch_ownership_tests.rs).
+async fn association_terminal_or_partial(db: &PgPool, execution: Uuid) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let observation: Value = sqlx::query_scalar(
+            "SELECT to_jsonb(e) FROM query_history.executions e WHERE execution_id=$1",
+        )
+        .bind(execution)
+        .fetch_one(db)
+        .await
+        .unwrap();
+        match observation["observation_state"].as_str().unwrap() {
+            "terminal" => return observation,
+            "pending" if Instant::now() >= deadline => return observation,
+            "pending" => {}
+            _ => panic!("unexpected association observation state; not an allowed partial result"),
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[tokio::test]
 #[ignore = "owned PG fixture; scripts/check-query-history-batch.sh"]
 async fn real_router_batch_dropped_submit_during_association_owned_execution_and_delete() {
@@ -1099,6 +1122,8 @@ async fn real_router_batch_dropped_submit_during_association_owned_execution_and
                 // authoritative job completion remain available during the outage.
                 persisted(&f.admin, job, "succeeded").await;
                 assert!(started.elapsed() < Duration::from_secs(2));
+                // Aggregate service budget evidence only, never attribution
+                // of this terminal's delivery result to a particular timeout.
                 assert!(
                     service
                         .health()
@@ -1112,17 +1137,97 @@ async fn real_router_batch_dropped_submit_during_association_owned_execution_and
                 .unwrap();
             let expected = if cancel { "cancelled" } else { "succeeded" };
             persisted(&f.admin, job, expected).await;
-            eprintln!("owned association terminal wait: cancel={cancel}, outage={outage}");
-            let terminal = row(&f.admin, execution).await;
-            assert_eq!(
-                terminal["outcome"],
-                if cancel { "cancelled" } else { "success" }
-            );
-            assert_eq!(terminal["execution_admitted"], !cancel);
-            assert_eq!(terminal["job_id"], job.to_string());
-            assert_eq!(terminal["received_at"], initial["received_at"]);
-            assert_eq!(terminal["expires_at"], initial["expires_at"]);
-            assert_eq!(terminal["client_id"], "original-client");
+            // Healthy cases retain the original strict terminal check. Only
+            // the deliberately bounded association outage permits pending at
+            // the same4s/20ms observation bound; A supplies ownership proof.
+            let observation = if outage {
+                association_terminal_or_partial(&f.admin, execution).await
+            } else {
+                row(&f.admin, execution).await
+            };
+            let terminal_observed = observation["observation_state"] == "terminal";
+            if terminal_observed {
+                assert_eq!(
+                    observation["outcome"],
+                    if cancel { "cancelled" } else { "success" }
+                );
+                assert_eq!(observation["execution_admitted"], !cancel);
+                assert_eq!(observation["job_id"], job.to_string());
+                assert_eq!(observation["cache_state"], "bypass");
+                assert_eq!(
+                    observation["truncated"],
+                    if cancel { Value::Null } else { json!(false) }
+                );
+                assert!(observation["duration_ms"]
+                    .as_i64()
+                    .is_some_and(|elapsed| elapsed >= 0));
+                assert!(
+                    observation["measured_rows_scanned"].is_null()
+                        && observation["measured_bytes_scanned"].is_null()
+                );
+                if cancel {
+                    assert!(observation["returned_rows"].is_null());
+                }
+                assert_eq!(
+                    observation["error_code"],
+                    if cancel {
+                        json!("cancelled")
+                    } else {
+                        Value::Null
+                    }
+                );
+            } else {
+                assert!(outage && !cancel);
+                assert_eq!(observation["observation_state"], "pending");
+                assert!(
+                    observation["execution_admitted"].is_null()
+                        || observation["execution_admitted"] == true
+                );
+                assert!(
+                    observation["job_id"].is_null() || observation["job_id"] == job.to_string()
+                );
+                assert_eq!(observation["cache_state"], "unknown");
+                for key in [
+                    "outcome",
+                    "error_code",
+                    "finished_at",
+                    "finished_observed_at",
+                    "duration_ms",
+                    "truncated",
+                    "returned_rows",
+                    "estimated_bytes_scanned",
+                    "estimated_rows_processed",
+                    "measured_bytes_scanned",
+                    "measured_rows_scanned",
+                ] {
+                    assert!(
+                        observation[key].is_null(),
+                        "pending must retain SQL-NULL terminal measurements: {key}"
+                    );
+                }
+                eprintln!("association observation: permitted_partial_pending; not ownership proof; historical_cause=unknown");
+            }
+            for key in [
+                "execution_id",
+                "owner_uuid",
+                "tenant",
+                "issuer",
+                "client_id",
+                "principal_kind",
+                "received_at",
+                "expires_at",
+                "operation",
+                "format",
+                "priority",
+                "dry_run",
+            ] {
+                assert_eq!(
+                    observation[key], initial[key],
+                    "original receipt/identity changed: {key}"
+                );
+            }
+            assert_eq!(observation["client_id"], "original-client");
+            assert!(observation["admitted_at"].is_null() && observation["finished_at"].is_null());
             assert_eq!(
                 count(&f.admin).await,
                 before + 1,
@@ -1135,10 +1240,10 @@ async fn real_router_batch_dropped_submit_during_association_owned_execution_and
                     job_response(&s, &canceller, job, true).await.status(),
                     StatusCode::CONFLICT
                 );
-            } else {
-                assert_eq!(terminal["returned_rows"], 1);
+            } else if terminal_observed {
+                assert_eq!(observation["returned_rows"], 1);
             }
-            // The owned run must release its share after terminal observation too.
+            // Actual reservation release is independent of sink delivery.
             let free = tokio::time::timeout(Duration::from_secs(2), state.admission.acquire(1))
                 .await
                 .unwrap()

@@ -316,10 +316,8 @@ async fn generic_primary_preflight_has_no_named_revision_and_closed_is_not_absen
     authority.shutdown().await;
 }
 
-// Reference the existing test fixture rather than duplicating private key bytes.
-#[allow(dead_code)]
-#[path = "../../../../siglake-ingest/tests/ingest/fake_idp.rs"]
-mod mixed_signing_fixture;
+// Reference the single private fixture rather than duplicating key bytes/modules.
+use crate::signing_fixture as mixed_signing_fixture;
 
 #[tokio::test]
 #[ignore = "owned primary fixture; scripts/check-query-policy.sh"]
