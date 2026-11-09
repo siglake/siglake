@@ -52,6 +52,14 @@ impl<'a> PreparedDottedJsonAttrKey<'a> {
 
     /// Look up this prepared dotted key while preserving legacy results.
     pub fn lookup(&self, attributes: &str) -> Option<String> {
+        // A literal dotted projection can follow a large nested envelope. In
+        // that case speculative nested lookup is wasted: the literal wins.
+        // This SIMD substring check is only a performance hint. False hits
+        // (including keys inside string values) use the original lookup, and
+        // escaped literal keys missed by the hint still use the full scanner.
+        if memchr::memmem::find(attributes.as_bytes(), self.key.as_bytes()).is_some() {
+            return json_attr_lookup(attributes, self.key);
+        }
         let raw = match find_dotted_top_level_value(attributes, self.key, self.head, self.tail) {
             DottedTopLevelValue::Literal(value) => value,
             DottedTopLevelValue::Head(value) => value?,
@@ -498,6 +506,20 @@ mod tests {
             prepared.lookup(r#"{"a":{"b":"nested"},"a.b":"unterminated}"#),
             Some("nested".to_owned())
         );
+    }
+
+    #[test]
+    fn literal_hint_preserves_false_hits_and_escaped_literal_precedence() {
+        for json in [
+            r#"{"note":"a.b","a":{"b":9007199254741791}}"#,
+            r#"{"note":"a.b","a":{},"a":{"b":"later"}}"#,
+            r#"{"a":{"b":"nested"},"a.b":{"exact":9007199254741791}}"#,
+            r#"{"a":{"b":"nested"},"a\u002eb":"escaped"}"#,
+            r#"{"note":"a.b","a":{"b":"nested"},"a\u002eb":null}"#,
+            r#"{"note":"a.b","a":{"b":},"a\u002eb":"escaped"}"#,
+        ] {
+            assert_prepared_parity(json, "a.b");
+        }
     }
 
     #[test]
