@@ -32,8 +32,9 @@ pub(super) async fn verify(conn: &mut PgConnection, role: Role) -> Result<(), Po
  AND NOT has_any_column_privilege(current_user,'query_policy.agent_limits','INSERT,UPDATE,REFERENCES')
  AND NOT EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
    WHERE left(n.nspname,3) <> 'pg_' AND n.nspname <> 'information_schema' AND has_function_privilege(current_user,p.oid,'EXECUTE')
-    AND NOT ($1='qp_manager' AND n.nspname='query_policy' AND p.oid='query_policy.save(text,text,text,uuid,uuid,text,bigint,bigint,bigint)'::regprocedure))
- AND ($1 <> 'qp_manager' OR has_function_privilege(current_user,'query_policy.save(text,text,text,uuid,uuid,text,bigint,bigint,bigint)','EXECUTE'))
+    AND NOT ($1='qp_manager' AND n.nspname='query_policy' AND p.oid IN ('query_policy.save(text,text,text,uuid,uuid,text,bigint,bigint,bigint)'::regprocedure, 'query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer)'::regprocedure)))
+ AND ($1 <> 'qp_manager' OR (has_function_privilege(current_user,'query_policy.save(text,text,text,uuid,uuid,text,bigint,bigint,bigint)','EXECUTE')
+   AND has_function_privilege(current_user,'query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer)','EXECUTE')))
  FROM pg_roles r WHERE r.rolname=current_user
  "#).bind(role.name()).fetch_one(&mut *conn).await.map_err(|_| PolicyError::Unavailable)?;
     if !safe {
@@ -43,8 +44,9 @@ pub(super) async fn verify(conn: &mut PgConnection, role: Role) -> Result<(), Po
         .fetch_one(conn)
         .await
         .map_err(|_| PolicyError::Unavailable)?;
-    let expected: serde_json::Value = serde_json::from_str(include_str!("schema-v1-contract.json"))
-        .expect("reviewed policy manifest");
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("schema-layout-v2-contract.json"))
+            .expect("reviewed policy manifest");
     if actual != expected {
         return Err(PolicyError::Unsafe);
     }

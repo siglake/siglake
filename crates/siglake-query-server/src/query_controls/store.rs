@@ -59,6 +59,67 @@ impl PolicyManager {
     pub async fn lookup(&self, binding: &ManagementBinding) -> Result<PolicyLookup, PolicyError> {
         lookup(&self.pool, &binding.key, Some(binding)).await
     }
+    /// Bounded primary read of unexpired edits for one server-selected binding.
+    /// The context constructor is NOT human/session authorization. The next
+    /// Console layer must authorize the current same-org human on every page.
+    pub async fn audit_page(
+        &self,
+        binding: &ManagementBinding,
+        context: &AuthorizedHumanManagementContext,
+        request: AuditPageRequest,
+    ) -> Result<AuditPage, PolicyError> {
+        if context.org != binding.org {
+            return Err(PolicyError::Binding);
+        }
+        tokio::time::timeout(self.pool.budget, async {
+            let mut lease = self.pool.acquire().await?;
+            let mut tx = begin(&mut lease, &binding.key, true, self.pool.budget).await?;
+            let result = sqlx::query("SELECT schema_version,revision,actor_sub,edited_at,expires_at,old_timeout_seconds,old_scan_bytes_warning,new_timeout_seconds,new_scan_bytes_warning FROM query_policy.read_edits($1,$2,$3,$4,$5,$6,$7)")
+                .bind(&binding.key.tenant).bind(&binding.key.issuer).bind(&binding.key.client)
+                .bind(binding.org).bind(binding.credential).bind(request.before_revision)
+                .bind(i32::from(request.limit)).fetch_all(&mut *tx).await;
+            let rows = match result {
+                Ok(rows) => rows,
+                Err(e) => {
+                    let error = save_error(&e);
+                    tx.rollback().await.map_err(|_| PolicyError::Unavailable)?;
+                    lease.complete().await?;
+                    return Err(error);
+                }
+            };
+            if rows.len() > usize::from(request.limit) {
+                return Err(PolicyError::Unavailable);
+            }
+            let mut edits = Vec::with_capacity(rows.len());
+            let mut before = request.before_revision;
+            for row in rows {
+                let decode = |_: sqlx::Error| PolicyError::Unavailable;
+                let edit = PolicyEdit {
+                    schema_version: row.try_get("schema_version").map_err(decode)?,
+                    revision: row.try_get("revision").map_err(decode)?,
+                    actor_sub: row.try_get("actor_sub").map_err(decode)?,
+                    edited_at: row.try_get("edited_at").map_err(decode)?,
+                    expires_at: row.try_get("expires_at").map_err(decode)?,
+                    old_settings: SavedSettings::new(row.try_get("old_timeout_seconds").map_err(decode)?, row.try_get("old_scan_bytes_warning").map_err(decode)?).map_err(|_| PolicyError::Unavailable)?,
+                    new_settings: SavedSettings::new(row.try_get("new_timeout_seconds").map_err(decode)?, row.try_get("new_scan_bytes_warning").map_err(decode)?).map_err(|_| PolicyError::Unavailable)?,
+                };
+                edit.validate()?;
+                if before.is_some_and(|revision| edit.revision >= revision) {
+                    return Err(PolicyError::Unavailable);
+                }
+                before = Some(edit.revision);
+                edits.push(edit);
+            }
+            tx.commit().await.map_err(|_| PolicyError::Unavailable)?;
+            lease.complete().await?;
+            let next_before_revision = if edits.len() == usize::from(request.limit) {
+                edits.last().map(|edit| edit.revision)
+            } else {
+                None
+            };
+            Ok(AuditPage { edits, next_before_revision })
+        }).await.map_err(|_| PolicyError::Unavailable)?
+    }
     /// Caller must already authorize the human session, exact org/credential UUID,
     /// ready binding and Origin. Manager GUC selection is NOT compromised-app
     /// isolation. A returned Unavailable can mean COMMIT outcome is UNKNOWN:

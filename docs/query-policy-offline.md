@@ -1,5 +1,9 @@
 # Query policy v1: OFFLINE authority only
 
+Controls5A adds the [management edit-audit/read/purge contract](../crates/siglake-query-server/src/query_controls/audit-contract.md).
+It supersedes the original ledger's retention/access and DB-layout statements;
+policy/wire schema_version remains 1. This is local source/manual-schema only.
+
 This document describes the accepted offline store contract. It does **not**
 authorize runtime activation or production migration. Subsequent injection-only
 buffered request work is documented in [query-controls-buffered.md](query-controls-buffered.md);
@@ -21,7 +25,9 @@ are production approval gates, not engine startup behavior.
 FORCE RLS protects both tables; tenant GUCs are transaction-local. Every read uses
 exact tenant/verified issuer/verified client predicates with byte-exact `C`
 collation (also checked in the manifest). Reader selects policy only;
-manager selects policy and executes one atomic save function, not actor audit.
+manager selects policy and executes atomic save plus bounded exact-binding
+`read_edits`, without direct audit-table access. Owner-only manual expired-edit
+purge is not a manager capability.
 The definer has a fixed `pg_catalog` search path, qualified policy objects, no
 dynamic SQL, explicit tenant/binding/value validation, and revoked PUBLIC EXECUTE.
 A trigger prevents key/binding/schema remapping and nonsequential revisions.
@@ -32,11 +38,15 @@ all-NULL reset saves a new revision, never deletes. Immutable runtime and
 org/credential UUID bindings have separate uniqueness; there is no cross-database
 FK, cascade, rebinding or credential lifecycle automation. Edits contain only safe
 numeric old/new values, tenant/org/credential references, version/revision,
-timestamp and verified human actor (256-byte storage bound).
+original DB timestamp, coherent immutable expiry and verified human actor
+(256-byte storage bound).
 
-**Production retention, authorized audit access and erasure require explicit owner
-approval. No audit duration is selected. Query history's 30 days is NOT authority
-for this audit.** There is intentionally no audit browsing API in this slice.
+**Approved edit retention is exactly 720 hours, with same-org authorized human
+operator reads. Active policy survives audit expiry/purge.** Query history's 30
+days is NOT authority for this audit. The bounded store page is not an HTTP API
+or human-auth implementation. Production migration/grants/job/purge authorization
+and broader erasure remain separate gates; no automatic migration/backfill or
+physical erasure is supplied. See the linked Controls5A contract for prerequisites.
 
 ## Explicit configuration and owned lifecycle
 
@@ -64,8 +74,10 @@ still supply a trusted primary target (no discovery or logical-replica attestati
 SQL wildcard prefix. Unsafe roles/schema fail closed.
 
 `integrity.sql` projects an OID-independent fixed policy-object manifest;
-`schema-v1-contract.json` is the fixed reviewed PostgreSQL 16.14 reference, not a
-learned runtime baseline. It covers owner/ACLs, columns/defaults, constraints,
+`schema-layout-v2-contract.json` is the fixed DB-layout-v2 reference generated on
+owned PostgreSQL 16.13 for Controls5A, not a learned runtime baseline. Per-policy
+and response schema_version remains 1; existing layouts require a separate
+reviewed manual upgrade, not runtime migration. It covers owner/ACLs, columns/defaults, constraints,
 indexes, triggers, rules, RLS policies and full function definitions/configuration.
 Compatibility with different server catalog rendering requires review; a mismatch
 is unavailable/unsafe, never a reason to skip checking or inherit. The manifest
@@ -188,9 +200,13 @@ See [public root provenance, additive SQLx semantics and rotation](../crates/sig
 Pinned addition bytes do not mean exclusive trust: WebPKI roots remain accepted.
 Actual RDS TLS/role/schema compatibility and coordinated rollout remain gates.
 
-### Owned PostgreSQL16.13 compatibility check
+### Historical owned PostgreSQL16.13 compatibility check (pre-Controls5A)
 
-The unchanged reviewed PG16.14 integrity manifest (`schema-v1-contract.json`,
+This subsection records earlier evidence, not the current layout-v2 manifest or
+this slice's toolchain claims. Controls5A uses only the approved cached SSL-capable
+PG16.13 prefix; it does not rerun 16.14, download tools or qualify two versions.
+
+The then-unchanged reviewed PG16.14 integrity manifest (`schema-v1-contract.json`,
 SHA256 `16fe62ee8fddbe6453e68754d3feec2697fa12e8eab3d830d6e5e66b292c6fd6`) was accepted by the owned
 socket-only PostgreSQL16.13 fixture: the full policy role/schema/tamper/CAS/primary/
 transaction suite plus signed buffered-controls selection passed. No catalog output

@@ -1,6 +1,8 @@
 //! Policy store and injection-only request/job authority. No env/main
 //! activation. Public job snapshots are explanatory. Supplied metadata constructors
 //! are NOT authentication proof; runtime derives keys from verified identity.
+mod audit;
+pub use audit::*;
 pub(crate) mod body;
 mod config;
 mod dto;

@@ -537,6 +537,16 @@ async fn checkout_rejects_role_schema_table_column_function_ownership_membership
       ("ALTER TABLE query_policy.agent_limits ADD CONSTRAINT tamper CHECK (revision<100)","ALTER TABLE query_policy.agent_limits DROP CONSTRAINT tamper"),
       ("ALTER TABLE query_policy.agent_limits ALTER COLUMN timeout_seconds TYPE numeric","ALTER TABLE query_policy.agent_limits DROP CONSTRAINT agent_limits_timeout_seconds_check; ALTER TABLE query_policy.agent_limits ALTER COLUMN timeout_seconds TYPE bigint; ALTER TABLE query_policy.agent_limits ADD CONSTRAINT agent_limits_timeout_seconds_check CHECK (timeout_seconds > 0 AND timeout_seconds <= 9223372036854775)"),
       ("ALTER TABLE query_policy.edits OWNER TO qp_manager","ALTER TABLE query_policy.edits OWNER TO qp_owner"),
+      ("GRANT EXECUTE ON FUNCTION query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer) TO qp_reader","REVOKE EXECUTE ON FUNCTION query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer) FROM qp_reader"),
+      ("GRANT EXECUTE ON FUNCTION query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer) TO PUBLIC","REVOKE EXECUTE ON FUNCTION query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer) FROM PUBLIC"),
+      ("GRANT EXECUTE ON FUNCTION query_policy.purge_expired_edits(text,integer) TO qp_manager","REVOKE EXECUTE ON FUNCTION query_policy.purge_expired_edits(text,integer) FROM qp_manager"),
+      ("GRANT EXECUTE ON FUNCTION query_policy.purge_expired_edits(text,integer) TO PUBLIC","REVOKE EXECUTE ON FUNCTION query_policy.purge_expired_edits(text,integer) FROM PUBLIC"),
+      ("GRANT UPDATE(expires_at) ON query_policy.edits TO qp_manager","REVOKE UPDATE(expires_at) ON query_policy.edits FROM qp_manager"),
+      ("ALTER TABLE query_policy.edits DISABLE TRIGGER guard_edit","ALTER TABLE query_policy.edits ENABLE TRIGGER guard_edit"),
+      ("ALTER FUNCTION query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer) SET search_path=public","ALTER FUNCTION query_policy.read_edits(text,text,text,uuid,uuid,bigint,integer) SET search_path=pg_catalog"),
+      ("ALTER FUNCTION query_policy.purge_expired_edits(text,integer) SECURITY DEFINER","ALTER FUNCTION query_policy.purge_expired_edits(text,integer) SECURITY INVOKER"),
+      ("ALTER TABLE query_policy.edits DROP CONSTRAINT edits_retention_check","ALTER TABLE query_policy.edits ADD CONSTRAINT edits_retention_check CHECK (expires_at-edited_at=interval '720 hours')"),
+      ("CREATE FUNCTION query_policy.unexpected() RETURNS integer LANGUAGE sql AS 'SELECT 1'; REVOKE ALL ON FUNCTION query_policy.unexpected() FROM PUBLIC","DROP FUNCTION query_policy.unexpected()"),
     ];
     for (change, undo) in cases {
         sql(&f, change).await;
@@ -587,7 +597,7 @@ async fn audit_failure_rolls_back_first_and_update_policy_atomically() {
     let b = binding(key("tenant", "issuer", "client"));
     // Deliberately preoccupy the audit revision; policy schema remains canonical.
     // A real INSERT failure inside save must undo its earlier policy INSERT.
-    sqlx::query("INSERT INTO query_policy.edits VALUES('tenant',$1,$2,1,1,'fixture-human',clock_timestamp(),NULL,NULL,NULL,NULL)").bind(b.org).bind(b.credential).execute(&f.admin).await.unwrap();
+    sqlx::query("INSERT INTO query_policy.edits (tenant,org_uuid,credential_uuid,schema_version,revision,actor_sub) VALUES('tenant',$1,$2,1,1,'fixture-human')").bind(b.org).bind(b.credential).execute(&f.admin).await.unwrap();
     assert_eq!(
         manager
             .save(&b, &actor(), save(0, Some(10), Some(20)))
@@ -600,7 +610,7 @@ async fn audit_failure_rolls_back_first_and_update_policy_atomically() {
         .save(&b, &actor(), save(0, Some(10), Some(20)))
         .await
         .unwrap();
-    sqlx::query("INSERT INTO query_policy.edits VALUES('tenant',$1,$2,1,2,'fixture-human',clock_timestamp(),NULL,NULL,NULL,NULL)").bind(b.org).bind(b.credential).execute(&f.admin).await.unwrap();
+    sqlx::query("INSERT INTO query_policy.edits (tenant,org_uuid,credential_uuid,schema_version,revision,actor_sub) VALUES('tenant',$1,$2,1,2,'fixture-human')").bind(b.org).bind(b.credential).execute(&f.admin).await.unwrap();
     assert_eq!(
         manager.save(&b, &actor(), save(1, None, None)).await,
         Err(PolicyError::Unavailable)
@@ -1188,4 +1198,450 @@ async fn owned_late_error_cancellation_and_close_do_not_log_upstream_error_body(
     );
     assert!(!output.contains(SENTINEL));
     // This is a late ERROR/release regression, NOT a NOTICE/INFO guarantee.
+}
+
+fn human_context(b: &ManagementBinding) -> AuthorizedHumanManagementContext {
+    AuthorizedHumanManagementContext::from_trusted_metadata(b.org, actor()).unwrap()
+}
+async fn page(
+    manager: &PolicyManager,
+    b: &ManagementBinding,
+    limit: u16,
+    before: Option<i64>,
+) -> AuditPage {
+    manager
+        .audit_page(
+            b,
+            &human_context(b),
+            AuditPageRequest::new(limit, before).unwrap(),
+        )
+        .await
+        .unwrap()
+}
+/// Fixture-only time travel, NOT deployed owner mutation authority. Keep the
+/// canonical trigger enabled again BEFORE any role-limited call/checkout.
+async fn age_edits(f: &Fixture, b: &ManagementBinding, through: i64) {
+    let mut tx = f.admin.begin().await.unwrap();
+    sqlx::query("ALTER TABLE query_policy.edits DISABLE TRIGGER guard_edit")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE query_policy.edits SET edited_at=statement_timestamp()-interval '721 hours', expires_at=statement_timestamp()-interval '1 hour' WHERE org_uuid=$1 AND credential_uuid=$2 AND revision <= $3")
+        .bind(b.org).bind(b.credential).bind(through).execute(&mut *tx).await.unwrap();
+    sqlx::query("ALTER TABLE query_policy.edits ENABLE TRIGGER guard_edit")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+/// Fixture admin switches to the existing NOLOGIN/non-bypass owner, rather than
+/// presenting an admin DELETE as proof of FORCE-RLS-respecting purge authority.
+async fn owner_purge(f: &Fixture, tenant: &str, limit: i32) -> i32 {
+    let mut tx = f.admin.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE qp_owner")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let safe: bool = sqlx::query_scalar("SELECT current_user='qp_owner' AND NOT rolsuper AND NOT rolbypassrls AND NOT rolcanlogin FROM pg_roles WHERE rolname=current_user").fetch_one(&mut *tx).await.unwrap();
+    assert!(safe);
+    sqlx::query("SELECT set_config('query_policy.tenant',$1,true)")
+        .bind(tenant)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let foreign: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM query_policy.edits WHERE tenant <> $1")
+            .bind(tenant)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(foreign, 0, "NOLOGIN owner must respect FORCE RLS");
+    let count = sqlx::query_scalar("SELECT query_policy.purge_expired_edits($1,$2)")
+        .bind(tenant)
+        .bind(limit)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    count
+}
+
+#[tokio::test]
+#[ignore = "new owned disposable PG only: scripts/check-query-policy.sh"]
+async fn audit_management_exact_binding_bounded_stable_pages_and_original_720h_expiry() {
+    let f = fixture().await;
+    let manager = PolicyManager::connect(config(&f, Role::Manager))
+        .await
+        .unwrap();
+    let b = binding(key("tenant", "https://issuer.invalid/", "reused-client"));
+    assert!(page(&manager, &b, 2, None).await.edits.is_empty());
+    for rev in 0..5 {
+        manager
+            .save(&b, &actor(), save(rev, Some(10 + rev), Some(100 + rev)))
+            .await
+            .unwrap();
+    }
+    let first = page(&manager, &b, 2, None).await;
+    assert_eq!(
+        first.edits.iter().map(|e| e.revision).collect::<Vec<_>>(),
+        vec![5, 4]
+    );
+    assert_eq!(first.next_before_revision, Some(4));
+    for e in &first.edits {
+        assert_eq!(e.expires_at - e.edited_at, chrono::Duration::hours(720));
+        assert_eq!(e.actor_sub, "synthetic-verified-human");
+        assert_eq!(e.schema_version, 1);
+        assert_eq!(e.new_settings.timeout_seconds(), Some(9 + e.revision));
+        assert_eq!(e.old_settings.timeout_seconds(), Some(8 + e.revision));
+        assert!(!format!("{e:?}").contains("synthetic-verified-human"));
+    }
+    let db_stamped: bool = sqlx::query_scalar("SELECT bool_and(edited_at <= clock_timestamp() AND edited_at > clock_timestamp()-interval '1 minute' AND expires_at-edited_at=interval '720 hours') FROM query_policy.edits").fetch_one(&f.admin).await.unwrap();
+    assert!(db_stamped);
+    // Successful reset is a NEW edit, not renewal of any original edit.
+    manager
+        .save(&b, &actor(), save(5, None, None))
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.save(&b, &actor(), save(5, Some(1), None)).await,
+        Err(PolicyError::Conflict)
+    );
+    let second = page(&manager, &b, 2, first.next_before_revision).await;
+    assert_eq!(
+        second.edits.iter().map(|e| e.revision).collect::<Vec<_>>(),
+        vec![3, 2]
+    );
+    let third = page(&manager, &b, 2, second.next_before_revision).await;
+    assert_eq!(
+        third.edits.iter().map(|e| e.revision).collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(third.next_before_revision, None);
+    assert_eq!(page(&manager, &b, 2, None).await.edits[1], first.edits[0]);
+    let foreign_context =
+        AuthorizedHumanManagementContext::from_trusted_metadata(Uuid::new_v4(), actor()).unwrap();
+    assert_eq!(
+        manager
+            .audit_page(
+                &b,
+                &foreign_context,
+                AuditPageRequest::new(2, None).unwrap()
+            )
+            .await,
+        Err(PolicyError::Binding)
+    );
+    for wrong in [
+        ManagementBinding::from_trusted_metadata(b.key.clone(), Uuid::new_v4(), b.credential)
+            .unwrap(),
+        ManagementBinding::from_trusted_metadata(b.key.clone(), b.org, Uuid::new_v4()).unwrap(),
+    ] {
+        assert_eq!(
+            manager
+                .audit_page(
+                    &wrong,
+                    &human_context(&wrong),
+                    AuditPageRequest::new(2, None).unwrap()
+                )
+                .await,
+            Err(PolicyError::Binding)
+        );
+    }
+    for k in [
+        key("other", "https://issuer.invalid/", "reused-client"),
+        key("tenant", "https://issuer.invalid", "reused-client"),
+        key("tenant", "https://issuer.invalid/", "other-client"),
+    ] {
+        let remap =
+            ManagementBinding::from_trusted_metadata(k.clone(), b.org, b.credential).unwrap();
+        assert!(page(&manager, &remap, 100, None).await.edits.is_empty());
+        let independent = binding(k);
+        manager
+            .save(&independent, &actor(), save(0, Some(99), None))
+            .await
+            .unwrap();
+        assert_eq!(page(&manager, &independent, 100, None).await.edits.len(), 1);
+        assert_eq!(
+            manager
+                .audit_page(
+                    &remap,
+                    &human_context(&remap),
+                    AuditPageRequest::new(1, None).unwrap()
+                )
+                .await,
+            Err(PolicyError::Binding)
+        );
+    }
+    // Reads do not renew the original timestamps. The database, not the DTO or
+    // application clock, excludes expired rows while the policy remains known.
+    age_edits(&f, &b, 4).await;
+    let live = page(&manager, &b, 100, None).await;
+    assert_eq!(
+        live.edits.iter().map(|e| e.revision).collect::<Vec<_>>(),
+        vec![6, 5]
+    );
+    assert_eq!(live.edits[1], first.edits[0]);
+    assert!(page(&manager, &b, 100, Some(5)).await.edits.is_empty());
+    let mut lease = manager.pool.acquire().await.unwrap();
+    assert!(tenant(&mut lease).await.is_none_or(|v| v.is_empty()));
+    lease.complete().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "new owned disposable PG only: scripts/check-query-policy.sh"]
+async fn audit_owner_expired_purge_is_bounded_force_rls_and_policy_survives_all_null() {
+    let f = fixture().await;
+    let manager = PolicyManager::connect(config(&f, Role::Manager))
+        .await
+        .unwrap();
+    let reader = PolicyReader::connect(config(&f, Role::Reader))
+        .await
+        .unwrap();
+    let a = binding(key("a", "issuer", "same-client"));
+    let b = binding(key("b", "issuer", "same-client"));
+    for binding in [&a, &b] {
+        manager
+            .save(binding, &actor(), save(0, Some(12), Some(100)))
+            .await
+            .unwrap();
+        manager
+            .save(binding, &actor(), save(1, None, None))
+            .await
+            .unwrap();
+        manager
+            .save(binding, &actor(), save(2, None, None))
+            .await
+            .unwrap();
+        age_edits(&f, binding, 2).await;
+    }
+    // Expired audit rows cannot be mutated, even by ordinary owner DML.
+    for statement in [
+        "UPDATE query_policy.edits SET expires_at=expires_at-interval '1 hour'",
+        "UPDATE query_policy.edits SET edited_at=edited_at-interval '1 hour', expires_at=expires_at-interval '1 hour'",
+        "UPDATE query_policy.edits SET revision=revision+10",
+        "UPDATE query_policy.edits SET tenant='b'",
+        "UPDATE query_policy.edits SET actor_sub='another-human'",
+        "DELETE FROM query_policy.edits WHERE revision=3",
+    ] {
+        let mut tx=f.admin.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE qp_owner").execute(&mut *tx).await.unwrap();
+        sqlx::query("SELECT set_config('query_policy.tenant','a',true)").execute(&mut *tx).await.unwrap();
+        let e=sqlx::query(statement).execute(&mut *tx).await.unwrap_err();
+        assert_eq!(e.as_database_error().unwrap().code().as_deref(),Some("QP002"));
+        tx.rollback().await.unwrap();
+    }
+    assert_eq!(owner_purge(&f, "a", 1).await, 1);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM query_policy.edits WHERE tenant='b'")
+        .fetch_one(&f.admin)
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(owner_purge(&f, "a", 1000).await, 1);
+    assert_eq!(owner_purge(&f, "a", 1000).await, 0);
+    let live = page(&manager, &a, 100, None).await;
+    assert_eq!(live.edits.len(), 1);
+    assert_eq!(live.edits[0].revision, 3);
+    let unchanged = live.edits[0].clone();
+    assert_eq!(page(&manager, &a, 100, None).await.edits[0], unchanged);
+    assert_eq!(owner_purge(&f, "b", 1000).await, 2);
+    age_edits(&f, &a, 3).await;
+    assert!(page(&manager, &a, 100, None).await.edits.is_empty());
+    assert_eq!(owner_purge(&f, "a", 1000).await, 1);
+    let lookup = reader.lookup(&a.key).await.unwrap();
+    assert_eq!(lookup.state(), PolicyState::Inherited);
+    assert_eq!(lookup.revision(), Some(3));
+    assert_eq!(manager.lookup(&a).await.unwrap(), lookup);
+    assert_eq!(
+        manager.save(&a, &actor(), save(0, None, None)).await,
+        Err(PolicyError::Conflict)
+    );
+    let next = manager
+        .save(&a, &actor(), save(3, Some(7), Some(90)))
+        .await
+        .unwrap();
+    assert_eq!(next.revision(), 4);
+    age_edits(&f, &a, 4).await;
+    assert_eq!(owner_purge(&f, "a", 1000).await, 1);
+    assert_eq!(
+        reader.lookup(&a.key).await.unwrap(),
+        PolicyLookup::Found(next)
+    );
+    assert_eq!(next.settings().timeout_seconds(), Some(7));
+    assert!(page(&manager, &a, 100, None).await.edits.is_empty());
+    // Never gain cross-tenant authority via a purge argument or invalid bound.
+    for (requested, limit) in [("b", 1), ("a", 0), ("a", 1001), ("a", -1)] {
+        let mut tx = f.admin.begin().await.unwrap();
+        sqlx::query("SET LOCAL ROLE qp_owner")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("SELECT set_config('query_policy.tenant','a',true)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let e = sqlx::query("SELECT query_policy.purge_expired_edits($1,$2)")
+            .bind(requested)
+            .bind(limit)
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            e.as_database_error().unwrap().code().as_deref(),
+            Some("QP003")
+        );
+        tx.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "new owned disposable PG only: scripts/check-query-policy.sh"]
+async fn audit_role_limited_interfaces_deny_writes_expiry_purge_and_unbounded_reads() {
+    let f = fixture().await;
+    let manager = PolicyManager::connect(config(&f, Role::Manager))
+        .await
+        .unwrap();
+    let b = binding(key("a", "issuer", "client"));
+    manager
+        .save(&b, &actor(), save(0, None, None))
+        .await
+        .unwrap();
+    // Even trusted owner INSERT cannot supply a renewable/backdated clock; this
+    // synthetic row is rolled back, not a deployed direct-write workflow.
+    let mut stamp_tx = f.admin.begin().await.unwrap();
+    sqlx::query("SET LOCAL ROLE qp_owner")
+        .execute(&mut *stamp_tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT set_config('query_policy.tenant','a',true)")
+        .execute(&mut *stamp_tx)
+        .await
+        .unwrap();
+    let db_stamp: bool=sqlx::query_scalar("INSERT INTO query_policy.edits (tenant,org_uuid,credential_uuid,schema_version,revision,actor_sub,edited_at,expires_at) VALUES ('a',$1,$2,1,2,'fixture-human','2000-01-01','2099-01-01') RETURNING edited_at >= statement_timestamp() AND edited_at <= clock_timestamp() AND expires_at-edited_at=interval '720 hours'").bind(b.org).bind(b.credential).fetch_one(&mut *stamp_tx).await.unwrap();
+    assert!(db_stamp);
+    stamp_tx.rollback().await.unwrap();
+    for role in ["qp_reader", "qp_manager", "qh_reader", "qh_writer"] {
+        let mut c = PgConnection::connect_with(&options(&f.socket, role))
+            .await
+            .unwrap();
+        for statement in [
+            "SELECT query_policy.purge_expired_edits('a',1)",
+            "DELETE FROM query_policy.edits",
+            "UPDATE query_policy.edits SET expires_at=clock_timestamp()",
+            "ALTER TABLE query_policy.edits DISABLE TRIGGER guard_edit",
+            "SELECT query_policy.guard_edit()",
+            "SELECT query_policy.immutable_binding()",
+        ] {
+            assert!(
+                sqlx::query(statement).execute(&mut c).await.is_err(),
+                "unexpected authority: {role} {statement}"
+            );
+        }
+        if role != "qp_manager" {
+            assert!(sqlx::query(
+                "SELECT * FROM query_policy.read_edits('a','issuer','client',$1,$2,NULL,1)"
+            )
+            .bind(b.org)
+            .bind(b.credential)
+            .execute(&mut c)
+            .await
+            .is_err());
+        }
+    }
+    let mut c = PgConnection::connect_with(&options(&f.socket, "qp_manager"))
+        .await
+        .unwrap();
+    for (tenant_arg, limit, cursor) in [
+        ("a", 0, None),
+        ("a", 101, None),
+        ("a", -1, None),
+        ("a", 1, Some(0_i64)),
+        ("a", 1, Some(-1)),
+        ("b", 1, None),
+    ] {
+        let mut tx = c.begin().await.unwrap();
+        sqlx::query("SELECT set_config('query_policy.tenant','a',true)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let e =
+            sqlx::query("SELECT * FROM query_policy.read_edits($1,'issuer','client',$2,$3,$4,$5)")
+                .bind(tenant_arg)
+                .bind(b.org)
+                .bind(b.credential)
+                .bind(cursor)
+                .bind(limit)
+                .execute(&mut *tx)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            e.as_database_error().unwrap().code().as_deref(),
+            Some("QP003")
+        );
+        tx.rollback().await.unwrap();
+        assert!(tenant(&mut c).await.is_none_or(|v| v.is_empty()));
+    }
+    // GUC on a different connection cannot supply the function's context.
+    let mut other = PgConnection::connect_with(&options(&f.socket, "qp_manager"))
+        .await
+        .unwrap();
+    let mut tx = c.begin().await.unwrap();
+    sqlx::query("SELECT set_config('query_policy.tenant','a',true)")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    assert!(sqlx::query(
+        "SELECT * FROM query_policy.read_edits('a','issuer','client',$1,$2,NULL,1)"
+    )
+    .bind(b.org)
+    .bind(b.credential)
+    .execute(&mut other)
+    .await
+    .is_err());
+    tx.rollback().await.unwrap();
+    assert_eq!(page(&manager, &b, 1, None).await.edits.len(), 1);
+    let mut lease = manager.pool.acquire().await.unwrap();
+    assert!(tenant(&mut lease).await.is_none_or(|v| v.is_empty()));
+    lease.complete().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "new owned disposable PG only: scripts/check-query-policy.sh"]
+async fn audit_read_cancellation_rollback_and_reused_manager_connection_have_no_tenant_leak() {
+    let f = fixture().await;
+    let manager = PolicyManager::connect(config(&f, Role::Manager))
+        .await
+        .unwrap();
+    let a = binding(key("a", "issuer", "client"));
+    let b = binding(key("b", "issuer", "client"));
+    for binding in [&a, &b] {
+        manager
+            .save(binding, &actor(), save(0, Some(10), None))
+            .await
+            .unwrap();
+    }
+    let context = human_context(&a);
+    let request = AuditPageRequest::new(1, None).unwrap();
+    let mut guard = f.admin.begin().await.unwrap();
+    sqlx::query("LOCK TABLE query_policy.edits IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *guard)
+        .await
+        .unwrap();
+    assert!(timeout(
+        Duration::from_millis(100),
+        manager.audit_page(&a, &context, request)
+    )
+    .await
+    .is_err());
+    assert_eq!(manager.pool.idle_count(), 0);
+    guard.rollback().await.unwrap();
+    assert_eq!(page(&manager, &b, 1, None).await.edits.len(), 1);
+    let mut lease = manager.pool.acquire().await.unwrap();
+    let original = pid(&mut lease).await;
+    assert!(tenant(&mut lease).await.is_none_or(|s| s.is_empty()));
+    lease.complete().await.unwrap();
+    drop(lease);
+    assert_eq!(page(&manager, &a, 1, None).await.edits.len(), 1);
+    let mut lease = manager.pool.acquire().await.unwrap();
+    assert_eq!(pid(&mut lease).await, original);
+    assert!(tenant(&mut lease).await.is_none_or(|s| s.is_empty()));
+    lease.complete().await.unwrap();
 }

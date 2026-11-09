@@ -1,5 +1,7 @@
 -- Canonical, OID-independent PostgreSQL catalog projection. Compared with the
--- reviewed schema-v1 manifest on EVERY checkout, never learned at runtime.
+-- reviewed DB-layout-v2 manifest on EVERY checkout, never learned at runtime.
+-- Policy/wire schema_version remains 1; this projection includes exact new
+-- audit columns, constraints, indexes, triggers, functions and every ACL.
 SELECT jsonb_build_object(
  'schema', (SELECT jsonb_build_object('owner',pg_get_userbyid(nspowner),'acl',
    (SELECT jsonb_agg(jsonb_build_array(COALESCE(r.rolname,'PUBLIC'),a.privilege_type,a.is_grantable) ORDER BY COALESCE(r.rolname,'PUBLIC'),a.privilege_type)
