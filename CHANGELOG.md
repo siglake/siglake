@@ -2,10 +2,14 @@
 
 ## Unreleased
 
+## 0.4.1
+
 - **Attribute lookup performance:** JSON string scanning uses vectorized quote
-  and escape search. Dotted-key precedence and lookup results are unchanged.
-  Further reductions in repeated object traversal are under investigation;
-  no general query speedup is claimed.
+  and escape search. Constant dotted-key queries choose between equivalent
+  traversal strategies once per Arrow batch, reducing repeated scans of nested
+  objects while retaining literal dotted-key precedence. Mixed row layouts,
+  duplicate keys, NULLs and exact numeric values retain their existing results.
+  Workload-specific measurements do not establish a general query speedup.
 
 - **WAL fallback diagnostics:** committed-only query fallbacks record the
   stage and reason in a bounded-label counter and a matching tracing event.
