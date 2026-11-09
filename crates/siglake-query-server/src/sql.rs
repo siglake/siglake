@@ -301,6 +301,7 @@ impl RequestClock {
         crate::query_controls::runtime::current().map(|c| Self {
             started: c.started,
             deadline: c.deadline,
+            prelude: PreludePhases::default(),
         })
     }
 
@@ -23489,3 +23490,7 @@ pub(crate) mod shard_controls_tests;
 #[cfg(test)]
 #[path = "sql/selected_path_controls_tests.rs"]
 mod selected_path_controls_tests;
+
+#[cfg(test)]
+#[path = "sql/request_clock_controls_tests.rs"]
+mod request_clock_controls_tests;
