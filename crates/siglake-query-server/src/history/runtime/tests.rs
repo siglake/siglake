@@ -3,6 +3,9 @@ use crate::history::postgres_tests::{expire, fixture, json_row, options, termina
 use sqlx::Row;
 use std::future::Future;
 
+#[path = "terminal_diagnosis_tests.rs"]
+mod terminal_diagnosis_tests;
+
 fn principal() -> Principal {
     Principal::from_caller(
         "runtime-fixture",
