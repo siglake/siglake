@@ -18,7 +18,9 @@
   [the attribution contract](docs/DESIGN_wal_committed_only_attribution.md).
 
 - **Dependency security:** update Parquet to 58.4.1 and Thrift to 0.23.0 to
-  address the Thrift allocation advisory.
+  address the Thrift allocation advisory. SQLite is updated to 3.54.1 through a
+  narrowly patched SQLx 0.8.6 driver dependency, resolving RUSTSEC-2026-0459
+  while retaining the existing SQLx API and catalog storage format.
 
 ## 0.4.0
 
