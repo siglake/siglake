@@ -226,3 +226,7 @@ iceberg-catalog-sql = { path = "third_party/iceberg-catalog-sql" }
 # its parts one at a time. Flush is 30.2% of append time on the 2026-08-08 1TB
 # round, the largest single stage.
 iceberg-storage-opendal = { path = "third_party/iceberg-storage-opendal" }
+
+# SQLx 0.8 pins an affected SQLite binding. Only this driver manifest differs
+# from its published 0.8.6 source; remove once a compatible release permits 0.39.
+sqlx-sqlite = { path = "third_party/sqlx-sqlite" }

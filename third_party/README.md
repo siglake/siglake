@@ -1,6 +1,7 @@
 # Vendored forks
 
-This directory contains first-class forks of three Apache-licensed crates:
+This directory contains first-class forks of three Apache-licensed crates,
+plus a SQLx SQLite dependency compatibility patch described below:
 
 - `iceberg` adds scan instrumentation, pruning, ordered writes, and maintenance actions.
 - `iceberg-catalog-sql` avoids redundant metadata reloads during optimistic commits.
@@ -276,3 +277,16 @@ require live GCS/S3/Azure credentials.
     incremented once per writer opened.
   - `Cargo.toml`: dependencies on `metrics` (workspace) and `tokio` with the
     `sync` feature, neither of which upstream has.
+
+## `sqlx-sqlite/` — SQLx 0.8.6 dependency compatibility patch
+
+The published `sqlx-sqlite` 0.8.6 pins `libsqlite3-sys` 0.30.1, whose bundled
+SQLite is affected by [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459).
+This copy retains upstream Rust source and its Apache-2.0/MIT licenses; the
+only manifest dependency change selects `libsqlite3-sys` 0.39.1, bundling
+patched SQLite 3.54.1. The SQLx 0.8 public API remains unchanged. The published
+SQLx 0.9.0 driver still caps the binding below 0.38, so upgrading it alone
+does not resolve the advisory. Remove this patch when a compatible published
+SQLx release permits the patched binding. `Cargo.toml.orig` is omitted because
+it describes the unpatched dependency. Upstream identity remains in
+`.cargo_vcs_info.json`; compare against the crates.io 0.8.6 archive.

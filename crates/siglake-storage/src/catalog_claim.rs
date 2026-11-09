@@ -1991,6 +1991,45 @@ mod tests {
         (claim, tmp)
     }
 
+    #[tokio::test]
+    async fn sqlite_runtime_is_patched_and_preserves_exact_wal_values() {
+        let (claim, tmp) = fresh().await;
+        let version: String = sqlx::query_scalar("SELECT sqlite_version()")
+            .fetch_one(&claim.pool)
+            .await
+            .unwrap();
+        let parts: Vec<u32> = version.split('.').map(|v| v.parse().unwrap()).collect();
+        assert!(
+            parts.as_slice() >= [3, 54, 0].as_slice(),
+            "SQLite {version}"
+        );
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL")
+            .fetch_one(&claim.pool)
+            .await
+            .unwrap();
+        assert_eq!(mode, "wal");
+        sqlx::query("CREATE TABLE sqlite_patch_probe (value INTEGER NOT NULL)")
+            .execute(&claim.pool)
+            .await
+            .unwrap();
+        let exact = 9_007_199_254_741_791_i64;
+        sqlx::query("INSERT INTO sqlite_patch_probe (value) VALUES (?)")
+            .bind(exact)
+            .execute(&claim.pool)
+            .await
+            .unwrap();
+        claim.pool.close().await;
+        let uri = format!("sqlite://{}?mode=rw", tmp.path().join("claim.db").display());
+        let reopened = SqlSegmentClaim::connect(&uri, "patched-reopen")
+            .await
+            .unwrap();
+        let value: i64 = sqlx::query_scalar("SELECT value FROM sqlite_patch_probe")
+            .fetch_one(&reopened.pool)
+            .await
+            .unwrap();
+        assert_eq!(value, exact);
+    }
+
     /// A segment that cannot be drained must not block every other segment.
     ///
     /// THE DEFECT THIS GUARDS. `release` reset `status` to 'sealed' and nothing
