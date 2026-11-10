@@ -43,7 +43,7 @@ permissions: {}
 
 jobs:
   authorize:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     permissions:
       # `actions: write` releases one queued run and `pull-requests: write`
       # removes a label a new commit invalidated. No `contents: write`, no

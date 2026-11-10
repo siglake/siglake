@@ -64,19 +64,16 @@ env:
 # THIS FILE RUNS UNCHANGED IN MORE THAN ONE REPOSITORY. The development repo
 # has Depot runners and an AWS role; the public repo has neither, and a job
 # that asks for a `depot-*` label there waits for a runner that never comes.
-# Two repository variables pick the runner per repo, and the defaults are the
-# Depot labels so a repo that sets nothing behaves exactly as before:
+# Repository variables override the runner. Public-repository PR events can
+# arrive without those variables, so siglake/siglake also has a hosted-runner
+# fallback. Otherwise external PRs queue on nonexistent Depot labels until
+# GitHub cancels them. Other repositories retain their Depot defaults.
 #
-#   SIGLAKE_CI_RUNNER        every job but `test`   (default depot-ubuntu-24.04-8)
-#   SIGLAKE_CI_RUNNER_LARGE  the `test` job         (default depot-ubuntu-24.04-64)
+#   SIGLAKE_CI_RUNNER        every job but `test`
+#   SIGLAKE_CI_RUNNER_LARGE  the `test` job
 #
-# A repo without Depot sets both to `ubuntu-24.04` (Settings > Secrets and
-# variables > Actions > Variables) BEFORE its first push. `vars` is one of the
-# few contexts `runs-on` accepts, which is why this is a variable and not a
-# secret or an env entry. The pinned label, not `ubuntu-latest`: the Depot
-# labels pin 24.04, and `ubuntu-latest` (24.04 in 2026-09) will move to 26.04
-# -- in public preview since 2026-06 -- at a time GitHub picks, which would
-# put the two repos on different images with nothing in this file saying so.
+# Keep pull_request execution restricted: this fallback changes placement only,
+# never the event, token permissions, secrets, or fork approval requirements.
 #
 # A standard GitHub-hosted runner is 4 vCPU, 16 GB, and ~21 GB free on / (14 GB
 # is what GitHub guarantees) against Depot's 8-64 vCPU and 150-250 GB. Nothing
@@ -85,7 +82,7 @@ env:
 jobs:
   # No compilation at all -- this one needs neither a big runner nor a cache.
   fmt:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -123,7 +120,7 @@ jobs:
   # compilation, and a wrong answer from either is a red build in under a
   # minute rather than after the four-minute test job.
   shell:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -390,7 +387,7 @@ jobs:
         run: python3 scripts/check-set-var.py
 
   test:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER_LARGE || 'depot-ubuntu-24.04-64' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER_LARGE || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-64' }}
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
@@ -495,7 +492,7 @@ jobs:
           du -sh target 2>/dev/null || true
 
   clippy:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
@@ -531,7 +528,7 @@ jobs:
   # a StatefulSet (FailedGetScale, never scales, install succeeds). Both are
   # visible in `helm template` output.
   helm:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -697,7 +694,7 @@ jobs:
           esac
 
   generated:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
@@ -760,7 +757,7 @@ jobs:
   # kind gives a real API server in ~40s, which is all these tests need -- they
   # assert on objects the operator creates, not on pods becoming ready.
   operator-cluster:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
     steps:
@@ -817,7 +814,7 @@ jobs:
           SIGLAKE_OPERATOR_REQUIRE_CLUSTER: "1"
 
   deny:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -848,7 +845,7 @@ jobs:
   # without its condition is a red build, and so is a `secrets.` reference the
   # event does not gate.
   docker:
-    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || 'depot-ubuntu-24.04-8' }}
+    runs-on: ${{ vars.SIGLAKE_CI_RUNNER || (github.repository == 'siglake/siglake' && 'ubuntu-24.04') || 'depot-ubuntu-24.04-8' }}
     permissions:
       id-token: write
       contents: read
