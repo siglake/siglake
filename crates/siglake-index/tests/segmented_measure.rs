@@ -24,14 +24,14 @@
 //!   report_segmented_vs_whole_file -- --ignored --nocapture
 //! ```
 //!
-//! Sized by `SIGLAKE_SEG_{ROWS_PER_FILE,GROUP_ROWS,FILES,RUNS,RARE_EVERY,PARSED_BYTES,BLOCK_BYTES}`.
+//! Sized by `SIGLAKE_SEG_{ROWS_PER_FILE,GROUP_ROWS,FILES,RUNS,RARE_EVERY,PARSED_BYTES,BLOCK_BYTES,ISO_RUNS}`.
 
 use std::time::{Duration, Instant};
 
 use siglake_index::segmented::{
     Lookup, SegmentedReader, SegmentedWriter, SliceSource, DEFAULT_TARGET_BLOCK_BYTES,
 };
-use siglake_index::{IndexBuilder, InvertedIndex};
+use siglake_index::{FlatIndex, IndexBuilder, InvertedIndex};
 
 /// The measurement corpus's text, row by row, without materializing it: the
 /// same shape as `puffin_rebuild.rs`'s `ab_shaped_event` (`bench_shaped_event`
@@ -257,6 +257,30 @@ fn report_segmented_vs_whole_file() {
     let v1_parse = parse.elapsed();
     assert_eq!(reparsed.n_rows(), whole.n_rows());
 
+    // The resident flat layout of the same index: what a parsed-index cache
+    // would charge if it held `FlatIndex` instead of the map-and-vectors form.
+    // `flat()` is the one-time per-file conversion a cache-load would run, so
+    // it is timed — it must stay small against the decode it follows.
+    let to_flat = Instant::now();
+    let v2 = whole.flat();
+    let v2_build = to_flat.elapsed();
+    // The real v2 load path: the on-disk bytes, parsed by `from_bytes_v2` (the
+    // reader's path once the write side emits v2), timed separately from the
+    // in-memory `flat()` conversion. The two must agree.
+    let v2_blob = v2.to_bytes_v2();
+    let load = Instant::now();
+    let v2_loaded = FlatIndex::from_bytes_v2(&v2_blob).expect("v2 layout round-trips");
+    let v2_load = load.elapsed();
+    assert_eq!(v2_loaded, v2);
+    // `PartialEq` compares values, not capacities: a decoder that grew a
+    // buffer past its exact size would pass the value check but bill the
+    // cache for headroom, so the charge is asserted on its own.
+    assert_eq!(
+        v2_loaded.heap_size_bytes(),
+        v2.heap_size_bytes(),
+        "the decoded index must bill the same resident charge"
+    );
+
     let open = Instant::now();
     let reader = SegmentedReader::open(SliceSource::shared(std::sync::Arc::clone(&seg_bytes)))
         .expect("segmented opens");
@@ -265,12 +289,14 @@ fn report_segmented_vs_whole_file() {
 
     println!(
         "\n## one file ({} rows, {} terms, {} row groups)\n\n\
-         | format | build | serialized | parse/open | resident |\n\
-         |---|---:|---:|---:|---:|\n\
-         | whole-file v1 | {:?} | {} | {:?} | {} |\n\
-         | seg2 | {:?} | {} | {:?} | {} |\n\
-         \nserialized ratio {:.2}x · resident ratio {:.0}x smaller · \
-         dictionary {} · postings {} · directory {}",
+         | format | build / convert | serialized | parse / load | resident | resident B/row |\n\
+         |---|---:|---:|---:|---:|---:|\n\
+         | whole-file v1 (map) | {:?} | {} | {:?} | {} | {:.1} |\n\
+         | whole-file v2 (flat, in-mem) | {:?} | {} | — | {} | {:.1} |\n\
+         | whole-file v2 (flat, from_bytes) | — | {} | {:?} | {} | {:.1} |\n\
+         | seg2 | {:?} | {} | {:?} | {} | {:.1} |\n\
+         \nserialized ratio {:.2}x · v1→v2 resident {:.1}x · v1→seg2 resident {:.0}x · \
+         seg2 dictionary {} · postings {} · directory {}",
         whole.n_rows(),
         whole.n_terms(),
         reader.n_groups(),
@@ -278,11 +304,22 @@ fn report_segmented_vs_whole_file() {
         mib(v1_bytes.len() as u64),
         v1_parse,
         mib(whole.heap_size_bytes() as u64),
+        whole.heap_size_bytes() as f64 / rows_per_file as f64,
+        v2_build,
+        mib(v2_blob.len() as u64),
+        mib(v2.heap_size_bytes() as u64),
+        v2.heap_size_bytes() as f64 / rows_per_file as f64,
+        mib(v2_blob.len() as u64),
+        v2_load,
+        mib(v2_loaded.heap_size_bytes() as u64),
+        v2_loaded.heap_size_bytes() as f64 / rows_per_file as f64,
         seg_build,
         mib(seg_bytes.len() as u64),
         seg_open,
         mib(reader.resident_bytes() as u64),
+        reader.resident_bytes() as f64 / rows_per_file as f64,
         seg_bytes.len() as f64 / v1_bytes.len() as f64,
+        whole.heap_size_bytes() as f64 / v2.heap_size_bytes() as f64,
         whole.heap_size_bytes() as f64 / reader.resident_bytes() as f64,
         mib(reader.dictionary_bytes()),
         mib(reader.postings_bytes()),
@@ -364,6 +401,203 @@ fn report_segmented_vs_whole_file() {
             reader.source().reads() / runs as u64,
             mib(fetched),
             100.0 * fetched as f64 / seg_bytes.len() as f64,
+        );
+    }
+
+    // ---- v1 map form vs v2 flat layout, same lookups, warm --------------
+    // The reader's text path does `postings` / `rows_containing` on the parsed
+    // index. Slice 2 swaps the cached value from the map form to the flat
+    // form; this is the per-lookup cost that swap trades. The flat form must
+    // not be meaningfully slower on the hot point-lookup shapes, and it pays
+    // the whole-dictionary sweep on the substring shape, as the map form does.
+    println!(
+        "\n## v1 (map) vs v2 (flat) lookups, one file, warm\n\n\
+         | shape | v1 warm | v2 warm | v2 ÷ v1 |\n\
+         |---|---:|---:|---:|"
+    );
+    for shape in SHAPES {
+        let mut v1_samples = Vec::with_capacity(runs);
+        let mut v2_samples = Vec::with_capacity(runs);
+        // Alternate which form is timed first each run: a fixed v1-then-v2
+        // order lets one form inherit the other's cold-cache / branch-predictor
+        // state, and a median over a biased sample is not a fair ratio.
+        for run in 0..runs {
+            let v1_first = run % 2 == 0;
+            let lookup_v1 = |index: &InvertedIndex| {
+                if shape.substring {
+                    index.rows_containing(shape.term).unwrap()
+                } else {
+                    index.postings(shape.term).unwrap_or(&[]).to_vec()
+                }
+            };
+            let lookup_v2 = |index: &FlatIndex| {
+                if shape.substring {
+                    index.rows_containing(shape.term).unwrap()
+                } else {
+                    index.postings(shape.term).unwrap_or(&[]).to_vec()
+                }
+            };
+            if v1_first {
+                let timed = Instant::now();
+                let got = lookup_v1(&whole);
+                v1_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+                let timed = Instant::now();
+                let got = lookup_v2(&v2);
+                v2_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            } else {
+                let timed = Instant::now();
+                let got = lookup_v2(&v2);
+                v2_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+                let timed = Instant::now();
+                let got = lookup_v1(&whole);
+                v1_samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            }
+        }
+        // The two forms must answer the same rows.
+        let a = if shape.substring {
+            whole.rows_containing(shape.term).unwrap()
+        } else {
+            whole.postings(shape.term).unwrap_or(&[]).to_vec()
+        };
+        let b = if shape.substring {
+            v2.rows_containing(shape.term).unwrap()
+        } else {
+            v2.postings(shape.term).unwrap_or(&[]).to_vec()
+        };
+        assert_eq!(b, a, "{}: v2 flat differs from v1 map", shape.name);
+        let v1_med = median(v1_samples);
+        let v2_med = median(v2_samples);
+        println!(
+            "| {} | {:?} | {:?} | {:.2} |",
+            shape.name,
+            v1_med,
+            v2_med,
+            v2_med.as_nanos() as f64 / v1_med.as_nanos() as f64,
+        );
+    }
+
+    // ---- isolated steady state: v1 alone, then v2 alone, no interleaving --
+    // The alternating section above measures each form in the other's dirty
+    // cache: a 526 MiB BTreeMap walk evicts v2's small hot set (36 KiB anchor
+    // table + 32 KB term window) before every v2 sample, so v2 never reaches
+    // the L3-resident steady state the jump table is designed for. This
+    // section runs each form's point shapes back-to-back, so the median lands
+    // in that form's own steady state. Point shapes only: the substring sweep
+    // walks the whole 72 MiB dictionary and is never L3-resident, so the jump
+    // table is irrelevant to it (already measured at 0.62x above).
+    let iso_runs = knob("SIGLAKE_SEG_ISO_RUNS", 101);
+    let point_shapes: &[Shape] = &SHAPES[..SHAPES.len() - 1]; // drop `substring_scan`, the last shape
+    println!(
+        "\n## v1 vs v2 lookups, one file, isolated steady state ({} consecutive per form)\n\n\
+         | shape | v1 steady | v2 steady | v2 ÷ v1 |\n\
+         |---|---:|---:|---:|",
+        iso_runs
+    );
+    // Phase A: v1 alone. v1's 526 MiB working set never fits the caches, so
+    // every sample is a steady ~2.3 µs pointer-chase; the median is that state.
+    let v1_steady: Vec<Duration> = point_shapes
+        .iter()
+        .map(|shape| {
+            let mut samples = Vec::with_capacity(iso_runs);
+            for _ in 0..iso_runs {
+                let timed = Instant::now();
+                let got = if shape.substring {
+                    whole.rows_containing(shape.term).unwrap()
+                } else {
+                    whole.postings(shape.term).unwrap_or(&[]).to_vec()
+                };
+                samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            }
+            median(samples)
+        })
+        .collect();
+    // Phase B: v2 alone. Consecutive v2 lookups settle the anchor table and
+    // term window into L3; the one cold first sample is discarded by the
+    // median. This is the state the jump table is built for.
+    let v2_steady: Vec<Duration> = point_shapes
+        .iter()
+        .map(|shape| {
+            let mut samples = Vec::with_capacity(iso_runs);
+            for _ in 0..iso_runs {
+                let timed = Instant::now();
+                let got = if shape.substring {
+                    v2.rows_containing(shape.term).unwrap()
+                } else {
+                    v2.postings(shape.term).unwrap_or(&[]).to_vec()
+                };
+                samples.push(timed.elapsed());
+                std::hint::black_box(got);
+            }
+            median(samples)
+        })
+        .collect();
+    for (i, shape) in point_shapes.iter().enumerate() {
+        let v1_med = v1_steady[i];
+        let v2_med = v2_steady[i];
+        println!(
+            "| {} | {:?} | {:?} | {:.2} |",
+            shape.name,
+            v1_med,
+            v2_med,
+            v2_med.as_nanos() as f64 / v1_med.as_nanos() as f64,
+        );
+    }
+    // No-copy: the table above pays a `Vec` allocation + copy of the postings
+    // on every sample (587 KB for `keyword`), which drowns the lookup. This
+    // consumes only the result length, isolating the index's own cost — the
+    // number the jump table and the fast-path normalization target.
+    println!(
+        "\n## v2 point lookup, no posting copy ({} consecutive)\n\n\
+         | shape | v2 no-copy |\n\
+         |---|---:|",
+        iso_runs
+    );
+    for shape in point_shapes {
+        let mut samples = Vec::with_capacity(iso_runs);
+        for _ in 0..iso_runs {
+            let timed = Instant::now();
+            let got = v2.postings(shape.term).map(|p| p.len());
+            samples.push(timed.elapsed());
+            std::hint::black_box(got);
+        }
+        println!("| {} | {:?} |", shape.name, median(samples));
+    }
+    // Amortized: the per-sample `Instant` above floors at ~1.2 µs on this box
+    // (the lookup is faster than the timer resolves), so every shape reads the
+    // same floor. One `Instant` around many lookups, divided by the count,
+    // amortizes the timer overhead and resolves the true sub-microsecond cost.
+    let amort = 20_000;
+    println!(
+        "\n## v2 point lookup, amortized over {amort} (true sub-µs cost)\n\n\
+         | shape | v1 amortized | v2 amortized | v2 ÷ v1 |\n\
+         |---|---:|---:|---:|"
+    );
+    for shape in point_shapes {
+        let v1_t = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..amort {
+            acc += whole.postings(shape.term).map(|p| p.len()).unwrap_or(0);
+        }
+        let v1_ns = v1_t.elapsed().as_nanos() as f64 / amort as f64;
+        std::hint::black_box(acc);
+        let v2_t = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..amort {
+            acc += v2.postings(shape.term).map(|p| p.len()).unwrap_or(0);
+        }
+        let v2_ns = v2_t.elapsed().as_nanos() as f64 / amort as f64;
+        std::hint::black_box(acc);
+        println!(
+            "| {} | {:.0} ns | {:.0} ns | {:.2} |",
+            shape.name,
+            v1_ns,
+            v2_ns,
+            v2_ns / v1_ns
         );
     }
 
@@ -491,8 +725,9 @@ fn report_segmented_vs_whole_file() {
         );
     }
     println!(
-        "\nv1 resident working set for {files} files: {} · seg2: {}",
+        "\nv1 resident working set for {files} files: {} · v2 (flat): {} · seg2: {}",
         mib((whole.heap_size_bytes() * files) as u64),
+        mib((v2.heap_size_bytes() * files) as u64),
         mib((reader.resident_bytes() * files) as u64),
     );
 }
