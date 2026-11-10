@@ -8,9 +8,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use siglake_query_server::discovery::{self, PeerSource};
+use siglake_query_server::history::{HistoryCollector, HistoryConfig};
 use siglake_query_server::{
     serve, serve_tls, AppState, AuditService, AuthConfig, JobStore, OidcVerifier, QueryScanConfig,
     ServerLimits, TlsConfig,
@@ -42,13 +43,24 @@ fn configure_server_query_scan_tuning(query_scan: QueryScanConfig) {
     }));
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum OidcProfile {
+    #[default]
+    Generic,
+    CognitoAccess,
+    CognitoMixed,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "siglake-query-server",
     about = "HTTP query API for the Siglake Iceberg warehouse",
-    version = siglake_core::BUILD_VERSION
+    version = siglake_core::BUILD_VERSION,
+    after_help = "Optional query history: set dedicated SIGLAKE_QUERY_HISTORY_DATABASE_URL and explicitly disable legacy audit with --audit-disabled. Fixed qh_writer; verified v3 schema required. Absent configuration makes no history connections. Up to 8 bounded preflight attempts; exhaustion requires restart. History degradation never changes SQL liveness/readiness. See docs/query-history-runtime.md."
 )]
 struct Cli {
+    #[command(flatten)]
+    controls: siglake_query_server::query_controls::startup::ControlsArgs,
     /// Address to bind the HTTP API.
     #[arg(long, default_value = "0.0.0.0:8089", env = "SIGLAKE_QUERY_BIND")]
     bind: SocketAddr,
@@ -90,13 +102,25 @@ struct Cli {
     /// OIDC issuer URL. When set, the server discovers the JWKS via
     /// `<issuer>/.well-known/openid-configuration` and verifies every
     /// `Authorization: Bearer <jwt>` against it. Requires
-    /// `--oidc-audience`.
+    /// `--oidc-audience` in the default generic profile.
     #[arg(long, env = "SIGLAKE_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
-    /// Expected `aud` claim. Required when `--oidc-issuer` is set.
+    /// Expected generic `aud`, or exact scalar human API audience for cognito-mixed.
+    /// Not used by cognito-access.
     #[arg(long, env = "SIGLAKE_OIDC_AUDIENCE")]
     oidc_audience: Option<String>,
+
+    /// Token contract: generic enforces audience; cognito-access requires
+    /// signed access-token client_id and a configured signed tenant claim.
+    /// cognito-mixed also accepts ID tokens for the exact human API audience.
+    #[arg(
+        long,
+        value_enum,
+        default_value = "generic",
+        env = "SIGLAKE_QUERY_OIDC_PROFILE"
+    )]
+    oidc_profile: OidcProfile,
 
     /// Name of the JWT claim that carries the per-request tenant
     /// identifier. Setting it enables per-request multi-tenancy and
@@ -387,6 +411,66 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Explicit mixed must fail before telemetry, storage or trusted discovery.
+    // Existing profiles keep their later validation path in run.
+    if cli.oidc_profile == OidcProfile::CognitoMixed {
+        if let Some(message) = query_oidc_config_error(
+            cli.oidc_profile,
+            cli.oidc_issuer.as_deref(),
+            cli.oidc_audience.as_deref(),
+            oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref()),
+            false,
+        ) {
+            anyhow::bail!(message);
+        }
+    }
+    let configured = cli.controls.prepare(
+        !cli.query_peers.is_empty() || cli.query_peer_discovery_srv.is_some(),
+        cli.query_coordinator_token.as_deref(),
+    )?;
+    if configured.is_some() {
+        let claim = oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref());
+        let allowed = allowed_tenants_from(cli.allowed_tenants.as_deref())
+            .map_err(|message| anyhow::anyhow!(message))?;
+        if let Some(message) = query_oidc_config_error(
+            cli.oidc_profile,
+            cli.oidc_issuer.as_deref(),
+            cli.oidc_audience.as_deref(),
+            claim,
+            allowed.is_some(),
+        ) {
+            anyhow::bail!(message);
+        }
+        // Validate static peer configuration, not discovery or query work.
+        discovery::peer_scheme_from(cli.query_peer_scheme.as_deref())
+            .map_err(|_| anyhow::anyhow!("invalid controlled peer configuration"))?;
+        let peers =
+            discovery::peer_config_from(&cli.query_peers, cli.query_peer_discovery_srv.as_deref())
+                .map_err(|_| anyhow::anyhow!("invalid controlled peer configuration"))?;
+        if let discovery::PeerConfig::Static(urls) = &peers {
+            siglake_query_server::query_controls::startup::validate_peer_urls(urls)?;
+        }
+        if matches!(peers, discovery::PeerConfig::Srv(_))
+            && cli
+                .query_peer_self_name
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+            && std::env::var("HOSTNAME")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            anyhow::bail!("controlled peer discovery requires self name");
+        }
+    }
+    // Fail closed before unrelated startup, including telemetry or catalog IO.
+    let authority = match configured {
+        Some(config) => Some(config.connect().await?),
+        None => None,
+    };
     // Logs + traces via OTel (opt-in via OTEL_EXPORTER_OTLP_ENDPOINT); the fmt
     // console layer always stays on, and stays on stderr, matching the siglake
     // CLI and the rest of the workspace's binaries.
@@ -395,13 +479,21 @@ async fn main() -> Result<()> {
     // startup error, a bad flag — so the flush happens once, here, on all of
     // them. The providers live in a `OnceLock` that never drops, so nothing
     // else would flush them. No-op when OTel is off.
-    let result = run().await;
+    let result = run(cli, authority.clone()).await;
+    if let Some(authority) = authority {
+        siglake_query_server::query_controls::startup::shutdown_owned(&authority).await;
+    }
     siglake_core::telemetry::shutdown();
     result
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
+async fn run(
+    cli: Cli,
+    authority: Option<Arc<siglake_query_server::query_controls::ControlsAuthority>>,
+) -> Result<()> {
+    // Dedicated env-only resolver: absent is disabled; invalid syntax or an
+    // enabled legacy raw audit rejects before any catalog/OIDC/listener work.
+    let history_config = HistoryConfig::from_env(cli.audit_disabled)?;
 
     // Resolve and validate the admission configuration before opening a
     // catalog or contacting OIDC discovery. A configured list without claim
@@ -410,7 +502,8 @@ async fn run() -> Result<()> {
     let oidc_tenant_claim = oidc_tenant_claim_from(cli.oidc_tenant_claim.as_deref());
     let allowed_tenants = allowed_tenants_from(cli.allowed_tenants.as_deref())
         .map_err(|message| anyhow::anyhow!(message))?;
-    if let Some(message) = query_tenant_config_error(
+    if let Some(message) = query_oidc_config_error(
+        cli.oidc_profile,
         cli.oidc_issuer.as_deref(),
         cli.oidc_audience.as_deref(),
         oidc_tenant_claim,
@@ -468,28 +561,48 @@ async fn run() -> Result<()> {
     )
     .await?;
 
-    let auth = match (cli.oidc_issuer.as_deref(), cli.oidc_audience.as_deref()) {
-        (Some(issuer), Some(audience)) => {
-            let mut verifier = OidcVerifier::from_issuer(issuer.to_string(), audience.to_string())
+    let auth = if let Some(issuer) = cli.oidc_issuer.as_deref() {
+        let mut verifier = match cli.oidc_profile {
+            OidcProfile::Generic => {
+                OidcVerifier::from_issuer(
+                    issuer.to_string(),
+                    cli.oidc_audience
+                        .clone()
+                        .expect("validated generic audience"),
+                )
                 .await
-                .with_context(|| format!("oidc discovery for {issuer}"))?;
-            if let Some(claim) = oidc_tenant_claim {
-                verifier = verifier.with_tenant_claim(claim);
-                tracing::info!(claim, "per-request tenant routing enabled");
             }
-            AuthConfig::from_oidc(verifier)
+            OidcProfile::CognitoAccess => {
+                OidcVerifier::from_cognito_access_issuer(
+                    issuer.to_string(),
+                    oidc_tenant_claim
+                        .expect("validated access tenant claim")
+                        .to_string(),
+                )
+                .await
+            }
+            OidcProfile::CognitoMixed => {
+                OidcVerifier::from_cognito_mixed_issuer(
+                    issuer.to_string(),
+                    cli.oidc_audience.clone().expect("validated mixed audience"),
+                    oidc_tenant_claim
+                        .expect("validated mixed tenant claim")
+                        .to_string(),
+                )
+                .await
+            }
         }
-        (Some(_), None) | (None, Some(_)) => {
-            anyhow::bail!("--oidc-issuer and --oidc-audience must both be set (or both unset)");
+        .with_context(|| format!("oidc discovery for {issuer}"))?;
+        if let Some(claim) = oidc_tenant_claim {
+            verifier = verifier.with_tenant_claim(claim);
+            tracing::info!(claim, "per-request tenant routing enabled");
         }
-        (None, None) => {
-            if oidc_tenant_claim.is_some() {
-                anyhow::bail!("--oidc-tenant-claim requires --oidc-issuer + --oidc-audience");
-            }
-            match cli.tokens.as_deref() {
-                Some(s) => AuthConfig::from_tokens(s.split(',')),
-                None => AuthConfig::open(),
-            }
+        tracing::info!(profile = ?cli.oidc_profile, "query OIDC token contract enabled");
+        AuthConfig::from_oidc(verifier)
+    } else {
+        match cli.tokens.as_deref() {
+            Some(s) => AuthConfig::from_tokens(s.split(',')),
+            None => AuthConfig::open(),
         }
     };
     if auth.is_open() {
@@ -593,6 +706,7 @@ async fn run() -> Result<()> {
     let peer_source = build_peer_source(&cli)?;
     let mut state = AppState::new(ice.clone(), auth)
         .with_limits(limits)
+        .with_controls_authority(authority)
         .with_jobs(jobs)
         .with_query_scan(query_scan)
         .with_wal_buffer_dir(cli.query_wal_buffer_dir.clone())
@@ -632,6 +746,10 @@ async fn run() -> Result<()> {
         state = state.with_audit(writer);
     }
 
+    let mut history = HistoryCollector::start(history_config);
+    state = state.with_history_source(history.observer_source());
+    tracing::info!(status = ?history.status(), "query history collector (independent of SQL availability)");
+
     let _metrics = siglake_core::metrics::init(cli.metrics_bind).await?;
     // Alerted counters exist at 0 from the first scrape, so the first
     // abandoned warm cycle or exec-pool task is a delta `increase()` can see.
@@ -646,7 +764,7 @@ async fn run() -> Result<()> {
     )
     .set(1.0);
 
-    match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
+    let result = match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
         (Some(cert), Some(key)) => {
             let tls = TlsConfig {
                 cert_path: cert.into(),
@@ -658,7 +776,13 @@ async fn run() -> Result<()> {
             anyhow::bail!("--tls-cert and --tls-key must both be set (or both unset)")
         }
         (None, None) => serve(cli.bind, state).await,
-    }
+    };
+    let drained = history.shutdown().await;
+    tracing::info!(
+        drained,
+        "query history collector shutdown (not a durability guarantee)"
+    );
+    result
 }
 
 /// Open an [`IcebergContext`] from CLI flag/env-var inputs. Same logic
@@ -802,6 +926,38 @@ fn allowed_tenants_from(
         allowed.insert(tenant);
     }
     Ok((!allowed.is_empty()).then_some(allowed))
+}
+
+/// Validate the explicit query-only access profile before any I/O.
+fn query_oidc_config_error(
+    profile: OidcProfile,
+    issuer: Option<&str>,
+    audience: Option<&str>,
+    tenant_claim: Option<&str>,
+    has_allowed_tenants: bool,
+) -> Option<&'static str> {
+    if profile == OidcProfile::Generic {
+        return query_tenant_config_error(issuer, audience, tenant_claim, has_allowed_tenants);
+    }
+    if profile == OidcProfile::CognitoMixed {
+        if issuer.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-issuer");
+        }
+        if audience.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-audience");
+        }
+        if tenant_claim.is_none_or(|value| value.trim().is_empty()) {
+            return Some("--oidc-profile cognito-mixed requires --oidc-tenant-claim");
+        }
+        return None;
+    }
+    if issuer.is_none_or(|issuer| issuer.trim().is_empty()) {
+        return Some("--oidc-profile cognito-access requires --oidc-issuer");
+    }
+    if tenant_claim.is_none() {
+        return Some("--oidc-profile cognito-access requires --oidc-tenant-claim");
+    }
+    None
 }
 
 /// Report a query tenancy configuration the server cannot enforce.
@@ -1139,5 +1295,100 @@ mod tests {
         assert_eq!(missing_entries.file_cache_max_entries, None);
         assert_eq!(zero_bytes.file_cache_max_bytes, None);
         assert_eq!(zero_bytes.file_cache_max_entries, None);
+    }
+    #[test]
+    fn cognito_profile_is_explicit_and_requires_signed_tenancy() {
+        use super::{query_oidc_config_error, OidcProfile};
+        let cli = Cli::try_parse_from(["siglake-query-server"]).unwrap();
+        assert_eq!(cli.oidc_profile, OidcProfile::Generic);
+        assert!(
+            Cli::try_parse_from(["siglake-query-server", "--oidc-profile", "unknown"]).is_err()
+        );
+        for (issuer, claim) in [
+            (None, None),
+            (Some(""), Some("org")),
+            (Some("issuer"), None),
+        ] {
+            assert!(query_oidc_config_error(
+                OidcProfile::CognitoAccess,
+                issuer,
+                None,
+                claim,
+                false
+            )
+            .is_some());
+        }
+        assert_eq!(
+            query_oidc_config_error(
+                OidcProfile::CognitoAccess,
+                Some("issuer"),
+                None,
+                Some("org"),
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            query_oidc_config_error(
+                OidcProfile::CognitoAccess,
+                Some("issuer"),
+                Some("human"),
+                Some("org"),
+                false
+            ),
+            None
+        );
+        assert!(query_oidc_config_error(
+            OidcProfile::Generic,
+            Some("issuer"),
+            None,
+            Some("org"),
+            false
+        )
+        .is_some());
+    }
+    #[test]
+    fn mixed_profile_requires_nonblank_issuer_human_audience_and_tenant() {
+        let valid = [Some("issuer"), Some("human-api"), Some("tenant")];
+        for index in 0..3 {
+            for blank in [None, Some(""), Some(" "), Some("\t\n")] {
+                let mut inputs = valid;
+                inputs[index] = blank;
+                assert!(super::query_oidc_config_error(
+                    super::OidcProfile::CognitoMixed,
+                    inputs[0],
+                    inputs[1],
+                    inputs[2],
+                    false
+                )
+                .is_some());
+            }
+        }
+        assert_eq!(
+            super::query_oidc_config_error(
+                super::OidcProfile::CognitoMixed,
+                valid[0],
+                valid[1],
+                valid[2],
+                true
+            ),
+            None
+        );
+        let cli = Cli::try_parse_from([
+            "siglake-query-server",
+            "--oidc-profile",
+            "cognito-mixed",
+            "--oidc-issuer",
+            "issuer",
+            "--oidc-audience",
+            "human-api",
+            "--oidc-tenant-claim",
+            "tenant",
+        ])
+        .unwrap();
+        let oidc_profile = cli.oidc_profile;
+        let oidc_audience = cli.oidc_audience;
+        assert_eq!(oidc_profile, super::OidcProfile::CognitoMixed);
+        assert_eq!(oidc_audience.as_deref(), Some("human-api"));
     }
 }

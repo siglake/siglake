@@ -641,3 +641,107 @@ async fn the_allow_list_bounds_the_resolved_tenant_not_the_header() {
 
     idp.abort();
 }
+
+#[tokio::test]
+async fn cognito_mixed_id_and_human_machine_access_share_http_otlp_tenant_boundary() {
+    use crate::fake_idp::{TEST_KID, TEST_PRIVATE_KEY_PEM};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    let (issuer, idp) = spawn_fake_idp().await;
+    let verifier =
+        OidcVerifier::from_cognito_mixed_issuer(issuer.clone(), AUD.into(), "tenant".into())
+            .await
+            .unwrap();
+    let ingester = Ingester::new().with(|state| {
+        let mut state = state
+            .with_oidc_verifier(verifier)
+            .with_tenant_routing(TenantRouting::TrustHeader);
+        state.allowed_tenants = Some(Arc::new(["acme".to_string()].into_iter().collect()));
+        state
+    });
+    let existing_active = ingester.wrote_for("active");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(TEST_KID.into());
+    let key = EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM).unwrap();
+    let sign =
+        |claims: &serde_json::Value| format!("Bearer {}", encode(&header, claims, &key).unwrap());
+    for (use_, subject, client) in [
+        ("id", "human-sub", None),
+        ("access", "machine-sub", Some("machine-client")),
+        ("access", "human-code-sub", Some("human-or-admin-client")),
+    ] {
+        let mut claims = json!({"iss":issuer,"sub":subject,"exp":now+600,"iat":now,"token_use":use_,"tenant":"acme"});
+        if use_ == "id" {
+            claims["aud"] = json!(AUD);
+        }
+        if let Some(client) = client {
+            claims["client_id"] = json!(client);
+        }
+        let token = sign(&claims);
+        for outcome in [
+            ingester.http_logs(None, Some(&token)).await,
+            ingester.grpc_logs(None, Some(&token)).await,
+            ingester.grpc_traces(None, Some(&token)).await,
+        ] {
+            assert_eq!(outcome, Outcome::Accepted);
+        }
+        for outcome in [
+            ingester.http_logs(Some("foreign"), Some(&token)).await,
+            ingester.grpc_logs(Some("foreign"), Some(&token)).await,
+            ingester.grpc_traces(Some("foreign"), Some(&token)).await,
+        ] {
+            assert_eq!(outcome, Outcome::Forbidden);
+        }
+        for tenant in [
+            json!(null),
+            json!(12),
+            json!([]),
+            json!(""),
+            json!(" "),
+            json!("bad.tenant"),
+            json!("x".repeat(129)),
+            json!("active"),
+            json!("sealed"),
+            json!("processing"),
+            json!("committed"),
+            json!("consumers"),
+            json!("foreign"),
+        ] {
+            claims["tenant"] = tenant;
+            let token = sign(&claims);
+            for outcome in [
+                ingester.http_logs(None, Some(&token)).await,
+                ingester.grpc_logs(None, Some(&token)).await,
+                ingester.grpc_traces(None, Some(&token)).await,
+            ] {
+                assert_eq!(outcome, Outcome::Forbidden);
+            }
+        }
+        claims.as_object_mut().unwrap().remove("tenant");
+        let token = sign(&claims);
+        for outcome in [
+            ingester.http_logs(Some("acme"), Some(&token)).await,
+            ingester.grpc_logs(Some("acme"), Some(&token)).await,
+            ingester.grpc_traces(Some("acme"), Some(&token)).await,
+        ] {
+            assert_eq!(outcome, Outcome::Forbidden);
+        }
+        claims["tenant"] = json!("acme");
+        claims["token_use"] = json!("ID");
+        let token = sign(&claims);
+        for outcome in [
+            ingester.http_logs(None, Some(&token)).await,
+            ingester.grpc_logs(None, Some(&token)).await,
+            ingester.grpc_traces(None, Some(&token)).await,
+        ] {
+            assert_eq!(outcome, Outcome::Unauthenticated);
+        }
+    }
+    assert!(ingester.wrote_for("acme"));
+    assert!(!ingester.wrote_for("foreign"));
+    assert_eq!(ingester.wrote_for("active"), existing_active);
+    idp.abort();
+}

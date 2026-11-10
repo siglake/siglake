@@ -20,7 +20,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
-use crate::oidc::{Claims, OidcVerifier};
+use crate::oidc::{Claims, OidcVerifier, VerifiedProviderPrincipal};
 use crate::AppState;
 
 /// Authentication configuration. Cheap to clone — internal state
@@ -108,6 +108,9 @@ pub struct CallerIdentity {
     /// a service account rather than the person who asked, and the handler needs
     /// to know it may take the tenant from the request body instead.
     pub coordinator: bool,
+    /// Available only for verified Cognito access tokens after tenant validation.
+    /// Headers, generic OIDC, static tokens and internal callers cannot set it.
+    pub provider_principal: Option<VerifiedProviderPrincipal>,
 }
 
 impl CallerIdentity {
@@ -117,15 +120,18 @@ impl CallerIdentity {
             email: None,
             tenant: None,
             coordinator: false,
+            provider_principal: None,
         }
     }
 
     fn from_claims(claims: Claims, tenant: Option<String>) -> Self {
+        let provider_principal = claims.provider_principal().cloned();
         Self {
             subject: claims.sub,
             email: claims.email,
             tenant,
             coordinator: false,
+            provider_principal,
         }
     }
 
@@ -139,6 +145,7 @@ impl CallerIdentity {
             email: None,
             tenant: None,
             coordinator: true,
+            provider_principal: None,
         }
     }
 
@@ -148,6 +155,7 @@ impl CallerIdentity {
             email: None,
             tenant: None,
             coordinator: false,
+            provider_principal: None,
         }
     }
 }
@@ -167,12 +175,16 @@ pub async fn middleware(
     // chart supports therefore broke every scanning query on the default
     // topology.
     //
-    // Scoped to `/api/v1/sql/shard`, the only thing this token is for. It is a
+    // Scoped to the exact v1/v2 shard paths, the only use of this token. It is a
     // cluster-internal secret, but that is a reason to keep its reach narrow
     // rather than to widen it: nothing else should be reachable by presenting
     // it.
     if let Some(expected) = state.coordinator_token.as_deref() {
-        if request.uri().path() == "/api/v1/sql/shard"
+        if matches!(
+            request.uri().path(),
+            "/api/v1/sql/shard" | crate::query_controls::wire::PATH
+        ) && (request.uri().path() != crate::query_controls::wire::PATH
+            || !expected.trim().is_empty())
             && extract_bearer(request.extensions(), request.headers()) == Some(expected)
         {
             request
@@ -220,7 +232,13 @@ pub async fn middleware(
         return refusal.into_response();
     }
     request.extensions_mut().insert(identity);
-    next.run(request).await
+    if state.query_controls.is_some() {
+        // Original monotonic anchor, after verified authorization and before
+        // extractors, policy/history/catalog/cache or selected-path work.
+        crate::query_controls::runtime::ingress(std::time::Instant::now(), next.run(request)).await
+    } else {
+        next.run(request).await
+    }
 }
 
 /// Decide the tenant a verified token is scoped to, or the refusal that stops
@@ -305,5 +323,16 @@ mod tests {
     fn labels() {
         assert_eq!(AuthConfig::open().label(), "open");
         assert_eq!(AuthConfig::from_tokens(["a"]).label(), "bearer");
+    }
+
+    #[test]
+    fn non_provider_credentials_never_fabricate_a_principal() {
+        for identity in [
+            CallerIdentity::anonymous(),
+            CallerIdentity::from_token("opaque"),
+            CallerIdentity::coordinator(),
+        ] {
+            assert!(identity.provider_principal.is_none());
+        }
     }
 }

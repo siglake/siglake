@@ -140,7 +140,7 @@ pub async fn result(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let id = JobId::parse(&id).map_err(|_| ApiError::bad_request("invalid job_id"))?;
-    owned_job(&state, &identity, id).await?;
+    let info = owned_job(&state, &identity, id).await?;
     let res = state
         .jobs
         .result(id)
@@ -165,7 +165,21 @@ pub async fn result(
             let body = res
                 .body
                 .ok_or_else(|| ApiError::internal("succeeded job has no result body"))?;
-            let mut response = (StatusCode::OK, Json(body)).into_response();
+            #[derive(serde::Serialize)]
+            struct ResultWithControls {
+                #[serde(flatten)]
+                records: crate::format::RecordsResponse,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                controls: Option<crate::query_controls::jobs::JobControls>,
+            }
+            let mut response = (
+                StatusCode::OK,
+                Json(ResultWithControls {
+                    records: body,
+                    controls: info.controls,
+                }),
+            )
+                .into_response();
             crate::sql::set_handler_micros_header(&mut response, started);
             crate::sql::set_result_cache_header(&mut response, "off");
             Ok(response)

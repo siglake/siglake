@@ -1,0 +1,709 @@
+{
+    "schema": {
+        "acl": [
+            [
+                "qp_manager",
+                "USAGE",
+                false
+            ],
+            [
+                "qp_owner",
+                "CREATE",
+                false
+            ],
+            [
+                "qp_owner",
+                "USAGE",
+                false
+            ],
+            [
+                "qp_reader",
+                "USAGE",
+                false
+            ]
+        ],
+        "owner": "qp_owner"
+    },
+    "tables": [
+        {
+            "acl": [
+                [
+                    "qp_manager",
+                    "SELECT",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "DELETE",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "INSERT",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "REFERENCES",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "SELECT",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "TRIGGER",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "TRUNCATE",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "UPDATE",
+                    false
+                ],
+                [
+                    "qp_reader",
+                    "SELECT",
+                    false
+                ]
+            ],
+            "rls": true,
+            "kind": "r",
+            "name": "agent_limits",
+            "force": true,
+            "owner": "qp_owner",
+            "rules": null,
+            "columns": [
+                [
+                    "tenant",
+                    "text",
+                    [
+                        "pg_catalog",
+                        "C"
+                    ],
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "verified_issuer",
+                    "text",
+                    [
+                        "pg_catalog",
+                        "C"
+                    ],
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "verified_client_id",
+                    "text",
+                    [
+                        "pg_catalog",
+                        "C"
+                    ],
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "org_uuid",
+                    "uuid",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "credential_uuid",
+                    "uuid",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "schema_version",
+                    "smallint",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "revision",
+                    "bigint",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "timeout_seconds",
+                    "bigint",
+                    null,
+                    false,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "scan_bytes_warning",
+                    "bigint",
+                    null,
+                    false,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "updated_at",
+                    "timestamp with time zone",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ]
+            ],
+            "indexes": [
+                [
+                    true,
+                    true,
+                    "CREATE UNIQUE INDEX agent_limits_org_uuid_credential_uuid_key ON query_policy.agent_limits USING btree (org_uuid, credential_uuid)"
+                ],
+                [
+                    true,
+                    true,
+                    "CREATE UNIQUE INDEX agent_limits_pkey ON query_policy.agent_limits USING btree (tenant, verified_issuer, verified_client_id)"
+                ]
+            ],
+            "options": null,
+            "policies": [
+                [
+                    "tenant_scope",
+                    "*",
+                    true,
+                    [
+                        "PUBLIC"
+                    ],
+                    "(tenant = current_setting('query_policy.tenant'::text, true))",
+                    "(tenant = current_setting('query_policy.tenant'::text, true))"
+                ]
+            ],
+            "triggers": [
+                [
+                    "immutable_binding",
+                    "O",
+                    false,
+                    "CREATE TRIGGER immutable_binding BEFORE UPDATE ON query_policy.agent_limits FOR EACH ROW EXECUTE FUNCTION query_policy.immutable_binding()"
+                ]
+            ],
+            "constraints": [
+                [
+                    "agent_limits_credential_uuid_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((credential_uuid <> '00000000-0000-0000-0000-000000000000'::uuid))"
+                ],
+                [
+                    "agent_limits_org_uuid_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((org_uuid <> '00000000-0000-0000-0000-000000000000'::uuid))"
+                ],
+                [
+                    "agent_limits_org_uuid_credential_uuid_key",
+                    "u",
+                    true,
+                    false,
+                    false,
+                    true,
+                    "UNIQUE (org_uuid, credential_uuid)"
+                ],
+                [
+                    "agent_limits_pkey",
+                    "p",
+                    true,
+                    false,
+                    false,
+                    true,
+                    "PRIMARY KEY (tenant, verified_issuer, verified_client_id)"
+                ],
+                [
+                    "agent_limits_revision_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((revision > 0))"
+                ],
+                [
+                    "agent_limits_scan_bytes_warning_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((scan_bytes_warning > 0))"
+                ],
+                [
+                    "agent_limits_schema_version_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((schema_version = 1))"
+                ],
+                [
+                    "agent_limits_tenant_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((((octet_length(tenant) >= 1) AND (octet_length(tenant) <= 128)) AND (tenant ~ '^[A-Za-z0-9_-]+$'::text) AND (lower(tenant) <> ALL (ARRAY['active'::text, 'sealed'::text, 'processing'::text, 'committed'::text, 'consumers'::text]))))"
+                ],
+                [
+                    "agent_limits_timeout_seconds_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK (((timeout_seconds > 0) AND (timeout_seconds <= '9223372036854775'::bigint)))"
+                ],
+                [
+                    "agent_limits_verified_client_id_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((((octet_length(verified_client_id) >= 1) AND (octet_length(verified_client_id) <= 128)) AND (verified_client_id !~ '[[:cntrl:]]'::text)))"
+                ],
+                [
+                    "agent_limits_verified_issuer_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((((octet_length(verified_issuer) >= 1) AND (octet_length(verified_issuer) <= 2048)) AND (verified_issuer !~ '[[:cntrl:]]'::text)))"
+                ]
+            ],
+            "persistence": "p"
+        },
+        {
+            "acl": [
+                [
+                    "qp_owner",
+                    "DELETE",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "INSERT",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "REFERENCES",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "SELECT",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "TRIGGER",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "TRUNCATE",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "UPDATE",
+                    false
+                ]
+            ],
+            "rls": true,
+            "kind": "r",
+            "name": "edits",
+            "force": true,
+            "owner": "qp_owner",
+            "rules": null,
+            "columns": [
+                [
+                    "tenant",
+                    "text",
+                    [
+                        "pg_catalog",
+                        "C"
+                    ],
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "org_uuid",
+                    "uuid",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "credential_uuid",
+                    "uuid",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "schema_version",
+                    "smallint",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "revision",
+                    "bigint",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "actor_sub",
+                    "text",
+                    [
+                        "pg_catalog",
+                        "default"
+                    ],
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "edited_at",
+                    "timestamp with time zone",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "expires_at",
+                    "timestamp with time zone",
+                    null,
+                    true,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "old_timeout_seconds",
+                    "bigint",
+                    null,
+                    false,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "old_scan_bytes_warning",
+                    "bigint",
+                    null,
+                    false,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "new_timeout_seconds",
+                    "bigint",
+                    null,
+                    false,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ],
+                [
+                    "new_scan_bytes_warning",
+                    "bigint",
+                    null,
+                    false,
+                    "",
+                    "",
+                    false,
+                    null,
+                    null
+                ]
+            ],
+            "indexes": [
+                [
+                    true,
+                    true,
+                    "CREATE INDEX edits_expiry ON query_policy.edits USING btree (tenant, expires_at, org_uuid, credential_uuid, revision)"
+                ],
+                [
+                    true,
+                    true,
+                    "CREATE UNIQUE INDEX edits_pkey ON query_policy.edits USING btree (org_uuid, credential_uuid, revision)"
+                ]
+            ],
+            "options": null,
+            "policies": [
+                [
+                    "tenant_scope",
+                    "*",
+                    true,
+                    [
+                        "PUBLIC"
+                    ],
+                    "(tenant = current_setting('query_policy.tenant'::text, true))",
+                    "(tenant = current_setting('query_policy.tenant'::text, true))"
+                ]
+            ],
+            "triggers": [
+                [
+                    "guard_edit",
+                    "O",
+                    false,
+                    "CREATE TRIGGER guard_edit BEFORE INSERT OR DELETE OR UPDATE ON query_policy.edits FOR EACH ROW EXECUTE FUNCTION query_policy.guard_edit()"
+                ]
+            ],
+            "constraints": [
+                [
+                    "edits_actor_sub_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((((octet_length(actor_sub) >= 1) AND (octet_length(actor_sub) <= 256)) AND (actor_sub !~ '[[:cntrl:]]'::text)))"
+                ],
+                [
+                    "edits_new_scan_bytes_warning_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((new_scan_bytes_warning > 0))"
+                ],
+                [
+                    "edits_new_timeout_seconds_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK (((new_timeout_seconds > 0) AND (new_timeout_seconds <= '9223372036854775'::bigint)))"
+                ],
+                [
+                    "edits_old_scan_bytes_warning_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((old_scan_bytes_warning > 0))"
+                ],
+                [
+                    "edits_old_timeout_seconds_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK (((old_timeout_seconds > 0) AND (old_timeout_seconds <= '9223372036854775'::bigint)))"
+                ],
+                [
+                    "edits_pkey",
+                    "p",
+                    true,
+                    false,
+                    false,
+                    true,
+                    "PRIMARY KEY (org_uuid, credential_uuid, revision)"
+                ],
+                [
+                    "edits_retention_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK (((expires_at - edited_at) = '720:00:00'::interval))"
+                ],
+                [
+                    "edits_revision_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((revision > 0))"
+                ],
+                [
+                    "edits_schema_version_check",
+                    "c",
+                    true,
+                    false,
+                    false,
+                    false,
+                    "CHECK ((schema_version = 1))"
+                ]
+            ],
+            "persistence": "p"
+        }
+    ],
+    "functions": [
+        {
+            "acl": [
+                [
+                    "qp_owner",
+                    "EXECUTE",
+                    false
+                ]
+            ],
+            "owner": "qp_owner",
+            "definition": "CREATE OR REPLACE FUNCTION query_policy.guard_edit()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog'\nAS $function$\nBEGIN\n IF TG_OP = 'INSERT' THEN\n  NEW.edited_at := pg_catalog.clock_timestamp();\n  NEW.expires_at := NEW.edited_at + interval '720 hours';\n  RETURN NEW;\n END IF;\n IF TG_OP = 'DELETE' AND current_user = 'qp_owner'\n    AND OLD.tenant COLLATE \"C\" = current_setting('query_policy.tenant', true) COLLATE \"C\"\n    AND OLD.expires_at <= pg_catalog.statement_timestamp() THEN\n  RETURN OLD;\n END IF;\n RAISE EXCEPTION USING ERRCODE='QP002', MESSAGE='policy edit mutation rejected';\nEND\n$function$\n"
+        },
+        {
+            "acl": [
+                [
+                    "qp_owner",
+                    "EXECUTE",
+                    false
+                ]
+            ],
+            "owner": "qp_owner",
+            "definition": "CREATE OR REPLACE FUNCTION query_policy.immutable_binding()\n RETURNS trigger\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog'\nAS $function$\nBEGIN\n IF (NEW.tenant, NEW.verified_issuer, NEW.verified_client_id, NEW.org_uuid, NEW.credential_uuid, NEW.schema_version)\n    IS DISTINCT FROM (OLD.tenant, OLD.verified_issuer, OLD.verified_client_id, OLD.org_uuid, OLD.credential_uuid, OLD.schema_version)\n    OR OLD.revision = 9223372036854775807 OR NEW.revision <> OLD.revision + 1 THEN\n  RAISE EXCEPTION USING ERRCODE='QP002', MESSAGE='policy binding rejected';\n END IF;\n RETURN NEW;\nEND\n$function$\n"
+        },
+        {
+            "acl": [
+                [
+                    "qp_owner",
+                    "EXECUTE",
+                    false
+                ]
+            ],
+            "owner": "qp_owner",
+            "definition": "CREATE OR REPLACE FUNCTION query_policy.purge_expired_edits(p_tenant text, p_limit integer)\n RETURNS integer\n LANGUAGE plpgsql\n SET search_path TO 'pg_catalog'\nAS $function$\nDECLARE removed integer;\nBEGIN\n IF current_user <> 'qp_owner'\n    OR current_setting('query_policy.tenant', true) COLLATE \"C\" IS DISTINCT FROM p_tenant COLLATE \"C\"\n    OR p_tenant IS NULL OR octet_length(p_tenant) NOT BETWEEN 1 AND 128 OR p_tenant !~ '^[A-Za-z0-9_-]+$'\n    OR lower(p_tenant) IN ('active','sealed','processing','committed','consumers')\n    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 1000 THEN\n  RAISE EXCEPTION USING ERRCODE='QP003', MESSAGE='policy input rejected';\n END IF;\n WITH batch AS (\n  SELECT e.org_uuid,e.credential_uuid,e.revision FROM query_policy.edits e\n  WHERE e.tenant=p_tenant AND e.expires_at <= pg_catalog.statement_timestamp()\n  ORDER BY e.expires_at,e.org_uuid,e.credential_uuid,e.revision\n  LIMIT p_limit FOR UPDATE SKIP LOCKED\n )\n DELETE FROM query_policy.edits e USING batch b\n WHERE e.tenant=p_tenant AND e.org_uuid=b.org_uuid AND e.credential_uuid=b.credential_uuid AND e.revision=b.revision\n   AND e.expires_at <= pg_catalog.statement_timestamp();\n GET DIAGNOSTICS removed = ROW_COUNT;\n RETURN removed;\nEND\n$function$\n"
+        },
+        {
+            "acl": [
+                [
+                    "qp_manager",
+                    "EXECUTE",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "EXECUTE",
+                    false
+                ]
+            ],
+            "owner": "qp_owner",
+            "definition": "CREATE OR REPLACE FUNCTION query_policy.read_edits(p_tenant text, p_issuer text, p_client text, p_org uuid, p_credential uuid, p_before bigint, p_limit integer)\n RETURNS TABLE(schema_version smallint, revision bigint, actor_sub text, edited_at timestamp with time zone, expires_at timestamp with time zone, old_timeout_seconds bigint, old_scan_bytes_warning bigint, new_timeout_seconds bigint, new_scan_bytes_warning bigint)\n LANGUAGE plpgsql\n SECURITY DEFINER\n SET search_path TO 'pg_catalog'\nAS $function$\nBEGIN\n IF current_setting('query_policy.tenant', true) COLLATE \"C\" IS DISTINCT FROM p_tenant COLLATE \"C\"\n    OR p_tenant IS NULL OR octet_length(p_tenant) NOT BETWEEN 1 AND 128 OR p_tenant !~ '^[A-Za-z0-9_-]+$'\n    OR lower(p_tenant) IN ('active','sealed','processing','committed','consumers')\n    OR p_issuer IS NULL OR octet_length(p_issuer) NOT BETWEEN 1 AND 2048 OR p_issuer ~ '[[:cntrl:]]'\n    OR p_client IS NULL OR octet_length(p_client) NOT BETWEEN 1 AND 128 OR p_client ~ '[[:cntrl:]]'\n    OR p_org IS NULL OR p_org = '00000000-0000-0000-0000-000000000000'\n    OR p_credential IS NULL OR p_credential = '00000000-0000-0000-0000-000000000000'\n    OR (p_before IS NOT NULL AND p_before <= 0)\n    OR p_limit IS NULL OR p_limit NOT BETWEEN 1 AND 100 THEN\n  RAISE EXCEPTION USING ERRCODE='QP003', MESSAGE='policy input rejected';\n END IF;\n -- The immutable policy binding survives expiry and purge. Never infer an\n -- issuer/client from the actor, attributes, or a reused client string.\n IF EXISTS (SELECT 1 FROM query_policy.agent_limits a WHERE a.tenant=p_tenant AND a.verified_issuer=p_issuer AND a.verified_client_id=p_client\n              AND (a.org_uuid <> p_org OR a.credential_uuid <> p_credential)) THEN\n  RAISE EXCEPTION USING ERRCODE='QP002', MESSAGE='policy binding rejected';\n END IF;\n RETURN QUERY SELECT e.schema_version,e.revision,e.actor_sub,e.edited_at,e.expires_at,e.old_timeout_seconds,e.old_scan_bytes_warning,e.new_timeout_seconds,e.new_scan_bytes_warning\n FROM query_policy.edits e JOIN query_policy.agent_limits a\n ON a.tenant=e.tenant AND a.org_uuid=e.org_uuid AND a.credential_uuid=e.credential_uuid\n WHERE a.tenant=p_tenant AND a.verified_issuer=p_issuer AND a.verified_client_id=p_client\n   AND a.org_uuid=p_org AND a.credential_uuid=p_credential\n   AND e.tenant=p_tenant AND e.org_uuid=p_org AND e.credential_uuid=p_credential\n   AND e.expires_at > pg_catalog.statement_timestamp() AND (p_before IS NULL OR e.revision < p_before)\n ORDER BY e.revision DESC LIMIT p_limit;\nEND\n$function$\n"
+        },
+        {
+            "acl": [
+                [
+                    "qp_manager",
+                    "EXECUTE",
+                    false
+                ],
+                [
+                    "qp_owner",
+                    "EXECUTE",
+                    false
+                ]
+            ],
+            "owner": "qp_owner",
+            "definition": "CREATE OR REPLACE FUNCTION query_policy.save(p_tenant text, p_issuer text, p_client text, p_org uuid, p_credential uuid, p_actor text, p_expected bigint, p_timeout bigint, p_warning bigint)\n RETURNS bigint\n LANGUAGE plpgsql\n SECURITY DEFINER\n SET search_path TO 'pg_catalog'\nAS $function$\nDECLARE\n prior query_policy.agent_limits%ROWTYPE;\n inserted boolean := false;\n saved bigint;\n stamp timestamptz := pg_catalog.clock_timestamp();\nBEGIN\n IF current_setting('query_policy.tenant', true) COLLATE \"C\" IS DISTINCT FROM p_tenant COLLATE \"C\"\n    OR p_tenant IS NULL OR octet_length(p_tenant) NOT BETWEEN 1 AND 128 OR p_tenant !~ '^[A-Za-z0-9_-]+$'\n    OR lower(p_tenant) IN ('active','sealed','processing','committed','consumers')\n    OR p_issuer IS NULL OR octet_length(p_issuer) NOT BETWEEN 1 AND 2048 OR p_issuer ~ '[[:cntrl:]]'\n    OR p_client IS NULL OR octet_length(p_client) NOT BETWEEN 1 AND 128 OR p_client ~ '[[:cntrl:]]'\n    OR p_org IS NULL OR p_org = '00000000-0000-0000-0000-000000000000'\n    OR p_credential IS NULL OR p_credential = '00000000-0000-0000-0000-000000000000'\n    OR p_actor IS NULL OR octet_length(p_actor) NOT BETWEEN 1 AND 256 OR p_actor ~ '[[:cntrl:]]'\n    OR p_expected IS NULL OR p_expected < 0 OR p_expected = 9223372036854775807\n    OR (p_timeout IS NOT NULL AND (p_timeout <= 0 OR p_timeout > 9223372036854775))\n    OR (p_warning IS NOT NULL AND p_warning <= 0) THEN\n  RAISE EXCEPTION USING ERRCODE='QP003', MESSAGE='policy input rejected';\n END IF;\n IF p_expected = 0 THEN\n  INSERT INTO query_policy.agent_limits VALUES (p_tenant,p_issuer,p_client,p_org,p_credential,1,1,p_timeout,p_warning,stamp)\n   ON CONFLICT DO NOTHING RETURNING true INTO inserted;\n END IF;\n IF inserted IS TRUE THEN\n  saved := 1;\n ELSE\n  SELECT * INTO prior FROM query_policy.agent_limits\n   WHERE tenant=p_tenant AND verified_issuer=p_issuer AND verified_client_id=p_client FOR UPDATE;\n  IF NOT FOUND THEN\n   IF p_expected = 0 THEN\n    RAISE EXCEPTION USING ERRCODE='QP002', MESSAGE='policy binding rejected';\n   END IF;\n   RAISE EXCEPTION USING ERRCODE='QP001', MESSAGE='policy revision conflict';\n  END IF;\n  IF prior.org_uuid <> p_org OR prior.credential_uuid <> p_credential THEN\n   RAISE EXCEPTION USING ERRCODE='QP002', MESSAGE='policy binding rejected';\n  END IF;\n  IF prior.revision <> p_expected THEN\n   RAISE EXCEPTION USING ERRCODE='QP001', MESSAGE='policy revision conflict';\n  END IF;\n  saved := prior.revision + 1;\n  UPDATE query_policy.agent_limits SET revision=saved, timeout_seconds=p_timeout, scan_bytes_warning=p_warning, updated_at=stamp\n   WHERE tenant=p_tenant AND verified_issuer=p_issuer AND verified_client_id=p_client;\n END IF;\n INSERT INTO query_policy.edits (tenant,org_uuid,credential_uuid,schema_version,revision,actor_sub,old_timeout_seconds,old_scan_bytes_warning,new_timeout_seconds,new_scan_bytes_warning)\n VALUES (p_tenant,p_org,p_credential,1,saved,p_actor,prior.timeout_seconds,prior.scan_bytes_warning,p_timeout,p_warning);\n RETURN saved;\nEND\n$function$\n"
+        }
+    ]
+}

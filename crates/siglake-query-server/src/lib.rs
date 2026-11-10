@@ -23,6 +23,7 @@ pub mod discovery;
 pub mod error;
 pub mod format;
 mod health;
+pub mod history;
 pub mod hot_cache;
 mod indexes_routes;
 pub mod jaeger_limits;
@@ -33,6 +34,18 @@ pub mod limits;
 pub mod midflight;
 pub mod oidc;
 pub mod openapi_dto;
+
+/// Named public CA profiles for dedicated connectors; never ordinary app pools.
+pub mod postgres_trust;
+
+#[cfg(test)]
+mod postgres_trust_tests;
+// One private signing fixture shared by Controls and batch-ownership tests.
+pub mod query_controls;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../siglake-ingest/tests/ingest/fake_idp.rs"]
+mod signing_fixture;
 mod sql;
 pub mod tenants;
 pub mod udfs;
@@ -259,6 +272,10 @@ pub struct AppState {
     pub jobs: Arc<JobStore>,
     /// Audit handle. `None` disables audit emission.
     pub audit: Option<AuditWriter>,
+    /// Opt-in observation; the source never owns a collector/runtime task.
+    pub history: Option<history::HistoryObserverSource>,
+    /// Optional explicit controls authority; disabled creates no policy connection.
+    pub(crate) query_controls: Option<Arc<query_controls::ControlsAuthority>>,
     /// Per-request tenant routing. `None` ⇒ every request routes
     /// through `ice` (the v0 single-tenant behavior).
     pub tenants: Option<TenantRegistry>,
@@ -328,6 +345,8 @@ impl AppState {
             limits: Arc::new(limits),
             jobs: Arc::new(JobStore::default()),
             audit: None,
+            history: None,
+            query_controls: None,
             tenants: None,
             allowed_tenants: None,
             query_scan: QueryScanConfig::default(),
@@ -395,8 +414,62 @@ impl AppState {
         self
     }
 
+    /// Explicit server-side injection. Captures validated operator timeouts;
+    /// configure limits first. Source CLI wiring is separately opt-in; this
+    /// constructor neither provisions schema/roles nor activates a deployment.
+    pub fn with_query_controls(
+        mut self,
+        reader: Arc<query_controls::PolicyReader>,
+        operator_generation: i64,
+    ) -> Result<Self, query_controls::PolicyError> {
+        self.query_controls = Some(Arc::new(query_controls::ControlsAuthority::new(
+            reader,
+            &self.limits,
+            operator_generation,
+        )?));
+        Ok(self)
+    }
+
+    /// Explicit wirev2 configuration. Configure limits first.
+    /// The skew bound is an operator assumption, not measured synchronization.
+    pub fn with_distributed_query_controls(
+        mut self,
+        reader: Arc<query_controls::PolicyReader>,
+        operator_generation: i64,
+        config: query_controls::DistributedControlsConfig,
+    ) -> Result<Self, query_controls::PolicyError> {
+        let mut authority =
+            query_controls::ControlsAuthority::new(reader, &self.limits, operator_generation)?;
+        authority.distributed = Some(config);
+        self.query_controls = Some(Arc::new(authority));
+        Ok(self)
+    }
+
+    /// Local/test service lifecycle: retain the state/authority until this
+    /// completes. Cancelling the wait does not discard producer ownership.
+    pub async fn shutdown_query_controls(&self) {
+        if let Some(authority) = &self.query_controls {
+            authority.shutdown().await;
+        }
+    }
+
     pub fn with_jobs(mut self, jobs: JobStore) -> Self {
+        if let Some(observer) = &self.history {
+            jobs.set_history_observer(observer.clone());
+        }
         self.jobs = Arc::new(jobs);
+        self
+    }
+
+    /// Inject a trusted observer without transferring service/task ownership.
+    pub fn with_history(self, observer: history::HistoryObserver) -> Self {
+        self.with_history_source(observer.into())
+    }
+
+    /// A non-owning facade; no observer exists until full collector preflight.
+    pub fn with_history_source(mut self, source: history::HistoryObserverSource) -> Self {
+        self.jobs.set_history_observer(source.clone());
+        self.history = Some(source);
         self
     }
 
@@ -456,9 +529,19 @@ impl AppState {
         &self,
         identity: &CallerIdentity,
     ) -> anyhow::Result<Arc<IcebergContext>> {
-        match (&self.tenants, identity.tenant.as_deref()) {
+        match (&self.tenants, self.execution_tenant(identity)) {
             (Some(reg), Some(t)) => reg.resolve(t).await,
             _ => Ok(self.ice.clone()),
+        }
+    }
+
+    /// Authoritative selected routing tenant, before catalog I/O. Exactly the
+    /// same decision is used by resolve_ice and job ownership. No canonical
+    /// tenant exists for the shared/default context; never guess from a claim.
+    pub(crate) fn execution_tenant<'a>(&self, identity: &'a CallerIdentity) -> Option<&'a str> {
+        match (&self.tenants, identity.tenant.as_deref()) {
+            (Some(_), Some(t)) => Some(t),
+            _ => None,
         }
     }
 
@@ -479,10 +562,7 @@ impl AppState {
     /// only after [`crate::tenants::validate`] accepted it, so the owner key
     /// and the namespace suffix are the same string by construction.
     pub fn job_owner(&self, identity: &CallerIdentity) -> Option<String> {
-        match (&self.tenants, identity.tenant.as_deref()) {
-            (Some(_), Some(t)) => Some(t.to_string()),
-            _ => None,
-        }
+        self.execution_tenant(identity).map(str::to_owned)
     }
 }
 
@@ -595,6 +675,7 @@ fn api_routes() -> OpenApiRouter<AppState> {
         .routes(routes!(debug_routes::memory_pool))
         .routes(routes!(sql::handle))
         .routes(routes!(sql::explain))
+        .routes(routes!(query_controls::effective::get))
         // Distributed query (#7): `/api/v1/sql` coordinates transparently when
         // peers are configured; `/local` always runs single-pod (the preserved
         // pre-distribution behavior); `/distributed` forces coordination;
@@ -608,8 +689,8 @@ fn api_routes() -> OpenApiRouter<AppState> {
 
 /// The OpenAPI 3.1 document for the query HTTP API.
 ///
-/// Built from the same route-set constructors [`router`] uses, so a route that
-/// exists cannot go undocumented. Takes no [`AppState`]: layers contribute
+/// Built from the public route-set constructors [`router`] uses. The internal
+/// coordinator-only versioned shard route is intentionally not a public API. Takes no [`AppState`]: layers contribute
 /// nothing to the document, and `split_for_parts` leaves the state generic.
 pub fn openapi() -> utoipa::openapi::OpenApi {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
@@ -624,6 +705,12 @@ pub fn router(state: AppState) -> Router {
     let api = api_routes()
         .split_for_parts()
         .0
+        // Distinct authenticated route: old workers return 404, never execute
+        // an unknown controls field through the permissive legacy DTO.
+        .route(
+            query_controls::wire::PATH,
+            axum::routing::post(sql::shard_v2),
+        )
         .route_layer(middleware::from_fn(track_in_flight))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1245,6 +1332,7 @@ pub fn spawn_query_cache_warmer(ice: Arc<IcebergContext>) {
 pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
     spawn_hot_cache_refresher(&state);
     let jobs = state.jobs.clone();
+    let controls = state.query_controls.clone();
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
@@ -1256,11 +1344,20 @@ pub async fn serve(addr: SocketAddr, state: AppState) -> Result<()> {
         tls = false,
         "siglake-query-server listening"
     );
+    let stopping = controls.clone();
     let serve_result = axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(c) = stopping {
+                c.stop_admissions();
+            }
+        })
         .await;
     tracing::info!("siglake-query-server stopped accepting connections");
     shutdown_jobs(&jobs).await;
+    if let Some(controls) = controls {
+        controls.shutdown().await;
+    }
     serve_result.context("axum::serve")
 }
 
@@ -1315,6 +1412,7 @@ async fn shutdown_signal() {
 pub async fn serve_tls(addr: SocketAddr, state: AppState, tls: TlsConfig) -> Result<()> {
     spawn_hot_cache_refresher(&state);
     let jobs = state.jobs.clone();
+    let controls = state.query_controls.clone();
     // axum-server's `from_pem_file` uses rustls which requires a
     // crypto provider installed in the process. Install aws-lc-rs
     // (the one we already pull in transitively via sqlx) if no
@@ -1343,8 +1441,12 @@ pub async fn serve_tls(addr: SocketAddr, state: AppState, tls: TlsConfig) -> Res
     );
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
+    let stopping = controls.clone();
     let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
+        if let Some(c) = stopping {
+            c.stop_admissions();
+        }
         shutdown_handle.graceful_shutdown(None);
     });
     let serve_result = axum_server::bind_rustls(addr, rustls_config)
@@ -1352,7 +1454,11 @@ pub async fn serve_tls(addr: SocketAddr, state: AppState, tls: TlsConfig) -> Res
         .serve(router(state).into_make_service())
         .await;
     signal_task.abort();
+    let _ = signal_task.await;
     shutdown_jobs(&jobs).await;
+    if let Some(controls) = controls {
+        controls.shutdown().await;
+    }
     serve_result.context("axum_server::serve")
 }
 

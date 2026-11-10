@@ -32,6 +32,9 @@ use datafusion::physical_plan::{execute_stream, ExecutionPlan};
 pub struct PlanRuntimeStats {
     pub nodes: usize,
     pub leaf_output_rows: u64,
+    /// Positive metric provenance for every leaf, not default numeric totals.
+    pub leaf_rows_measured: bool,
+    pub scan_bytes_measured: bool,
     pub elapsed_compute_nanos: u64,
     pub output_rows: u64,
     pub output_batches: u64,
@@ -610,8 +613,15 @@ async fn collect_plan_with_caps_stream(
 
 pub fn summarize_plan_runtime(plan: &Arc<dyn ExecutionPlan>) -> PlanRuntimeStats {
     let mut out = PlanRuntimeStats::default();
+    let mut leaves = 0;
+    let mut measured_row_leaves = 0;
+    let mut measured_byte_leaves = 0;
     let _ = plan.apply(|node| {
         out.nodes += 1;
+        let leaf = node.children().is_empty();
+        if leaf {
+            leaves += 1;
+        }
         if let Some(scan) = node
             .as_any()
             .downcast_ref::<siglake_storage::SiglakeIcebergTableScan>()
@@ -665,12 +675,20 @@ pub fn summarize_plan_runtime(plan: &Arc<dyn ExecutionPlan>) -> PlanRuntimeStats
             out.file_cache_misses += sum("file_cache_misses");
             out.file_cache_bypasses += sum("file_cache_bypasses");
             out.file_cache_populate_rows += sum("file_cache_populate_rows");
-            if node.children().is_empty() {
-                out.leaf_output_rows += aggregate.output_rows().unwrap_or_default() as u64;
+            if leaf {
+                if let Some(rows) = aggregate.output_rows() {
+                    measured_row_leaves += 1;
+                    out.leaf_output_rows += rows as u64;
+                }
+                if aggregate.sum_by_name("bytes_scanned").is_some() {
+                    measured_byte_leaves += 1;
+                }
             }
         }
         Ok(TreeNodeRecursion::Continue)
     });
+    out.leaf_rows_measured = leaves > 0 && measured_row_leaves == leaves;
+    out.scan_bytes_measured = leaves > 0 && measured_byte_leaves == leaves;
     out
 }
 

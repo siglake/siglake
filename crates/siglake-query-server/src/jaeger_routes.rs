@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use chrono::{DateTime, Utc};
 use datafusion::prelude::{DataFrame, SessionContext};
 use serde::Deserialize;
@@ -197,17 +196,20 @@ pub async fn services(
     Extension(identity): Extension<CallerIdentity>,
     Path(index): Path<String>,
 ) -> Result<Response, ApiError> {
-    let request = TraceRequest::begin(&state).await?;
-    let traces = request.open(&state, &identity, &index).await?;
-    let services = request.name_list(&traces, NameList::Services).await?;
-    Ok((
-        axum::http::StatusCode::OK,
-        Json(json!({
-            "data": services,
-            "total": services.len(),
-        })),
+    crate::query_controls::runtime::run_jaeger(
+        state.query_controls.clone(),
+        identity.clone(),
+        async {
+            let request = TraceRequest::begin(&state).await?;
+            let traces = request.open(&state, &identity, &index).await?;
+            let services = request.name_list(&traces, NameList::Services).await?;
+            request.response(NativeResponse {
+                data: &services,
+                total: services.len(),
+            })
+        },
     )
-        .into_response())
+    .await
 }
 
 /// Jaeger-compatible operation-name list for one service.
@@ -280,19 +282,22 @@ pub async fn operations(
     Extension(identity): Extension<CallerIdentity>,
     Path((index, service)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let request = TraceRequest::begin(&state).await?;
-    let traces = request.open(&state, &identity, &index).await?;
-    let operations = request
-        .name_list(&traces, NameList::Operations { service })
-        .await?;
-    Ok((
-        axum::http::StatusCode::OK,
-        Json(json!({
-            "data": operations,
-            "total": operations.len(),
-        })),
+    crate::query_controls::runtime::run_jaeger(
+        state.query_controls.clone(),
+        identity.clone(),
+        async {
+            let request = TraceRequest::begin(&state).await?;
+            let traces = request.open(&state, &identity, &index).await?;
+            let operations = request
+                .name_list(&traces, NameList::Operations { service })
+                .await?;
+            request.response(NativeResponse {
+                data: &operations,
+                total: operations.len(),
+            })
+        },
     )
-        .into_response())
+    .await
 }
 
 /// Jaeger-compatible trace search.
@@ -386,31 +391,33 @@ pub async fn find_traces(
     // enforced for free — so a flood of hostile `?limit=` requests cannot
     // occupy the pod's admission budget on its way to being refused.
     refuse_over_trace_ceiling(params.limit, &state)?;
-    let request = TraceRequest::begin(&state).await?;
-    let traces = request.open(&state, &identity, &index).await?;
-    let trace_ids = request.phase(traces.find_trace_ids(&params)).await?;
-    if trace_ids.is_empty() {
-        // Immediately ready, and still refused when the clock is gone: the
-        // selection scan can consume the whole budget and come back empty.
-        request.check_deadline()?;
-        return Ok((
-            axum::http::StatusCode::OK,
-            Json(json!({"data": [], "total": 0})),
-        )
-            .into_response());
-    }
-    let rows = request
-        .phase(traces.fetch_spans_for_trace_ids(&trace_ids))
-        .await?;
-    let data = build_jaeger_traces(rows, &trace_ids)?;
-    Ok((
-        axum::http::StatusCode::OK,
-        Json(json!({
-            "data": data,
-            "total": trace_ids.len(),
-        })),
+    crate::query_controls::runtime::run_jaeger(
+        state.query_controls.clone(),
+        identity.clone(),
+        async {
+            let request = TraceRequest::begin(&state).await?;
+            let traces = request.open(&state, &identity, &index).await?;
+            let trace_ids = request.phase(traces.find_trace_ids(&params)).await?;
+            if trace_ids.is_empty() {
+                // Immediately ready, and still refused when the clock is gone: the
+                // selection scan can consume the whole budget and come back empty.
+                request.check_deadline()?;
+                return request.response(NativeResponse::<Value> {
+                    data: &[],
+                    total: 0,
+                });
+            }
+            let rows = request
+                .phase(traces.fetch_spans_for_trace_ids(&trace_ids))
+                .await?;
+            let data = build_jaeger_traces(rows, &trace_ids)?;
+            request.response(NativeResponse {
+                data: &data,
+                total: trace_ids.len(),
+            })
+        },
     )
-        .into_response())
+    .await
 }
 
 /// Jaeger-compatible single-trace lookup.
@@ -484,20 +491,23 @@ pub async fn get_trace(
     Extension(identity): Extension<CallerIdentity>,
     Path((index, trace_id)): Path<(String, String)>,
 ) -> Result<Response, ApiError> {
-    let request = TraceRequest::begin(&state).await?;
-    let traces = request.open(&state, &identity, &index).await?;
-    let rows = request
-        .phase(traces.fetch_spans_for_trace_ids(std::slice::from_ref(&trace_id)))
-        .await?;
-    let data = build_jaeger_traces(rows, std::slice::from_ref(&trace_id))?;
-    Ok((
-        axum::http::StatusCode::OK,
-        Json(json!({
-            "data": data,
-            "total": data.len(),
-        })),
+    crate::query_controls::runtime::run_jaeger(
+        state.query_controls.clone(),
+        identity.clone(),
+        async {
+            let request = TraceRequest::begin(&state).await?;
+            let traces = request.open(&state, &identity, &index).await?;
+            let rows = request
+                .phase(traces.fetch_spans_for_trace_ids(std::slice::from_ref(&trace_id)))
+                .await?;
+            let data = build_jaeger_traces(rows, std::slice::from_ref(&trace_id))?;
+            request.response(NativeResponse {
+                data: &data,
+                total: data.len(),
+            })
+        },
     )
-        .into_response())
+    .await
 }
 
 /// One interactive request lifecycle for the four Jaeger read routes (#2096).
@@ -511,11 +521,11 @@ pub async fn get_trace(
 /// left, and it answers after the memory is already gone.
 ///
 /// Deliberately NOT a private budget. The reservation comes out of the shared
-/// interactive [`crate::admission::AdmissionController`] and the wall clock is
-/// the interactive tier's own `default_timeout`, so trace reads compete with
-/// SQL rather than beside it. The Jaeger API has no `limits` object to tighten
-/// them with — its shape is fixed by the Jaeger UI — so the server ceilings ARE
-/// the resolved limits here.
+/// interactive [`crate::admission::AdmissionController`], so trace reads compete
+/// with SQL rather than beside it. The Jaeger API has no `limits` object: the
+/// shared authority resolves trusted primary policy against interactive defaults
+/// before `begin`, retaining authenticated ingress through body production.
+/// Without injected authority the existing operator-only behavior remains.
 ///
 /// ONE guard and ONE deadline per REQUEST, not per query phase. `find_traces`
 /// selects trace ids and then retrieves their spans: two reservations would let
@@ -542,10 +552,32 @@ struct TraceRequest {
     _admission: crate::admission::AdmissionGuard,
 }
 
+/// Borrow the completed native data instead of rebuilding a whole Value arena.
+#[derive(serde::Serialize)]
+struct NativeResponse<'a, T: serde::Serialize> {
+    data: &'a [T],
+    total: usize,
+}
+
+struct TraceBody {
+    bytes: Option<bytes::Bytes>,
+    _request: TraceRequest,
+}
+impl futures::Stream for TraceBody {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(self.bytes.take().map(Ok))
+    }
+}
+
 impl TraceRequest {
-    /// Start the clock, then take the reservation.
+    /// Retain the shared original clock, then take the unestimated reservation.
+    /// Without authority, start the existing operator clock here.
     ///
-    /// In that order, and before tenant resolution: the index lookup and the
+    /// Before catalog tenant resolution: the index lookup and the
     /// DataFusion table registration are catalog and object-store work that a
     /// slow backend can stretch past any request budget, and admission's own
     /// bounded wait (`SIGLAKE_QUERY_ADMISSION_WAIT_MS`) is time this request
@@ -557,15 +589,29 @@ impl TraceRequest {
     /// of trace reads from all registering tables at once.
     async fn begin(state: &AppState) -> Result<Self, ApiError> {
         let tier = state.limits.tier(Priority::Interactive);
-        let resolved =
-            ResolvedLimits::resolve(&RequestLimits::default(), Priority::Interactive, &tier);
-        let started = Instant::now();
-        let deadline = tokio::time::Instant::from_std(started + resolved.timeout);
-        let admission = crate::sql::acquire_admission_reservation(
-            state,
+        let resolved = crate::query_controls::runtime::resolve(
+            &RequestLimits::default(),
             Priority::Interactive,
-            state.admission.unestimated_reservation_bytes(),
-            None,
+            &tier,
+        );
+        let controls = crate::query_controls::runtime::current();
+        let started = controls.map_or_else(Instant::now, |c| c.started);
+        let deadline = controls.map_or_else(
+            || tokio::time::Instant::from_std(started + resolved.timeout),
+            |c| c.deadline,
+        );
+        let cost = CostReport::unknown_after_timeout();
+        let admission = crate::sql::apply_timeout(
+            crate::sql::acquire_admission_reservation(
+                state,
+                Priority::Interactive,
+                state.admission.unestimated_reservation_bytes(),
+                None,
+            ),
+            &resolved,
+            &cost,
+            deadline,
+            started,
         )
         .await?;
         let cancel = siglake_storage::QueryCancel::new();
@@ -578,6 +624,35 @@ impl TraceRequest {
             _cancel_guard: siglake_storage::CancelOnDrop(cancel),
             _admission: admission,
         })
+    }
+
+    /// Encode before headers and keep cancellation/admission with server body production.
+    fn response(self, value: impl serde::Serialize) -> Result<Response, ApiError> {
+        self.check_deadline()?;
+        #[cfg(test)]
+        controls_tests::render_checkpoint();
+        let encoded = crate::format::checked_json(&value);
+        self.check_deadline()?;
+        let bytes = encoded.map_err(ApiError::internal)?;
+        let controlled = crate::query_controls::runtime::current().is_some();
+        if !controlled {
+            return Ok((
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                bytes,
+            )
+                .into_response());
+        }
+        // The authority's existing bounded producer retains this source through
+        // outer delivery/drop/expiry. No detached Jaeger ownership task.
+        let source = TraceBody {
+            bytes: Some(bytes),
+            _request: self,
+        };
+        Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            axum::body::Body::from_stream(source),
+        )
+            .into_response())
     }
 
     /// Run one phase on what is LEFT of this request's budget.
@@ -660,9 +735,9 @@ struct TraceRenderBudget {
     /// #2184: it collected with `df.collect()`, so the mid-flight breaker every
     /// `/api/v1/sql` browse runs under did not exist here.
     max_rows_scanned: usize,
-    /// `false` (from `RequestLimits`, which this surface cannot set) would
-    /// bypass the wall clock; it never lifts a render ceiling. Kept so the
-    /// rows-SCANNED breaker reads the same switch the SQL path reads.
+    /// The optional scan-row breaker switch SQL reads. This surface has no
+    /// caller limits; neither this switch nor render ceilings replace the
+    /// independent mandatory clock when controls authority is injected.
     circuit_breakers: bool,
     /// Derived from the admission reservation this request holds (#2184).
     ceilings: JaegerCeilings,
@@ -774,6 +849,8 @@ impl TraceQueryContext {
         // answer with a generation newer than the provider just registered, and
         // the name-list cache would file this generation's answer under the
         // next one's key.
+        #[cfg(test)]
+        controls_tests::checkpoint(controls_tests::Point::Register).await;
         let generation = ice
             .register_table_returning_generation(&ctx, &table, TRACE_TABLE_NAME)
             .await
@@ -997,6 +1074,8 @@ impl TraceQueryContext {
         } else {
             usize::MAX
         };
+        #[cfg(test)]
+        controls_tests::checkpoint(controls_tests::Point::Collect).await;
         let outcome = crate::midflight::collect_with_bounds(
             df,
             max_rows_scanned,
@@ -1111,6 +1190,10 @@ impl TraceQueryContext {
         let sql = list.sql();
         let Some(key) = self.name_cache_key(list) else {
             return names_of(&self.query_records(&sql, RenderKind::Names).await?);
+        };
+        let key = match crate::query_controls::runtime::cache_discriminator(resolved) {
+            Some(controls) => format!("{key}|{controls}"),
+            None => key,
         };
         let leader = match crate::sql::prepare_name_list_cache(key, resolved, deadline).await {
             // The stored arena, split back into names outside the cache mutex
@@ -1296,10 +1379,10 @@ fn rows_of(records: &crate::format::RecordsResponse) -> Result<Vec<Map<String, V
     records
         .rows
         .as_array()
-        .cloned()
-        .unwrap_or_default()
         .into_iter()
+        .flatten()
         .map(|row| {
+            crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
             row.as_object()
                 .cloned()
                 .ok_or_else(|| ApiError::internal("internal traces query returned non-object row"))
@@ -1315,11 +1398,18 @@ fn rows_of(records: &crate::format::RecordsResponse) -> Result<Vec<Map<String, V
 /// time and cannot answer with a differently ordered or differently filtered
 /// list.
 fn names_of(records: &crate::format::RecordsResponse) -> Result<Vec<String>, ApiError> {
-    Ok(rows_of(records)?
-        .into_iter()
-        .filter_map(|row| row.into_iter().next().map(|(_, value)| value))
-        .filter_map(|value| value.as_str().map(str::to_string))
-        .collect())
+    let mut names = Vec::new();
+    for row in rows_of(records)? {
+        crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
+        if let Some(value) = row
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| value.as_str().map(str::to_string))
+        {
+            names.push(value);
+        }
+    }
+    Ok(names)
 }
 
 /// Which Jaeger ceiling refused a request, as
@@ -1518,6 +1608,7 @@ fn build_jaeger_traces(
 ) -> Result<Vec<Value>, ApiError> {
     let mut grouped: BTreeMap<String, Vec<Map<String, Value>>> = BTreeMap::new();
     for row in rows {
+        crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
         let trace_id = row
             .get("trace_id")
             .and_then(Value::as_str)
@@ -1528,6 +1619,7 @@ fn build_jaeger_traces(
 
     let mut traces = Vec::new();
     for trace_id in trace_order {
+        crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
         let Some(rows) = grouped.remove(trace_id) else {
             continue;
         };
@@ -1542,6 +1634,7 @@ fn build_jaeger_trace(trace_id: &str, rows: Vec<Map<String, Value>>) -> Result<V
     let mut spans = Vec::with_capacity(rows.len());
 
     for row in rows {
+        crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
         let service = row
             .get("service")
             .and_then(Value::as_str)
@@ -1562,11 +1655,11 @@ fn build_jaeger_trace(trace_id: &str, rows: Vec<Map<String, Value>>) -> Result<V
         spans.push(build_jaeger_span(trace_id, &process_id, &row)?);
     }
 
-    Ok(json!({
-        "traceID": trace_id,
-        "spans": spans,
-        "processes": Value::Object(processes),
-    }))
+    Ok(Value::Object(Map::from_iter([
+        ("traceID".into(), Value::String(trace_id.into())),
+        ("spans".into(), Value::Array(spans)),
+        ("processes".into(), Value::Object(processes)),
+    ])))
 }
 
 fn build_jaeger_span(
@@ -1595,7 +1688,11 @@ fn build_jaeger_span(
         .map(parse_attributes_object)
         .transpose()?
         .unwrap_or_default();
-    Ok(json!({
+    let mut span = Map::from_iter([
+        ("tags".into(), Value::Array(residual_tags(&attributes)?)),
+        ("logs".into(), Value::Array(event_logs(&attributes)?)),
+    ]);
+    let Value::Object(fields) = json!({
         "traceID": trace_id,
         "spanID": span_id,
         "operationName": required_string(row, "name")?,
@@ -1603,9 +1700,11 @@ fn build_jaeger_span(
         "startTime": timestamp_micros(required_string(row, "timestamp")?)?,
         "duration": row.get("duration_nanos").and_then(Value::as_i64).unwrap_or_default() / 1_000,
         "processID": process_id,
-        "tags": residual_tags(&attributes),
-        "logs": event_logs(&attributes),
-    }))
+    }) else {
+        unreachable!("object literal")
+    };
+    span.extend(fields);
+    Ok(Value::Object(span))
 }
 
 fn required_string<'a>(row: &'a Map<String, Value>, key: &str) -> Result<&'a str, ApiError> {
@@ -1619,34 +1718,42 @@ fn parse_attributes_object(raw: &str) -> Result<Map<String, Value>, ApiError> {
         .map_err(|e| ApiError::internal(format!("parse trace attributes: {e}")))
 }
 
-fn residual_tags(attributes: &Map<String, Value>) -> Vec<Value> {
-    let mut tags = attributes
-        .iter()
-        .filter(|(key, _)| *key != "events" && *key != "links")
-        .filter_map(|(key, value)| {
-            value.as_str().map(|value| {
-                json!({
-                    "key": key,
-                    "type": "string",
-                    "value": value,
-                })
-            })
-        })
-        .collect::<Vec<_>>();
+fn residual_tags(attributes: &Map<String, Value>) -> Result<Vec<Value>, ApiError> {
+    let mut tags = Vec::new();
+    for (key, value) in attributes {
+        crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
+        if key != "events" && key != "links" {
+            if let Some(value) = value.as_str() {
+                tags.push(json!({"key": key, "type": "string", "value": value}));
+            }
+        }
+    }
     tags.sort_by(|left, right| left["key"].as_str().cmp(&right["key"].as_str()));
-    tags
+    crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
+    Ok(tags)
 }
 
-fn event_logs(attributes: &Map<String, Value>) -> Vec<Value> {
+fn event_logs(attributes: &Map<String, Value>) -> Result<Vec<Value>, ApiError> {
     let Some(events) = attributes.get("events").and_then(Value::as_array) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    events.iter().filter_map(event_log_entry).collect()
+    let mut logs = Vec::new();
+    for event in events {
+        crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
+        if let Some(log) = event_log_entry(event)? {
+            logs.push(log);
+        }
+    }
+    Ok(logs)
 }
 
-fn event_log_entry(event: &Value) -> Option<Value> {
-    let object = event.as_object()?;
-    let timestamp = otlp_event_time_micros(object.get("timeUnixNano")?)?;
+fn event_log_entry(event: &Value) -> Result<Option<Value>, ApiError> {
+    let Some(object) = event.as_object() else {
+        return Ok(None);
+    };
+    let Some(timestamp) = object.get("timeUnixNano").and_then(otlp_event_time_micros) else {
+        return Ok(None);
+    };
     let mut fields = Vec::new();
     if let Some(name) = object.get("name").and_then(Value::as_str) {
         fields.push(json!({
@@ -1657,6 +1764,7 @@ fn event_log_entry(event: &Value) -> Option<Value> {
     }
     if let Some(attributes) = object.get("attributes").and_then(Value::as_array) {
         for attribute in attributes {
+            crate::query_controls::runtime::render_check().map_err(ApiError::internal)?;
             let Some(attr) = attribute.as_object() else {
                 continue;
             };
@@ -1673,10 +1781,10 @@ fn event_log_entry(event: &Value) -> Option<Value> {
             }));
         }
     }
-    Some(json!({
-        "timestamp": timestamp,
-        "fields": fields,
-    }))
+    Ok(Some(Value::Object(Map::from_iter([
+        ("timestamp".into(), Value::Number(timestamp.into())),
+        ("fields".into(), Value::Array(fields)),
+    ]))))
 }
 
 fn proto_json_value_to_string(value: &Value) -> Option<String> {
@@ -1780,7 +1888,7 @@ mod tests {
         (status, serde_json::from_slice(&body).unwrap())
     }
 
-    async fn build_state() -> (crate::AppState, Arc<IcebergContext>, tempfile::TempDir) {
+    pub(super) async fn build_state() -> (crate::AppState, Arc<IcebergContext>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let warehouse = tmp.path().join("warehouse");
         let ice = Arc::new(IcebergContext::open(&warehouse).await.unwrap());
@@ -1814,7 +1922,7 @@ mod tests {
         removed
     }
 
-    async fn append_trace_fixture(ice: &IcebergContext, index_id: &str) {
+    pub(super) async fn append_trace_fixture(ice: &IcebergContext, index_id: &str) {
         let config = IndexConfig {
             index_id: index_id.to_string(),
             doc_mapping: builtin_traces_template().doc_mapping,
@@ -2371,7 +2479,10 @@ mod tests {
     /// set in the environment (project convention: tests never `set_var`).
     /// Everything else stays at the interactive defaults, because the point is
     /// that these routes read the same ceilings SQL does.
-    fn tuned_limits(timeout: std::time::Duration, admission_budget_bytes: u64) -> ServerLimits {
+    pub(super) fn tuned_limits(
+        timeout: std::time::Duration,
+        admission_budget_bytes: u64,
+    ) -> ServerLimits {
         let mut limits = ServerLimits::default();
         limits.interactive.default_timeout = timeout;
         limits.interactive.ceiling_timeout = limits.interactive.ceiling_timeout.max(timeout);
@@ -3350,3 +3461,7 @@ mod tests {
         assert_eq!(rows.len(), 300, "the trace came back short");
     }
 }
+
+#[cfg(test)]
+#[path = "jaeger_routes/controls_tests.rs"]
+mod controls_tests;

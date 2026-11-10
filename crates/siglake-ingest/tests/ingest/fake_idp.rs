@@ -118,3 +118,19 @@ pub async fn spawn_fake_idp() -> (String, tokio::task::JoinHandle<()>) {
     });
     (issuer, handle)
 }
+
+pub fn issue_access_jwt(issuer: &str, client_id: &str, tenant: &str) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some(TEST_KID.into());
+    encode(
+        &header,
+        &json!({"iss":issuer,"sub":"synthetic-subject","iat":now,"exp":now+600,
+        "token_use":"access","client_id":client_id,"tenant":tenant}),
+        &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM).unwrap(),
+    )
+    .unwrap()
+}

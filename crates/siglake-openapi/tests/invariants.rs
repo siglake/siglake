@@ -499,6 +499,7 @@ fn route_table_is_exact() {
         ("/api/v1/delete-tasks/{id}", &["get"][..]),
         ("/api/v1/sql", &["post"][..]),
         ("/api/v1/sql/explain", &["post"][..]),
+        ("/api/v1/query-controls/effective", &["get"][..]),
         ("/api/v1/sql/local", &["post"][..]),
         ("/api/v1/sql/distributed", &["post"][..]),
         ("/api/v1/sql/shard", &["post"][..]),

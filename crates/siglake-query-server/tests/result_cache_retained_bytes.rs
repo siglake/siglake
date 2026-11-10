@@ -241,6 +241,8 @@ fn retained_heap_bytes_tracks_the_allocator() {
         let mut response = name_list("service", 16, 8);
         response.cost = Some(CostReport {
             files_to_scan: Some(12),
+            estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: Some(40),
             estimated_bytes_scanned: 1 << 20,
             estimated_rows_processed: 4096,

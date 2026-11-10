@@ -13,6 +13,8 @@ import httpx
 import sqlglot
 from sqlglot import exp
 
+from .controls import ControlsError, from_headers, validate as validate_controls
+
 
 class SiglakeError(Exception):
     """An actionable error safe to return through a tool."""
@@ -65,6 +67,15 @@ def validate_sql(query: str) -> str:
     return query
 
 
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
 class SiglakeClient:
     def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None):
         self.settings = settings
@@ -87,20 +98,35 @@ class SiglakeClient:
                     async with client.stream(method, self.settings.endpoint.rstrip("/") + path, json=body) as response:
                         if response.is_redirect:
                             raise SiglakeError("Siglake returned a redirect; configure its final API base URL")
+                        try:
+                            controls = from_headers(response.headers)
+                        except ControlsError:
+                            raise SiglakeError("Siglake returned invalid query controls metadata") from None
                         if not response.is_success:
                             # Never reflect an arbitrary upstream error page, SQL text, or credentials.
                             hints = {401: "check SIGLAKE_TOKEN", 403: "check token permissions and SIGLAKE_TENANT",
                                      404: "check the endpoint and table name", 422: "check compatibility with the query API request format", 400: "check DataFusion SQL syntax and schema",
                                      413: "narrow the time range or returned columns", 429: "server is busy; try later",
                                      504: "narrow the time range or simplify the query"}
-                            raise SiglakeError(f"Siglake HTTP {response.status_code}: " + hints.get(response.status_code, "check query-server logs"))
+                            detail = ("; controls=" + json.dumps(controls, separators=(",", ":"))) if controls is not None else ""
+                            raise SiglakeError(f"Siglake HTTP {response.status_code}: " + hints.get(response.status_code, "check query-server logs") + detail)
                         data = bytearray()
                         async for chunk in response.aiter_bytes():
                             if len(data) + len(chunk) > self.settings.max_response_bytes:
                                 raise SiglakeError("Response exceeds the MCP byte limit; select fewer columns, smaller fields or fewer rows")
                             data.extend(chunk)
                         try:
-                            return json.loads(data)
+                            result = json.loads(data, object_pairs_hook=_unique_object)
+                            if isinstance(result, dict) and "controls" in result:
+                                try:
+                                    validate_controls(result["controls"])
+                                    if controls is not None and result["controls"] != controls:
+                                        raise ControlsError()
+                                except ControlsError:
+                                    raise SiglakeError("Siglake returned invalid query controls metadata") from None
+                            elif controls is not None:
+                                raise SiglakeError("Siglake response is missing required query controls metadata")
+                            return result
                         except (ValueError, UnicodeError):
                             raise SiglakeError("Siglake returned an invalid JSON response") from None
         except (TimeoutError, httpx.TimeoutException):

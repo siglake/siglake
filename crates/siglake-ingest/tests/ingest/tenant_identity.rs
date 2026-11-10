@@ -145,3 +145,39 @@ async fn a_token_without_the_claim_is_refused() {
 
     idp.abort();
 }
+
+#[tokio::test]
+async fn cognito_access_ingest_is_explicit_and_preserves_claim_tenant_authority() {
+    use crate::fake_idp::issue_access_jwt;
+    let (issuer, idp) = spawn_fake_idp().await;
+    let access = OidcVerifier::from_cognito_access_issuer(issuer.clone(), "tenant".into())
+        .await
+        .unwrap();
+    let generic = OidcVerifier::from_issuer(issuer.clone(), "human-client".into())
+        .await
+        .unwrap()
+        .with_tenant_claim("tenant");
+    let (app, tmp) = app_with_verifier(access).await;
+    let (generic_app, _generic_tmp) = app_with_verifier(generic).await;
+    let token = issue_access_jwt(&issuer, "dynamic-client", "acme");
+    assert_eq!(
+        post(&generic_app, &token, None).await,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(post(&app, &token, None).await, StatusCode::OK);
+    assert_eq!(post(&app, &token, Some("acme")).await, StatusCode::OK);
+    assert_eq!(
+        post(&app, &token, Some("foreign")).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(tmp.path().join("acme").exists());
+    assert!(!tmp.path().join("foreign").exists());
+    let token = issue_access_jwt(&issuer, "another-dynamic-client", "acme");
+    assert_eq!(post(&app, &token, None).await, StatusCode::OK);
+    let token = issue_access_jwt(&issuer, "dynamic-client", "");
+    assert_eq!(
+        post(&app, &token, Some("acme")).await,
+        StatusCode::FORBIDDEN
+    );
+    idp.abort();
+}

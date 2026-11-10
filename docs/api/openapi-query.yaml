@@ -1340,6 +1340,38 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ApiErrorBody"
+  /api/v1/query-controls/effective:
+    get:
+      tags:
+      - sql
+      operationId: get
+      responses:
+        "200":
+          description: >-
+            This verified caller's local default-request controls for both priorities;
+            disabled is explicit.
+        "400":
+          description: Query parameters are not supported.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorBody"
+        "401":
+          description: Missing or invalid bearer credential.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorBody"
+        "403":
+          description: The verified tenant claim is missing, unusable or refused by this server.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorBody"
+        "503":
+          description: Configured policy authority unavailable.
+        "504":
+          description: Original operator budget expired.
   /api/v1/sql:
     post:
       tags:
@@ -1976,6 +2008,10 @@ components:
       - result_url
       - priority
       properties:
+        controls:
+          oneOf:
+          - type: "null"
+          - $ref: "#/components/schemas/JobControls"
         job_id:
           type: string
           description: Job identifier (UUIDv7, so ids sort by submission time).
@@ -2611,6 +2647,26 @@ components:
         cancelled:
           type: string
           description: Id of the job that was cancelled.
+    JobControls:
+      type: object
+      required:
+      - accepted_at
+      - original_expires_at
+      - accepted
+      properties:
+        accepted:
+          $ref: "#/components/schemas/JobSnapshot"
+        accepted_at:
+          type: string
+          format: date-time
+        execution:
+          oneOf:
+          - type: "null"
+          - $ref: "#/components/schemas/JobSnapshot"
+        original_expires_at:
+          type: string
+          format: date-time
+      additionalProperties: false
     JobInfo:
       type: object
       description: |-
@@ -2623,6 +2679,10 @@ components:
       - submitted_at
       - query
       properties:
+        controls:
+          oneOf:
+          - type: "null"
+          - $ref: "#/components/schemas/JobControls"
         cost:
           oneOf:
           - type: "null"
@@ -2652,6 +2712,45 @@ components:
         submitted_at:
           type: string
           format: date-time
+    JobSnapshot:
+      type: object
+      required:
+      - version
+      - policy_schema_version
+      - mandatory_timeout
+      - operator_generation
+      - effective_timeout_ms
+      - timeout_opt_out_ignored
+      properties:
+        effective_timeout_ms:
+          type: integer
+          format: int64
+        mandatory_timeout:
+          type: boolean
+        operator_generation:
+          type: integer
+          format: int64
+        policy_revision:
+          type:
+          - integer
+          - "null"
+          format: int64
+        policy_schema_version:
+          type: integer
+          format: int32
+          minimum: 0
+        scan_bytes_warning:
+          type:
+          - integer
+          - "null"
+          format: int64
+        timeout_opt_out_ignored:
+          type: boolean
+        version:
+          type: integer
+          format: int32
+          minimum: 0
+      additionalProperties: false
     JobStatus:
       type: string
       enum:

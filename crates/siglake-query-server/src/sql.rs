@@ -7,6 +7,10 @@
 //! Client SQL is READ-ONLY on every entry point here — see [`read_only_sql`]
 //! for what that refuses and why the default was not safe.
 
+#[path = "sql_controlled_jobs.rs"]
+mod controlled_jobs;
+use controlled_jobs::submit_controlled_batch;
+
 use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,9 +50,15 @@ use crate::audit::{AuditRow, AuditStatus, AuditWriter};
 use crate::auth::CallerIdentity;
 use crate::cost::{estimate, extract_exact_time_bounds_from_expr, CostReport};
 use crate::error::ApiError;
+#[cfg(test)]
+use crate::format::batches_to_records;
 #[allow(unused_imports)] // referenced by the `#[utoipa::path]` response bodies
 use crate::format::RecordsResponse;
 use crate::format::{NdjsonStream, QueryFormat};
+use crate::history::{
+    buffered as history_buffered, CacheState as HistoryCacheState, ErrorCode as HistoryErrorCode,
+    Operation as HistoryOperation,
+};
 use crate::jobs::{CompletionOutcome, JobStatus};
 use crate::limits::{Priority, RequestLimits, ResolvedLimits};
 #[allow(unused_imports)]
@@ -287,7 +297,18 @@ struct RequestClock {
 }
 
 impl RequestClock {
+    fn controls() -> Option<Self> {
+        crate::query_controls::runtime::current().map(|c| Self {
+            started: c.started,
+            deadline: c.deadline,
+            prelude: PreludePhases::default(),
+        })
+    }
+
     fn new(timeout: std::time::Duration) -> Self {
+        if let Some(clock) = Self::controls() {
+            return clock;
+        }
         let started = Instant::now();
         Self {
             deadline: tokio::time::Instant::from_std(started + timeout),
@@ -869,14 +890,18 @@ fn result_cache_key(
     scope: ResultCacheScope,
 ) -> String {
     let normalized_query = normalize_query_for_cache(query);
+    let controls = crate::query_controls::runtime::cache_discriminator(resolved)
+        .map(|value| format!("|{value}"))
+        .unwrap_or_default();
     format!(
-        "{}|snapshot={}|schema={}|rows={}|bytes={}|{}|query={}",
+        "{}|snapshot={}|schema={}|rows={}|bytes={}|{}{}|query={}",
         namespace,
         snapshot_id,
         schema_id,
         resolved.max_rows_returned,
         resolved.max_bytes_scanned,
         scope.key_fragment(),
+        controls,
         normalized_query
     )
 }
@@ -3574,7 +3599,7 @@ async fn render_fast_path_records(
     } else {
         "off"
     };
-    let mut response = (status, Json(body.as_ref())).into_response();
+    let mut response = crate::format::records_response(status, Arc::clone(&body));
     set_result_cache_header(&mut response, outcome);
     response
 }
@@ -3862,6 +3887,53 @@ mod result_cache_accounting_tests {
             Arc::ptr_eq(&first, &stored) && Arc::ptr_eq(&first, &second),
             "a hit copied the body instead of sharing it"
         );
+    }
+
+    /// A private construction test, NOT an assertion that different controls
+    /// share a production key: cache_discriminator intentionally isolates them.
+    /// The store retains only native payload; response-scoped controls never
+    /// mutate it, even when the SAME Arc is rendered in different scopes.
+    #[tokio::test]
+    async fn cached_native_payload_never_retains_current_controls() {
+        use crate::query_controls::runtime::{body_scope, test_controls};
+        let stored = Arc::new(name_list(2));
+        let original = serde_json::to_value(stored.as_ref()).unwrap();
+        let mut cache = SqlResultCache::default();
+        cache.insert(
+            "private-structural-key".into(),
+            CachedSqlResult {
+                bytes: crate::format::retained_heap_bytes(&stored),
+                body: CachedBody::Records(stored.clone()),
+            },
+        );
+        for seconds in [2, 3] {
+            let hit = cache
+                .get("private-structural-key")
+                .unwrap()
+                .expect_records();
+            assert!(Arc::ptr_eq(&hit, &stored));
+            body_scope(
+                test_controls(std::time::Duration::from_secs(seconds)),
+                async {
+                    let response = crate::format::records_response(StatusCode::OK, hit);
+                    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap();
+                    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(value["controls"]["effective_timeout_ms"], seconds * 1000);
+                    assert_eq!(value["controls"]["output_cap_enforced"], false);
+                },
+            )
+            .await;
+            let native = cache
+                .get("private-structural-key")
+                .unwrap()
+                .expect_records();
+            let serialized = serde_json::to_value(native.as_ref()).unwrap();
+            assert_eq!(serialized, original);
+            assert!(serialized.get("controls").is_none());
+            assert!(Arc::ptr_eq(&native, &stored));
+        }
     }
 
     /// THE FIFO DEFECT (#2452). A hit used to leave the key at its insertion
@@ -4401,6 +4473,31 @@ pub(crate) async fn plan_client_sql(
     ctx.sql_with_options(sql, read_only_sql()).await
 }
 
+async fn controlled<F, W>(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+    handoff: bool,
+    work: W,
+) -> Result<Response, ApiError>
+where
+    F: std::future::Future<Output = Result<Response, ApiError>>,
+    W: FnOnce(AppState, CallerIdentity, SqlRequest) -> F,
+{
+    let authority = state.query_controls.clone();
+    let caller = identity.clone();
+    let limits = req.limits.clone();
+    let priority = req.priority;
+    let handoff = handoff && priority == Priority::Batch && !req.dry_run;
+    let future = Box::pin(work(state, identity, req));
+    if handoff {
+        crate::query_controls::runtime::run_handoff(authority, caller, limits, priority, future)
+            .await
+    } else {
+        crate::query_controls::runtime::run(authority, caller, limits, priority, future).await
+    }
+}
+
 // The single-pod fallback is implemented by `handle_local`.
 /// `POST /api/v1/sql` entry point. Transparently coordinates a distributed
 /// query when worker peers are configured and this is an ordinary interactive
@@ -4488,14 +4585,43 @@ pub async fn handle(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let execution_id = siglake_storage::QueryExecutionId::next();
-    let mut result = siglake_storage::with_query_execution_id(
-        execution_id,
-        Box::pin(handle_scoped(state, identity, req)),
-    )
-    .await;
+    let mut result = controlled(state, identity, req, true, handle_observed).await;
     stamp_buffered_sql_headers(&mut result, format, started);
     result
+}
+
+async fn handle_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    siglake_storage::with_query_execution_id(execution_id, async move {
+        if state.peers.is_some() {
+            history_buffered::observe_configured(state, identity, req, |state, identity, req| {
+                Box::pin(crate::query_controls::runtime::phase(handle_scoped(
+                    state, identity, req,
+                )))
+            })
+            .await
+        } else {
+            let eligible = history_buffered::eligible(&req);
+            history_buffered::observe(
+                state,
+                identity,
+                req,
+                HistoryOperation::Sql,
+                eligible,
+                |state, identity, req| {
+                    Box::pin(crate::query_controls::runtime::phase(handle_scoped(
+                        state, identity, req,
+                    )))
+                },
+            )
+            .await
+        }
+    })
+    .await
 }
 
 async fn handle_scoped(
@@ -4504,10 +4630,10 @@ async fn handle_scoped(
     req: SqlRequest,
 ) -> Result<Response, ApiError> {
     if req.query.trim().is_empty() {
-        return handle_local(State(state), axum::extract::Extension(identity), Json(req)).await;
+        return handle_local_inner(state, identity, req, None, None, None).await;
     }
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
+    let resolved = crate::query_controls::runtime::resolve(&req.limits, req.priority, &tier);
 
     // A batch request's timeout governs the queued RUN, not the HTTP handoff.
     // Keep validation, tenant resolution, admission and the 202 outside that
@@ -4537,6 +4663,7 @@ async fn handle_scoped(
     // would double-count the one histogram.
     clock.prelude.resolve = resolve_started.elapsed();
     let rewrite_started = Instant::now();
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let effective_query = apply_timeout(
         apply_query_rewrites_for_serving(
             &ice,
@@ -4678,15 +4805,57 @@ pub async fn handle_local(
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let execution_id = siglake_storage::current_query_execution_id()
-        .unwrap_or_else(siglake_storage::QueryExecutionId::next);
-    let mut result = siglake_storage::with_query_execution_id(
-        execution_id,
-        Box::pin(handle_local_inner(state, identity, req, None, None, None)),
-    )
-    .await;
+    let mut result = controlled(state, identity, req, true, handle_local_observed).await;
     stamp_buffered_sql_headers(&mut result, format, started);
     result
+}
+
+async fn handle_local_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
+    let eligible = history_buffered::eligible(&req);
+    let execution_id = siglake_storage::current_query_execution_id()
+        .unwrap_or_else(siglake_storage::QueryExecutionId::next);
+    siglake_storage::with_query_execution_id(
+        execution_id,
+        history_buffered::observe(
+            state,
+            identity,
+            req,
+            HistoryOperation::Sql,
+            eligible,
+            |state, identity, req| {
+                Box::pin(crate::query_controls::runtime::phase(handle_local_inner(
+                    state, identity, req, None, None, None,
+                )))
+            },
+        ),
+    )
+    .await
+}
+
+/// Authoritative execution provenance, never inferred from response defaults.
+enum HistoryScanEvidence<'a> {
+    Unavailable,
+    NoDataScan,
+    Runtime(&'a crate::midflight::PlanRuntimeStats),
+}
+
+/// Copy only numeric execution evidence; never rows, names, plans or errors.
+fn observe_history_record_metrics(body: &RecordsResponse, scan: HistoryScanEvidence<'_>) {
+    let (rows, bytes) = match scan {
+        HistoryScanEvidence::NoDataScan => (Some(0), Some(0)),
+        HistoryScanEvidence::Runtime(runtime) if runtime.unsettled_partitions == 0 => (
+            runtime
+                .leaf_rows_measured
+                .then_some(runtime.leaf_output_rows),
+            runtime.scan_bytes_measured.then_some(runtime.bytes_scanned),
+        ),
+        _ => (None, None),
+    };
+    history_buffered::records(body.row_count, body.truncated, rows, bytes);
 }
 
 async fn handle_local_inner(
@@ -4697,6 +4866,7 @@ async fn handle_local_inner(
     pre_rewritten_query: Option<RewrittenQuery>,
     request_clock: Option<RequestClock>,
 ) -> Result<Response, ApiError> {
+    let request_clock = request_clock.or_else(RequestClock::controls);
     let start = request_clock
         .map(|clock| clock.started)
         .unwrap_or_else(Instant::now);
@@ -4715,8 +4885,16 @@ async fn handle_local_inner(
         );
         return Err(ApiError::bad_request("query is empty"));
     }
+    history_buffered::effective(
+        if req.dry_run || req.priority == Priority::Batch || format == QueryFormat::Records {
+            crate::history::OutputFormat::Records
+        } else {
+            crate::history::OutputFormat::Ndjson
+        },
+        req.dry_run,
+    );
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
+    let resolved = crate::query_controls::runtime::resolve(&req.limits, req.priority, &tier);
     let clock = request_clock.unwrap_or(RequestClock {
         started: start,
         deadline: tokio::time::Instant::from_std(start + resolved.timeout),
@@ -4756,6 +4934,7 @@ async fn handle_local_inner(
     let resolve_elapsed = resolve_started.elapsed() + prelude.resolve;
     record_phase_metric("sql", "resolve_ice", resolve_elapsed);
     let rewrite_started = Instant::now();
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let rewrite = async {
         match pre_rewritten_query {
             Some(query) => Ok(query),
@@ -4867,8 +5046,14 @@ async fn handle_local_inner(
         deadline,
         &effective_query.attr_rewrite_bindings,
     )) {
-        SqlResultCacheDecision::Skip => None,
-        SqlResultCacheDecision::Leader(ctx) => Some(ctx),
+        SqlResultCacheDecision::Skip => {
+            history_buffered::cache(HistoryCacheState::Bypass);
+            None
+        }
+        SqlResultCacheDecision::Leader(ctx) => {
+            history_buffered::cache(HistoryCacheState::Miss);
+            Some(ctx)
+        }
         SqlResultCacheDecision::Hit(body) => {
             // The stored body, shared rather than copied (#2304): only the
             // cost report is cloned out of it, for the audit and the metrics,
@@ -4876,6 +5061,7 @@ async fn handle_local_inner(
             // cannot resolve to a name-list entry (#2302) — see
             // `CachedBody::expect_records`.
             let body = body.expect_records();
+            history_buffered::cache(HistoryCacheState::Hit);
             let cost = body.cost.clone();
             // A hit is a response to THIS request, and this request's clock may
             // already have run out — the probe can be handed a warm entry with
@@ -4898,12 +5084,19 @@ async fn handle_local_inner(
                 record_metrics("sql", start, &result_meta, &cost);
                 return result_meta;
             }
+            history_buffered::admit();
+            observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
+            if let Some(cost) = &cost {
+                history_buffered::cost(cost);
+            }
             let status = if body.truncated {
                 StatusCode::PAYLOAD_TOO_LARGE
             } else {
                 StatusCode::OK
             };
-            let mut response = (status, Json(body.as_ref())).into_response();
+            // Native cache entries include unclipped fast paths; no selected
+            // clipping provenance is retained by CachedBody.
+            let mut response = crate::format::records_response(status, Arc::clone(&body));
             set_result_cache_header(&mut response, "hit");
             let result_meta: Result<Response, ApiError> = Ok(response);
             if let Some(cost) = cost.as_ref() {
@@ -5029,6 +5222,7 @@ async fn handle_local_inner(
         datafusion::prelude::SessionContext::new_with_state(hinted)
     };
     let session_elapsed = session_started.elapsed();
+    history_buffered::phase(HistoryErrorCode::Planning);
     let register_started = Instant::now();
     // Registration reads table metadata (and, with buffering on, lists WAL
     // segments) — catalog and object-store work that a slow backend can stretch
@@ -5107,6 +5301,7 @@ async fn handle_local_inner(
     let estimate_started = Instant::now();
     let mut cost =
         under_request_deadline!(async { estimate(&df, &ice).await.map_err(ApiError::internal) });
+    history_buffered::cost(&cost);
     let estimate_elapsed = estimate_started.elapsed();
     record_phase_metric("sql", "estimate", estimate_elapsed);
 
@@ -5125,6 +5320,8 @@ async fn handle_local_inner(
                 buffer_load.as_ref(),
                 "local_records_fast_path",
             ) {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::NoDataScan);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5141,6 +5338,8 @@ async fn handle_local_inner(
                 } else {
                     StatusCode::OK
                 };
+                // Whole-table count returns its native one row even at cap zero;
+                // this fast path did not apply the selected records clipper.
                 let result_meta: Result<Response, ApiError> =
                     Ok(render_fast_path_records(body, status, cache_ctx.clone()).await);
                 emit_terminal_audit(
@@ -5161,6 +5360,8 @@ async fn handle_local_inner(
                     try_windowed_count_fast_path_records(&df, &ice, shard, cost.clone(), delta),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5196,6 +5397,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5231,6 +5434,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5266,6 +5471,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5302,6 +5509,8 @@ async fn handle_local_inner(
                     ),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5330,6 +5539,8 @@ async fn handle_local_inner(
                     try_date_histogram_fast_path_records(&df, &ice, shard, cost.clone(), delta),
                 ))
             {
+                history_buffered::admit();
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 attach_fast_path_phases(
                     &mut body,
                     fast_path_plan_micros,
@@ -5491,10 +5702,12 @@ async fn handle_local_inner(
             false,
             Some(msg.clone()),
         );
+        history_buffered::phase(HistoryErrorCode::Validation);
         return Err(ApiError::cost_rejected(msg, &cost));
     }
 
     let admission_started = Instant::now();
+    history_buffered::phase(HistoryErrorCode::Admission);
     let _admission = if req.dry_run {
         None
     } else {
@@ -5520,6 +5733,8 @@ async fn handle_local_inner(
         }
     };
 
+    // Admission covers the upstream numeric probe as well as the normal scan.
+    history_buffered::admit();
     let admission_elapsed = admission_started.elapsed();
 
     // This path reads data, unlike the metadata battery. It runs only AFTER
@@ -5574,7 +5789,8 @@ async fn handle_local_inner(
 
     let mut execute_elapsed = std::time::Duration::ZERO;
     let result = if req.dry_run {
-        Ok((StatusCode::OK, Json(cost.clone())).into_response())
+        history_buffered::planned();
+        crate::query_controls::presentation::planning_response(cost.clone(), req.priority)
     } else {
         let execute_started = Instant::now();
         let result = execute_with_limits(
@@ -5788,6 +6004,18 @@ async fn submit_batch(
     ice: Arc<siglake_storage::iceberg::IcebergContext>,
     effective_query: RewrittenQuery,
 ) -> Result<Response, ApiError> {
+    if let Some(authority) = state.query_controls.clone() {
+        return submit_controlled_batch(
+            state,
+            identity,
+            req,
+            resolved,
+            ice,
+            effective_query,
+            authority,
+        )
+        .await;
+    }
     // Batch planning happens on the dedicated runtime, so there is no cost
     // report yet. Reserve the batch tier's fixed share before creating the job
     // row; a saturated pod therefore answers 429 + Retry-After rather than
@@ -5801,13 +6029,19 @@ async fn submit_batch(
     .await?;
     let id = state
         .jobs
-        .submit(
+        .submit_observed(
             effective_query.sql.clone(),
             Priority::Batch,
             state.job_owner(&identity),
+            history_buffered::batch_execution_id(),
         )
         .await
         .map_err(ApiError::internal)?;
+    let history = history_buffered::transfer_batch(id.0);
+    if let Some(observation) = &history {
+        state.jobs.track_history(id, observation.clone());
+    }
+    let observer = state.history.as_ref().and_then(|source| source.current());
     let audit = state.audit.clone();
     let identity = identity.clone();
     // Passed WHOLE. `max_rows_scanned` had never been copied across, so
@@ -5826,9 +6060,25 @@ async fn submit_batch(
     jobs.register_abort(id, abort);
 
     state.jobs.batch_runtime().spawn(async move {
+        // The run is the sole strong lifecycle owner, including while queued
+        // and during post-abort acknowledgement. The registry is only weak:
+        // dropping/panicking this future must retain uncertainty, not strand
+        // a live observation in the job store.
+        let _history = history;
         // The reservation lives in the spawned future, not in the short HTTP
         // request. Dropping this future on DELETE also drops the reservation.
         let _admission = admission;
+        // No await after the durable INSERT until this task owns the job,
+        // reservation and observation: cancelling HTTP must not orphan a live
+        // owner's pending job. Association is bounded metadata work, before
+        // engine polling and outside Abortable so DELETE during the bind still
+        // retains the original receipt and authoritative cancellation outcome.
+        // A queued/unpolled task (and its 202) does not promise a completed bind.
+        if let Some(observation) = &_history {
+            if let (Some(observer), Some(execution)) = (&observer, observation.execution_id()) {
+                observer.associate_job(execution, id.0).await;
+            }
+        }
         let lifecycle = JobLifecycle {
             jobs: jobs.clone(),
             id,
@@ -5858,10 +6108,12 @@ async fn submit_batch(
             ),
         );
         let _ = futures::future::Abortable::new(execution, abort_registration).await;
+        jobs.observe_history_after_run(id).await;
         jobs.clear_abort(id);
     });
 
     let body = crate::openapi_dto::BatchSubmitResponse {
+        controls: None,
         job_id: id.to_string(),
         status_url: format!("/api/v1/jobs/{id}"),
         result_url: format!("/api/v1/jobs/{id}/result"),
@@ -6035,6 +6287,18 @@ async fn drive_batch_job_after_running_publication(
     // disagreeing with itself: the metric says the job produced an
     // answer, the audit trail says a query ran to completion, and
     // `GET /api/v1/jobs/<id>` says it was cancelled.
+    if let Some(observation) = jobs.history_observation(id) {
+        match &outcome {
+            BatchOutcome::Ok(body, cost) => {
+                observation.cost(cost);
+                observation.records(body.row_count, body.truncated);
+            }
+            BatchOutcome::Timeout(Some(cost)) | BatchOutcome::Failed(_, Some(cost)) => {
+                observation.cost(cost)
+            }
+            _ => {}
+        }
+    }
     let (terminal, persisted) = match outcome {
         BatchOutcome::Ok(body, cost) => {
             let dropped_rows = body.row_count;
@@ -6785,6 +7049,9 @@ async fn run_batch_query(
     // The run's budget, started by the caller before it published `running`.
     deadline: BatchDeadline,
 ) -> BatchOutcome {
+    if let Some(observation) = lifecycle.and_then(|l| l.jobs.history_observation(l.id)) {
+        observation.admit();
+    }
     // Dropping the batch future (timeout or DELETE) must stop the scan pumps,
     // not just their parent future. The scan captures this extension while it
     // is planned; CancelOnDrop flips it on every return path.
@@ -7108,6 +7375,32 @@ pub async fn explain(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
+    controlled(state, identity, req, false, explain_observed).await
+}
+
+async fn explain_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
+    history_buffered::observe(
+        state,
+        identity,
+        req,
+        HistoryOperation::Explain,
+        true,
+        |state, identity, req| {
+            crate::query_controls::runtime::phase(explain_inner(state, identity, req))
+        },
+    )
+    .await
+}
+
+async fn explain_inner(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+) -> Result<Response, ApiError> {
     if req.query.trim().is_empty() {
         return Err(ApiError::bad_request("query is empty"));
     }
@@ -7115,16 +7408,21 @@ pub async fn explain(
         .resolve_ice(&identity)
         .await
         .map_err(ApiError::internal)?;
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let query = rewrite_search_if_needed(&ice, &req.query).await?;
     let ctx = state
         .query_scan
         .session_context_with_order(preferred_scan_order_for_sql(&ice, &query).await);
+    history_buffered::phase(HistoryErrorCode::Planning);
     register_tables_for_query(&ice, &ctx, &query).await?;
     let df = plan_client_sql(&ctx, &query)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let cost = estimate(&df, &ice).await.map_err(ApiError::internal)?;
-    Ok((StatusCode::OK, Json(cost)).into_response())
+    history_buffered::cost(&cost);
+    history_buffered::admit();
+    history_buffered::planned();
+    crate::query_controls::presentation::planning_response(cost, req.priority)
 }
 
 #[derive(Debug, Clone)]
@@ -7373,11 +7671,37 @@ fn try_count_fast_path_response(
                 stats: Some(crate::format::ScanStats::default()),
                 approximation: None,
             };
-            Ok(Some((StatusCode::OK, Json(body)).into_response()))
+            Ok(Some(crate::format::records_response(
+                StatusCode::OK,
+                Arc::new(body),
+            )))
         }
         QueryFormat::Ndjson => {
+            if crate::query_controls::runtime::current().is_some() {
+                let body = crate::format::RecordsResponse {
+                    columns: vec![fp.output_column],
+                    rows: serde_json::Value::Array(vec![row]),
+                    row_count: 1,
+                    truncated: false,
+                    max_rows: None,
+                    cost: Some(cost),
+                    stats: None,
+                    approximation: None,
+                };
+                let cost = body.cost.clone();
+                return Ok(Some(crate::query_controls::presentation::ndjson_response(
+                    crate::format::records_ndjson_body(body, true),
+                    cost.as_ref(),
+                    crate::query_controls::runtime::current().unwrap().priority,
+                    None,
+                )?));
+            }
             let line = serde_json::to_vec(&row).map_err(ApiError::internal)?;
-            let mut resp = Response::new(Body::from([line, b"\n".to_vec()].concat()));
+            let mut resp = Response::new(crate::format::rendered_ndjson_body(
+                [line, b"\n".to_vec()].concat(),
+                1,
+                true,
+            ));
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/x-ndjson"),
@@ -8552,18 +8876,33 @@ async fn try_group_count_fast_path_response_with_bindings(
         return Ok(None);
     };
     match format {
-        QueryFormat::Records => Ok(Some((StatusCode::OK, Json(body)).into_response())),
+        QueryFormat::Records => Ok(Some(crate::format::records_response(
+            StatusCode::OK,
+            Arc::new(body),
+        ))),
         QueryFormat::Ndjson => {
+            if crate::query_controls::runtime::current().is_some() {
+                let cost = body.cost.clone();
+                return Ok(Some(crate::query_controls::presentation::ndjson_response(
+                    crate::format::records_ndjson_body(body, false),
+                    cost.as_ref(),
+                    crate::query_controls::runtime::current().unwrap().priority,
+                    None,
+                )?));
+            }
             let rows = body.rows.as_array().ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!("group fast path rows must be an array"))
             })?;
+            let row_count = rows.len();
             let mut payload = Vec::new();
             for row in rows {
                 let line = serde_json::to_vec(row).map_err(ApiError::internal)?;
                 payload.extend_from_slice(&line);
                 payload.push(b'\n');
             }
-            let mut resp = Response::new(Body::from(payload));
+            let mut resp = Response::new(crate::format::rendered_ndjson_body(
+                payload, row_count, false,
+            ));
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/x-ndjson"),
@@ -9200,7 +9539,9 @@ async fn try_date_histogram_fast_path_records(
     )
     .map_err(|e| ApiError::internal(anyhow::anyhow!("build date_histogram batch: {e}")))?;
 
-    let mut body = crate::format::batches_to_records(&[batch], None).map_err(ApiError::internal)?;
+    let mut body = crate::format::batches_to_records_cooperative(&[batch], None)
+        .await
+        .map_err(ApiError::internal)?;
     body.cost = Some(cost);
     Ok(Some(body))
 }
@@ -9218,20 +9559,35 @@ async fn try_date_histogram_fast_path_response(
         return Ok(None);
     };
     match format {
-        QueryFormat::Records => Ok(Some((StatusCode::OK, Json(body)).into_response())),
+        QueryFormat::Records => Ok(Some(crate::format::records_response(
+            StatusCode::OK,
+            Arc::new(body),
+        ))),
         QueryFormat::Ndjson => {
+            if crate::query_controls::runtime::current().is_some() {
+                let cost = body.cost.clone();
+                return Ok(Some(crate::query_controls::presentation::ndjson_response(
+                    crate::format::records_ndjson_body(body, false),
+                    cost.as_ref(),
+                    crate::query_controls::runtime::current().unwrap().priority,
+                    None,
+                )?));
+            }
             let rows = body.rows.as_array().ok_or_else(|| {
                 ApiError::internal(anyhow::anyhow!(
                     "date_histogram fast path rows must be an array"
                 ))
             })?;
+            let row_count = rows.len();
             let mut payload = Vec::new();
             for row in rows {
                 let line = serde_json::to_vec(row).map_err(ApiError::internal)?;
                 payload.extend_from_slice(&line);
                 payload.push(b'\n');
             }
-            let mut resp = Response::new(Body::from(payload));
+            let mut resp = Response::new(crate::format::rendered_ndjson_body(
+                payload, row_count, false,
+            ));
             resp.headers_mut().insert(
                 header::CONTENT_TYPE,
                 header::HeaderValue::from_static("application/x-ndjson"),
@@ -11581,7 +11937,7 @@ async fn execute_with_limits(
     let inner = async move {
         match format {
             QueryFormat::Records => {
-                render_records(
+                let response = render_records(
                     df,
                     &resolved_inner,
                     Some(cost),
@@ -11592,25 +11948,40 @@ async fn execute_with_limits(
                     numeric_probe,
                     started,
                 )
-                .await
+                .await?;
+                if crate::query_controls::runtime::current().is_some() {
+                    let (parts, body) = response.into_parts();
+                    Ok(Response::from_parts(
+                        parts,
+                        Body::from_stream(GuardedStream {
+                            inner: body.into_data_stream(),
+                            _cancel: cancel,
+                            _guard: admission,
+                        }),
+                    ))
+                } else {
+                    Ok(response)
+                }
             }
             // Ndjson hands the guard to the body; Records keeps it in this
             // scope, where it covers the collect and fires on the timeout.
-            QueryFormat::Ndjson => render_ndjson(df, &resolved_inner, admission, cancel).await,
+            QueryFormat::Ndjson => {
+                render_ndjson(df, &resolved_inner, &cost, admission, cancel).await
+            }
         }
     };
     apply_timeout(inner, resolved, &cost_for_timeout, deadline, started).await
 }
 
 struct GuardedStream<S> {
-    _guard: Option<crate::admission::AdmissionGuard>,
+    inner: S,
     /// Cancels the query's scans when this BODY is dropped. It has to live here
     /// rather than in the handler: an NDJSON response streams after the handler
     /// returns, so a handler-scoped guard cancelled healthy requests (3 e2e
     /// tests went 3 rows -> 0). Here it fires on exactly the right event --
     /// the body finishing, or the client hanging up mid-stream.
     _cancel: Option<siglake_storage::CancelOnDrop>,
-    inner: S,
+    _guard: Option<crate::admission::AdmissionGuard>,
 }
 
 impl<S> futures::Stream for GuardedStream<S>
@@ -11634,6 +12005,9 @@ pub(crate) async fn apply_timeout<F, T>(
 where
     F: std::future::Future<Output = Result<T, ApiError>>,
 {
+    if crate::query_controls::runtime::current().is_some() {
+        return crate::query_controls::runtime::phase(fut).await;
+    }
     if !resolved.circuit_breakers {
         return fut.await;
     }
@@ -11658,6 +12032,9 @@ where
 /// without awaiting anything the deadline could cut, so without this check a
 /// warmed entry answered 200 to a request whose budget had already gone.
 pub(crate) fn deadline_expired(resolved: &ResolvedLimits, deadline: tokio::time::Instant) -> bool {
+    if let Some(controls) = crate::query_controls::runtime::current() {
+        return tokio::time::Instant::now() >= controls.deadline;
+    }
     resolved.circuit_breakers && tokio::time::Instant::now() >= deadline
 }
 
@@ -11684,20 +12061,24 @@ pub(crate) fn request_timeout_error(
 ///
 /// Separate from [`request_timeout_error`] on purpose: the shard answers a bare
 /// 504 rather than the cost-carrying `ApiError::timeout` body, because it has no
-/// `CostReport` (`estimate()` is deliberately not run per shard) and its caller
-/// is the coordinator, which reads the status, not the body.
-fn shard_timeout_error(resolved: &ResolvedLimits) -> ApiError {
+/// `CostReport` (`estimate()` is deliberately not run per shard). Direct callers
+/// retain this same native body; coordinator callers primarily read the status.
+pub(crate) fn shard_timeout_error(timeout: std::time::Duration, priority: Priority) -> ApiError {
     metrics::counter!(
         "siglake_query_breaker_trips_total",
         "breaker" => "shard_timeout",
-        "priority" => resolved.priority.label()
+        "priority" => priority.label()
     )
     .increment(1);
+    shard_timeout_response(timeout)
+}
+
+fn shard_timeout_response(timeout: std::time::Duration) -> ApiError {
     ApiError::new_status(
         axum::http::StatusCode::GATEWAY_TIMEOUT,
         format!(
             "shard exceeded its wall-clock budget of {}s",
-            resolved.timeout.as_secs()
+            timeout.as_secs()
         ),
     )
 }
@@ -11769,6 +12150,8 @@ async fn render_records(
                         limit,
                         "ordered-residual drain hit the rows cap; retrying as pruned TopK"
                     );
+                    // The final plan's counters omit this first attempt.
+                    history_buffered::incomplete_scan_attribution();
                     return Box::pin(render_records(
                         fallback,
                         resolved,
@@ -11836,15 +12219,31 @@ async fn render_records(
     let stats_elapsed = stats_started.elapsed();
 
     let render_started = Instant::now();
-    // #7420: the executed plan's schema is what the caller asked for (aliases,
-    // projection order). It only takes effect when the collect returned no
-    // batches at all; otherwise the batch schema answers, as before.
-    let mut body = crate::format::batches_to_records_with_schema(
-        &batches,
-        Some(resolved.max_rows_returned),
-        Some(plan.schema().as_ref()),
-    )
-    .map_err(ApiError::internal)?;
+    // Keep upstream's empty-result schema and controlled cooperative conversion.
+    let mut body = if crate::query_controls::runtime::current().is_some() {
+        let mut body = crate::format::batches_to_records_cooperative(
+            &batches,
+            Some(resolved.max_rows_returned),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+        if batches.is_empty() {
+            body.columns = plan
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+        }
+        body
+    } else {
+        crate::format::batches_to_records_with_schema(
+            &batches,
+            Some(resolved.max_rows_returned),
+            Some(plan.schema().as_ref()),
+        )
+        .map_err(ApiError::internal)?
+    };
     let render_elapsed = render_started.elapsed();
     record_phase_metric("sql", "render_records", render_elapsed);
     body.cost = cost;
@@ -11872,6 +12271,7 @@ async fn render_records(
     if let Some(stats) = body.stats.as_mut() {
         numeric_probe.add_to(stats);
     }
+    observe_history_record_metrics(&body, HistoryScanEvidence::Runtime(&runtime));
     let status = if body.truncated {
         StatusCode::PAYLOAD_TOO_LARGE
     } else {
@@ -11934,7 +12334,11 @@ async fn render_records(
     // encodes the body eagerly, so its cost is inside the handler's `total_ms`
     // and has to be named here to be named at all (#7456).
     let serialize_started = Instant::now();
-    let mut response = (status, Json(body.as_ref())).into_response();
+    let mut response = crate::format::records_response_with_cap(
+        status,
+        Arc::clone(&body),
+        Some(resolved.max_rows_returned),
+    );
     set_result_cache_header(&mut response, cache_outcome);
     let serialize_elapsed = serialize_started.elapsed();
     tracing::info!(
@@ -11965,6 +12369,7 @@ async fn render_records(
 async fn render_ndjson(
     df: DataFrame,
     resolved: &ResolvedLimits,
+    cost: &CostReport,
     admission: Option<crate::admission::AdmissionGuard>,
     cancel: Option<siglake_storage::CancelOnDrop>,
 ) -> Result<Response, ApiError> {
@@ -11977,7 +12382,8 @@ async fn render_ndjson(
         .map_err(ApiError::internal)?;
     let stream = datafusion::physical_plan::execute_stream(plan.clone(), task_ctx)
         .map_err(ApiError::internal)?;
-    let mut ndjson = NdjsonStream::new(stream, Some(resolved.max_rows_returned));
+    let mut ndjson = NdjsonStream::new(stream, Some(resolved.max_rows_returned))
+        .with_history(history_buffered::transfer_stream(), plan.clone());
     if resolved.circuit_breakers {
         ndjson = ndjson.with_rows_scanned_cap(plan, resolved.max_rows_scanned, resolved.priority);
     }
@@ -11986,13 +12392,12 @@ async fn render_ndjson(
         _cancel: cancel,
         inner: ndjson,
     });
-    let mut resp = Response::new(body);
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("application/x-ndjson"),
-    );
-    *resp.status_mut() = StatusCode::OK;
-    Ok(resp)
+    crate::query_controls::presentation::ndjson_response(
+        body,
+        Some(cost),
+        resolved.priority,
+        Some(resolved.max_rows_returned),
+    )
 }
 
 fn record_metrics(
@@ -13444,6 +13849,8 @@ mod tests {
     fn inline_lane_admits_positive_small_estimates_and_rejects_punts() {
         let base = CostReport {
             files_to_scan: Some(2),
+            estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: None,
             estimated_bytes_scanned: 1024,
             estimated_rows_processed: 500,
@@ -18566,10 +18973,80 @@ pub async fn shard(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<ShardQueryRequest>,
 ) -> Result<Response, ApiError> {
-    let execution_id = siglake_storage::QueryExecutionId::next();
-    siglake_storage::with_query_execution_id(
-        execution_id,
-        Box::pin(shard_scoped(state, identity, req)),
+    crate::query_controls::runtime::run_shard(
+        state.query_controls.clone(),
+        identity.clone(),
+        req.priority,
+        async move {
+            let execution_id = siglake_storage::QueryExecutionId::next();
+            siglake_storage::with_query_execution_id(
+                execution_id,
+                history_buffered::observe_shard(state, identity, req, |state, identity, req| {
+                    Box::pin(crate::query_controls::runtime::phase(shard_scoped(
+                        state, identity, req,
+                    )))
+                }),
+            )
+            .await
+        },
+    )
+    .await
+}
+
+/// Strict internal envelope; forwarded authority never becomes a verified JWT
+/// identity. Tenancy still passes through the existing coordinator shard checks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControlledShardRequest {
+    query: String,
+    shard: Option<ShardParam>,
+    pin: Option<ShardPin>,
+    controls: crate::query_controls::wire::Context,
+}
+pub(crate) async fn shard_v2(
+    State(state): State<AppState>,
+    axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
+    req: Result<Json<ControlledShardRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Response, ApiError> {
+    if !identity.coordinator {
+        return Err(ApiError::forbidden("coordinator authentication required"));
+    }
+    // Serde's native errors can echo invalid enum values/field names. Never
+    // reflect private forwarded context, SQL or arbitrary peer input.
+    let Json(req) = req.map_err(|_| {
+        ApiError::new_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "controlled shard context invalid",
+        )
+    })?;
+    let shard = ShardQueryRequest {
+        query: req.query,
+        shard: req.shard,
+        pin: req.pin,
+        priority: req.controls.priority(),
+        tenant: req.controls.tenant(),
+    };
+    crate::query_controls::wire::run_forwarded(
+        state.query_controls.clone(),
+        &identity,
+        &req.controls,
+        async {
+            let execution_id = siglake_storage::QueryExecutionId::next();
+            siglake_storage::with_query_execution_id(
+                execution_id,
+                history_buffered::observe_shard(
+                    state,
+                    identity.clone(),
+                    shard,
+                    |state, identity, req| {
+                        Box::pin(crate::query_controls::runtime::phase(shard_scoped(
+                            state, identity, req,
+                        )))
+                    },
+                ),
+            )
+            .await
+        },
     )
     .await
 }
@@ -18582,6 +19059,8 @@ async fn shard_scoped(
     if req.query.trim().is_empty() {
         return Err(ApiError::bad_request("query is empty"));
     }
+    history_buffered::cache(HistoryCacheState::Bypass);
+    history_buffered::effective(crate::history::OutputFormat::Arrow, false);
     // Per-pod governance parity (#7): each worker enforces the mid-flight
     // rows-scanned breaker on *its* shard, so no single pod runs unbounded. The
     // cluster's aggregate ceiling is therefore N × the per-pod limit — which is
@@ -18589,7 +19068,8 @@ async fn shard_scoped(
     // governs total cost. Workers only serve interactive shards (the transparent
     // path skips coordination for Batch), so the interactive tier is correct.
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&RequestLimits::default(), req.priority, &tier);
+    let resolved =
+        crate::query_controls::runtime::resolve(&RequestLimits::default(), req.priority, &tier);
     // WALL-CLOCK BUDGET, ANCHORED AT REQUEST ARRIVAL.
     //
     // The 504 this endpoint's OpenAPI list documents used to be armed only
@@ -18600,21 +19080,47 @@ async fn shard_scoped(
     // collect, outliving the coordinator waiting on it and holding pool bytes
     // the whole way. Same defect as #1526 on the local path, different endpoint.
     //
-    // One instant, taken here, covers every phase below. Unconditional: the
-    // shard path resolves from `RequestLimits::default()`, so `circuit_breakers`
-    // is always on and the collect timeout was unconditional too.
-    let deadline = tokio::time::Instant::now() + resolved.timeout;
+    // Configured controls retain the original authenticated ingress, including
+    // policy/history waits. Absent authority preserves the legacy worker clock.
+    // Time is unconditional, independent of optional scan circuit breakers.
+    let deadline = crate::query_controls::runtime::current()
+        .map(|c| c.deadline)
+        .unwrap_or_else(|| tokio::time::Instant::now() + resolved.timeout);
+    // Controlled expiry is accounted once by the outer native-response adapter,
+    // after phase/until arbitration. Inner errors may be replaced there. Legacy
+    // execution has no outer owner and retains its native increment here.
+    let timeout_error = || {
+        if crate::query_controls::runtime::current().is_some() {
+            shard_timeout_response(resolved.timeout)
+        } else {
+            shard_timeout_error(resolved.timeout, resolved.priority)
+        }
+    };
     macro_rules! under_shard_deadline {
+        ($point:ident, $future:expr) => {
+            under_shard_deadline!(async {
+                #[cfg(test)]
+                shard_controls_tests::checkpoint(shard_controls_tests::Point::$point).await;
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(timeout_error());
+                }
+                $future.await
+            })
+        };
         ($future:expr) => {{
             // Pre-poll check, like `apply_timeout`: `timeout_at` polls once
             // before consulting the clock, so an already-ready metadata path
             // would otherwise turn an exhausted budget into a success.
             if tokio::time::Instant::now() >= deadline {
-                return Err(shard_timeout_error(&resolved));
+                return Err(timeout_error());
             }
-            match tokio::time::timeout_at(deadline, $future).await {
+            let result = tokio::time::timeout_at(deadline, $future).await;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(timeout_error());
+            }
+            match result {
                 Ok(res) => res?,
-                Err(_) => return Err(shard_timeout_error(&resolved)),
+                Err(_) => return Err(timeout_error()),
             }
         }};
     }
@@ -18663,14 +19169,17 @@ async fn shard_scoped(
     // Resolving the tenant context can create and open a catalog; the `SEARCH`
     // rewrite reads the index config behind it. Catalog work, on this request's
     // clock like everything else.
-    let ice = under_shard_deadline!(async {
+    let ice = under_shard_deadline!(Catalog, async {
         state
             .resolve_ice(&identity)
             .await
             .map_err(ApiError::internal)
     });
+    history_buffered::phase(HistoryErrorCode::InvalidSql);
     let query = under_shard_deadline!(rewrite_search_if_needed(&ice, &req.query));
-    let preferred_scan_order = preferred_scan_order_for_sql(&ice, &query).await;
+    let preferred_scan_order = under_shard_deadline!(PreferredOrder, async {
+        Ok::<_, ApiError>(preferred_scan_order_for_sql(&ice, &query).await)
+    });
     // PER-REQUEST CANCELLATION, which this path never had. On the default chart
     // config (`query.replicas: 2`, distributed on) every user query executes
     // here, so every coordinator timeout or client disconnect left a worker
@@ -18687,6 +19196,8 @@ async fn shard_scoped(
     // handler returns.
     let cancel = siglake_storage::QueryCancel::new();
     let _cancel_guard = siglake_storage::CancelOnDrop(cancel.clone());
+    #[cfg(test)]
+    shard_controls_tests::capture_cancel(&cancel);
     // A worker's shard is its own execution, with its own id in ITS pod's log.
     // The coordinator's id is not carried across the hop: the shard body is a
     // versioned wire contract and a pod-local counter would not be comparable
@@ -18720,7 +19231,7 @@ async fn shard_scoped(
     // Registration reads table metadata from the catalog and object store — the
     // phase a slow backend stretches furthest past the budget. The
     // half-registered session context dies with the request.
-    under_shard_deadline!(register_tables_for_query(&ice, &ctx, &query));
+    under_shard_deadline!(Register, register_tables_for_query(&ice, &ctx, &query));
     // #89: pin the shard read to the coordinator's serving snapshot.
     //
     // #1525: a pin that is STILL unresolvable after `pinned_table_provider`'s
@@ -18754,18 +19265,17 @@ async fn shard_scoped(
                 // Without a pinned schema id (an older coordinator) the
                 // worker's own registered schema is what it always was.
                 let schema = match pin.schema_id {
-                    None => ctx
-                        .table_provider(&pin.table)
-                        .await
-                        .map_err(|e| {
+                    None => under_shard_deadline!(Schema, async {
+                        ctx.table_provider(&pin.table).await.map_err(|e| {
                             ApiError::internal(anyhow::anyhow!(
                                 "resolving schema for empty pin on `{}`: {e}",
                                 pin.table
                             ))
-                        })?
-                        .schema(),
+                        })
+                    })
+                    .schema(),
                     Some(schema_id) => {
-                        match under_shard_deadline!(async {
+                        match under_shard_deadline!(Pin, async {
                             ice.pinned_empty_schema(
                                 &pin.table,
                                 schema_id,
@@ -18822,7 +19332,7 @@ async fn shard_scoped(
             (Some(snapshot_id), false) => {
                 // A pin miss triggers a metadata refresh inside `pinned_table_provider`,
                 // so this is another catalog round trip on the budget.
-                match under_shard_deadline!(async {
+                match under_shard_deadline!(Pin, async {
                     ice.pinned_table_provider(
                         &pin.table,
                         snapshot_id,
@@ -18897,6 +19407,7 @@ async fn shard_scoped(
         }
     }
     crate::udfs::register_udfs(&ctx);
+    history_buffered::phase(HistoryErrorCode::Planning);
     let df = under_shard_deadline!(async {
         plan_client_sql(&ctx, &query)
             .await
@@ -18934,6 +19445,8 @@ async fn shard_scoped(
     // wall clock: a scan can be slow without being large (a deep unconverged
     // layout, a stalled S3 fetch), and the row cap never fires for it.
     let collect = async {
+        // Execution starts here; workers intentionally have no reservation.
+        history_buffered::admit();
         let batches = if resolved.circuit_breakers {
             match crate::midflight::collect_plan_with_rows_scanned_cap(
                 plan.clone(),
@@ -18994,8 +19507,12 @@ async fn shard_scoped(
     // `_cancel_guard` fires as the macro's `return` unwinds this frame, so the
     // scan stops rather than running on unobserved — which is the whole point of
     // arming it: a timeout that only stops WAITING leaves the work running.
-    let batches = under_shard_deadline!(collect);
-    let bytes = crate::format::batches_to_arrow_ipc(&batches).map_err(ApiError::internal)?;
+    let batches = under_shard_deadline!(Collect, collect);
+    let bytes = under_shard_deadline!(async {
+        #[cfg(test)]
+        shard_controls_tests::checkpoint(shard_controls_tests::Point::Render).await;
+        crate::format::batches_to_arrow_ipc(&batches).map_err(ApiError::internal)
+    });
     let mut resp = Response::new(Body::from(bytes));
     resp.headers_mut().insert(
         header::CONTENT_TYPE,
@@ -19025,6 +19542,17 @@ async fn shard_scoped(
         axum::http::HeaderValue::from_bytes(&encoded_totals)
             .map_err(|error| ApiError::internal(anyhow::Error::new(error)))?,
     );
+    history_buffered::records(
+        batches.iter().map(|batch| batch.num_rows()).sum(),
+        false,
+        (runtime.unsettled_partitions == 0 && runtime.leaf_rows_measured)
+            .then_some(runtime.leaf_output_rows),
+        (runtime.unsettled_partitions == 0 && runtime.scan_bytes_measured)
+            .then_some(runtime.bytes_scanned),
+    );
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timeout_error());
+    }
     Ok(resp)
 }
 
@@ -19097,27 +19625,54 @@ pub async fn distributed(
     axum::extract::Extension(identity): axum::extract::Extension<CallerIdentity>,
     Json(req): Json<SqlRequest>,
 ) -> Result<Response, ApiError> {
-    // #967: the EXPLICIT endpoint reports that no membership is available
-    // rather than silently running single-pod — a caller who asked for the
-    // distributed path wants to know it did not happen. The transparent
-    // `/api/v1/sql` falls back to local instead (see `handle`).
-    let Some(peers) = state.peers.as_ref().and_then(|source| source.capture()) else {
-        return Err(ApiError::bad_request(
-            "distributed query not configured, or peer discovery has not published a \
-             membership yet (set --query-peers, or --query-peer-discovery-srv and wait \
-             for the first answer)",
-        ));
-    };
     let started = Instant::now();
     let format = req.format.unwrap_or_default();
-    let execution_id = siglake_storage::QueryExecutionId::next();
-    let mut result = siglake_storage::with_query_execution_id(
-        execution_id,
-        Box::pin(distributed_inner(state, identity, req, None, None, peers)),
-    )
-    .await;
+    // Pin actual membership before primary/history waits.
+    let peers = state.peers.as_ref().and_then(|source| source.capture());
+    // Flags cannot prove which branch classification/Tier1 will select.
+    let mut result = if state
+        .query_controls
+        .as_ref()
+        .is_some_and(|c| c.distributed.is_none())
+        && req.priority == Priority::Batch
+        && !req.dry_run
+    {
+        Err(crate::query_controls::runtime::unsupported())
+    } else {
+        controlled(state, identity, req, false, move |state, identity, req| {
+            distributed_observed(state, identity, req, peers)
+        })
+        .await
+    };
     stamp_buffered_sql_headers(&mut result, format, started);
     result
+}
+
+async fn distributed_observed(
+    state: AppState,
+    identity: CallerIdentity,
+    req: SqlRequest,
+    peers: Option<Arc<crate::discovery::PeerSnapshot>>,
+) -> Result<Response, ApiError> {
+    let execution_id = siglake_storage::QueryExecutionId::next();
+    siglake_storage::with_query_execution_id(
+        execution_id,
+        history_buffered::observe_configured(state, identity, req, |state, identity, req| async {
+            // Preserve the explicit endpoint's existing no-membership refusal.
+            let Some(peers) = peers else {
+                return Err(ApiError::bad_request(
+                    "distributed query not configured, or peer discovery has not published a \
+             membership yet (set --query-peers, or --query-peer-discovery-srv and wait \
+             for the first answer)",
+                ));
+            };
+            crate::query_controls::runtime::phase(Box::pin(distributed_inner(
+                state, identity, req, None, None, peers,
+            )))
+            .await
+        }),
+    )
+    .await
 }
 
 #[tracing::instrument(skip_all, fields(otel.kind = "internal", query = %req.query))]
@@ -19162,7 +19717,13 @@ async fn distributed_inner(
         Some([t]) => ice.is_managed_index(t).await.unwrap_or(false),
         _ => false,
     };
+    #[cfg(test)]
+    selected_path_controls_tests::checkpoint(selected_path_controls_tests::Point::Classification)
+        .await;
     if !distributable {
+        if req.priority == Priority::Batch && !req.dry_run {
+            crate::query_controls::runtime::select_local_durable(state.query_controls.as_deref())?;
+        }
         return Box::pin(handle_local_inner(
             state,
             identity,
@@ -19176,7 +19737,7 @@ async fn distributed_inner(
     let start = Instant::now();
     let format = req.format.unwrap_or_default();
     let tier = state.limits.tier(req.priority);
-    let resolved = ResolvedLimits::resolve(&req.limits, req.priority, &tier);
+    let resolved = crate::query_controls::runtime::resolve(&req.limits, req.priority, &tier);
     let effective_query = match pre_rewritten_query {
         Some(query) => query,
         None => {
@@ -19234,10 +19795,13 @@ async fn distributed_inner(
 
     // Same pre-flight bytes breaker as the single-pod path — the estimate is on
     // the whole-table plan (total work), which is the right ceiling to enforce.
+    history_buffered::phase(HistoryErrorCode::Planning);
     let df = plan_client_sql(&planning, &effective_query.sql)
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     let cost = estimate(&df, &ice).await.map_err(ApiError::internal)?;
+    history_buffered::cost(&cost);
+    history_buffered::cache(HistoryCacheState::Bypass);
     let tier1_plan_micros = plan_started.elapsed().as_micros() as u64;
     // A ROW-LIMITED query is governed by the MID-FLIGHT breaker, not by this
     // one. `estimated_bytes_scanned` is an upper bound, and a `LIMIT` makes it
@@ -19438,6 +20002,10 @@ async fn distributed_inner(
         })
         .await?;
         if let Some(mut body) = served {
+            history_buffered::effective(crate::history::OutputFormat::Records, false);
+            history_buffered::admit();
+            // Some battery arms perform uninstrumented metadata/page work.
+            observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
             attach_fast_path_phases(
                 &mut body,
                 tier1_plan_micros,
@@ -19450,8 +20018,10 @@ async fn distributed_inner(
             );
             metrics::counter!("siglake_query_coordinator_total", "mode" => "tier1_local")
                 .increment(1);
-            let result: Result<Response, ApiError> =
-                Ok((StatusCode::OK, Json(body)).into_response());
+            let result: Result<Response, ApiError> = Ok(crate::format::records_response(
+                StatusCode::OK,
+                Arc::new(body),
+            ));
             emit_terminal_audit(
                 state.audit.as_ref(),
                 &identity,
@@ -19512,7 +20082,12 @@ async fn distributed_inner(
         }
         _ => false,
     };
+    #[cfg(test)]
+    selected_path_controls_tests::checkpoint(selected_path_controls_tests::Point::ScanLocal).await;
     if scan_local {
+        if req.priority == Priority::Batch && !req.dry_run {
+            crate::query_controls::runtime::select_local_durable(state.query_controls.as_deref())?;
+        }
         metrics::counter!("siglake_query_coordinator_total", "mode" => "scan_local").increment(1);
         let local_execution_id = siglake_storage::QueryExecutionId::next();
         return siglake_storage::with_query_execution_id(
@@ -19529,6 +20104,28 @@ async fn distributed_inner(
         .await;
     }
 
+    // Enabled controls require explicitly configured v2 authority AND service
+    // authentication. Never silently dispatch legacy/uncontrolled fragments.
+    let controlled_dispatch = crate::query_controls::wire::current_dispatch();
+    if state.query_controls.is_some()
+        && (controlled_dispatch.is_none()
+            || state
+                .coordinator_token
+                .as_deref()
+                .is_none_or(|t| t.trim().is_empty()))
+    {
+        return Err(crate::query_controls::runtime::unsupported());
+    }
+
+    // Legacy explicit routing ignores dry_run and uses batch only as a tier
+    // on this branch. Record the chosen execution, not those request hints.
+    history_buffered::effective(
+        match format {
+            QueryFormat::Records => crate::history::OutputFormat::Records,
+            QueryFormat::Ndjson => crate::history::OutputFormat::Ndjson,
+        },
+        false,
+    );
     let pin_table = referenced_tables(&effective_query.sql)
         .and_then(|t| t.into_iter().next())
         .unwrap_or_else(|| "events".to_string());
@@ -19585,7 +20182,8 @@ async fn distributed_inner(
         state.coordinator_token.clone(),
     )
     .with_tenant(identity.tenant.clone())
-    .with_pin(pin_table.clone(), pin_generation.clone());
+    .with_pin(pin_table.clone(), pin_generation.clone())
+    .with_controls(controlled_dispatch.clone());
     // The ONLY admission reservation a distributed query takes: one share on
     // this coordinator, priced from the whole-query estimate and held through
     // fan-out and merge. Workers admit nothing (see `shard`: admitting a
@@ -19594,6 +20192,7 @@ async fn distributed_inner(
     // 2026-09-05 on a coordinator-plus-peer pair with a four-slot budget:
     // `/api/v1/sql` and `/api/v1/sql/local` both admit four and refuse the
     // fifth, and the peer trips admission zero times.
+    history_buffered::phase(HistoryErrorCode::Admission);
     let _admission = match acquire_admission(&state, &resolved, &cost).await {
         Ok(guard) => guard,
         Err(err) => {
@@ -19611,6 +20210,7 @@ async fn distributed_inner(
             return result;
         }
     };
+    history_buffered::admit();
     // #94: the coordinator itself is the failover target — it holds the full
     // file set, so a dead worker degrades one shard's latency, not the query.
     // The fallback posts to the coordinator's OWN /shard endpoint, so a
@@ -19629,7 +20229,8 @@ async fn distributed_inner(
         state.coordinator_token.clone(),
     )
     .with_tenant(identity.tenant.clone())
-    .with_pin(pin_table.clone(), pin_generation);
+    .with_pin(pin_table.clone(), pin_generation)
+    .with_controls(controlled_dispatch);
     let result: Result<Response, ApiError> = async {
         let (batches, coord_stats) = crate::coordinator::coordinate_with_failover(
             &planning,
@@ -19645,12 +20246,15 @@ async fn distributed_inner(
             QueryFormat::Ndjson => {
                 let body =
                     crate::format::batches_to_ndjson(&batches).map_err(ApiError::internal)?;
-                let mut resp = Response::new(Body::from(body));
-                resp.headers_mut().insert(
-                    header::CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("application/x-ndjson"),
-                );
-                Ok(resp)
+                // Already-buffered coordinator payload: transfer delivery
+                // ownership without parsing/copying it or inventing scan data.
+                let rows = batches.iter().map(|batch| batch.num_rows()).sum();
+                crate::query_controls::presentation::ndjson_response(
+                    crate::format::rendered_ndjson_body(body, rows, false),
+                    Some(&cost),
+                    resolved.priority,
+                    None,
+                )
             }
             QueryFormat::Records => {
                 let render_started = Instant::now();
@@ -19671,6 +20275,9 @@ async fn distributed_inner(
                 )
                 .map_err(ApiError::internal)?;
                 body.cost = Some(cost.clone());
+                // x-siglake-scan is partial diagnostic attribution, not proof
+                // of complete measured counters across all worker attempts.
+                observe_history_record_metrics(&body, HistoryScanEvidence::Unavailable);
                 // #85: coordinator-side attribution — plan/classify, the
                 // buffer partial, each shard's wall (fan-out is concurrent,
                 // so the max is the fan-out cost), and the merge.
@@ -19713,7 +20320,11 @@ async fn distributed_inner(
                     .saturating_add(merge_micros);
                 phases.execution_micros = Some(execution_micros);
                 phases.other_micros = Some(execution_remainder(execution_micros, named_micros));
-                Ok((StatusCode::OK, Json(body)).into_response())
+                Ok(crate::format::records_response_with_cap(
+                    StatusCode::OK,
+                    Arc::new(body),
+                    Some(resolved.max_rows_returned),
+                ))
             }
         }
     }
@@ -20959,6 +21570,7 @@ mod batch_lifecycle_tests {
     fn identity() -> CallerIdentity {
         CallerIdentity {
             subject: "lifecycle-test".into(),
+            provider_principal: None,
             email: None,
             tenant: None,
             coordinator: false,
@@ -20968,6 +21580,8 @@ mod batch_lifecycle_tests {
     fn cost() -> CostReport {
         CostReport {
             files_to_scan: Some(1),
+            estimate_complete: false,
+            estimate_inventory_trusted: false,
             files_considered: Some(1),
             estimated_bytes_scanned: 4096,
             estimated_rows_processed: 10,
@@ -22749,3 +23363,134 @@ mod bounded_equality_count_tests {
         assert_eq!(sum(&bounded), sum(&generic));
     }
 }
+
+#[cfg(test)]
+mod history_scan_availability_tests {
+    use super::*;
+    use datafusion::execution::context::SessionConfig;
+    use futures::StreamExt;
+    use siglake_core::Event;
+    use siglake_storage::iceberg::IcebergContext;
+
+    fn value(counter: crate::history::Counter) -> u64 {
+        serde_json::to_value(counter).unwrap().as_u64().unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_scan_snapshot_omits_incomplete_counters_but_keeps_returned_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ice = Arc::new(
+            IcebergContext::open(&tmp.path().join("warehouse"))
+                .await
+                .unwrap(),
+        );
+        ice.append_events(&(0..128).map(|_| Event::now("fixture")).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        let ctx = SessionContext::new_with_config(
+            SessionConfig::new()
+                .with_batch_size(16)
+                .with_target_partitions(1),
+        );
+        ice.register_with_datafusion(&ctx).await.unwrap();
+        let df = ctx.sql("SELECT raw FROM events").await.unwrap();
+        let task_ctx = crate::midflight::task_ctx_for(&df);
+        let plan = df.create_physical_plan().await.unwrap();
+        // A real live siglake partition, not a fabricated boolean. Its
+        // per-partition attribution has not folded, exactly the snapshot shape
+        // retained when the collector's bounded settle expires.
+        let mut stream = plan.execute(0, task_ctx).unwrap();
+        let batch = stream.next().await.unwrap().unwrap();
+        let incomplete =
+            siglake_storage::settle_scan_partitions(&plan, crate::midflight::SCAN_SETTLE_DEADLINE)
+                .await;
+        assert!(!incomplete.complete && incomplete.live_partitions > 0);
+        let runtime = crate::midflight::summarize_plan_runtime(&plan);
+        assert!(runtime.unsettled_partitions > 0);
+        assert!(runtime.leaf_rows_measured && runtime.scan_bytes_measured);
+        let body = batches_to_records(&[batch], Some(1)).unwrap();
+        assert!(body.truncated);
+        let evidence = history_buffered::capture_test_measurements(async {
+            observe_history_record_metrics(&body, HistoryScanEvidence::Runtime(&runtime));
+        })
+        .await;
+        assert_eq!(value(evidence.counters.returned_rows.unwrap()), 1);
+        assert_eq!(evidence.truncated, Some(true));
+        assert!(evidence.counters.measured_rows_scanned.is_none());
+        assert!(evidence.counters.measured_bytes_scanned.is_none());
+        while let Some(batch) = stream.next().await {
+            batch.unwrap();
+        }
+        drop(stream);
+        let settled =
+            siglake_storage::settle_scan_partitions(&plan, crate::midflight::SCAN_SETTLE_DEADLINE)
+                .await;
+        assert!(settled.complete);
+        let complete = crate::midflight::summarize_plan_runtime(&plan);
+        assert_eq!(complete.unsettled_partitions, 0);
+        assert!(complete.leaf_output_rows > 0 && complete.bytes_scanned > 0);
+        let evidence = history_buffered::capture_test_measurements(async {
+            observe_history_record_metrics(&body, HistoryScanEvidence::Runtime(&complete));
+        })
+        .await;
+        assert_eq!(
+            value(evidence.counters.measured_rows_scanned.unwrap()),
+            complete.leaf_output_rows
+        );
+        assert_eq!(
+            value(evidence.counters.measured_bytes_scanned.unwrap()),
+            complete.bytes_scanned
+        );
+    }
+
+    #[tokio::test]
+    async fn default_stats_do_not_establish_measurement_but_proven_no_scan_zero_does() {
+        let body = RecordsResponse {
+            columns: vec![],
+            rows: serde_json::json!([]),
+            row_count: 0,
+            truncated: false,
+            max_rows: None,
+            cost: None,
+            stats: Some(crate::format::ScanStats::default()),
+            approximation: None,
+        };
+        let default_runtime = crate::midflight::PlanRuntimeStats::default();
+        for scan in [
+            HistoryScanEvidence::Unavailable,
+            HistoryScanEvidence::Runtime(&default_runtime),
+        ] {
+            let unknown = history_buffered::capture_test_measurements(async {
+                observe_history_record_metrics(&body, scan);
+            })
+            .await;
+            assert!(unknown.counters.measured_rows_scanned.is_none());
+            assert!(unknown.counters.measured_bytes_scanned.is_none());
+        }
+        let retried = history_buffered::capture_test_measurements(async {
+            history_buffered::incomplete_scan_attribution();
+            observe_history_record_metrics(&body, HistoryScanEvidence::NoDataScan);
+        })
+        .await;
+        assert!(retried.counters.measured_rows_scanned.is_none());
+        assert!(retried.counters.measured_bytes_scanned.is_none());
+        let zero = history_buffered::capture_test_measurements(async {
+            observe_history_record_metrics(&body, HistoryScanEvidence::NoDataScan);
+        })
+        .await;
+        assert_eq!(value(zero.counters.measured_rows_scanned.unwrap()), 0);
+        assert_eq!(value(zero.counters.measured_bytes_scanned.unwrap()), 0);
+    }
+}
+
+#[cfg(test)]
+#[path = "sql/shard_controls_tests.rs"]
+pub(crate) mod shard_controls_tests;
+
+#[cfg(test)]
+#[path = "sql/selected_path_controls_tests.rs"]
+mod selected_path_controls_tests;
+
+#[cfg(test)]
+#[path = "sql/request_clock_controls_tests.rs"]
+mod request_clock_controls_tests;

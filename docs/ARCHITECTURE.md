@@ -2332,7 +2332,14 @@ at all — so turning OIDC on hardened the HTTP port and left gRPC accepting
 unauthenticated exports into any named tenant. Both are fixed: one boundary now
 decides tenancy for every ingest transport.
 
-**A tenant claim needs an issuer and an audience with it.** The tenant comes
+**A tenant claim needs an issuer and an audience with it in generic OIDC.**
+The explicit binary-level [Cognito access-token profile](COGNITO_ACCESS_AUTH.md)
+instead requires an issuer and signed tenant/client identity without a human
+client audience; both tiers must opt in separately. Generic verification now
+requires issuer/audience claims to be present, correcting the library's old
+optional-claim behavior. Review that profile's rollout gate before deployment.
+
+The tenant comes
 from a verified token, so with no OIDC verifier configured there is nothing to
 take it from. Both boundaries refuse to start on a claim set by itself — with
 static tokens, with open auth, or with `trustScopeHeader` still routing on the

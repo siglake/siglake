@@ -172,6 +172,7 @@ pub struct HttpShardRunner {
     /// belongs to no tenant. The worker accepts it only from a request bearing
     /// its own coordinator token.
     tenant: Option<String>,
+    controls: Option<crate::query_controls::wire::Dispatch>,
 }
 
 impl HttpShardRunner {
@@ -180,17 +181,29 @@ impl HttpShardRunner {
             // #94 follow-up: a DEAD peer must fail fast so the failover
             // retry costs ~ms, not the OS SYN timeout (live test measured
             // 2.4s). Healthy intra-VPC connects are sub-ms; 250ms is
-            // generous. The overall request timeout stays unbounded — heavy
-            // shards legitimately run long.
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_millis(250))
-                .build()
-                .expect("reqwest client"),
+            // generous. Legacy v1 has no overall timeout; explicitly controlled
+            // v2 below covers send, response pumping and decode by original expiry.
+            client: Self::http_client(false),
             peers,
             auth,
             pin: None,
             tenant: None,
+            controls: None,
         }
+    }
+
+    fn http_client(controlled: bool) -> reqwest::Client {
+        let builder =
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_millis(250));
+        // A redirect can resend authenticated POST/body to permissive v1 before
+        // any final-URL check. Only controlled transport forbids all redirects;
+        // retain the existing TLS/proxy/connect defaults and legacy behavior.
+        let builder = if controlled {
+            builder.redirect(reqwest::redirect::Policy::none())
+        } else {
+            builder
+        };
+        builder.build().expect("reqwest client")
     }
 
     /// Forward `tenant` (the original caller's) on every shard request.
@@ -209,6 +222,16 @@ impl HttpShardRunner {
     /// generation the pinned snapshot never belonged to.
     pub fn with_pin(mut self, table: String, generation: TableGeneration) -> Self {
         self.pin = Some((table, generation));
+        self
+    }
+    pub(crate) fn with_controls(
+        mut self,
+        controls: Option<crate::query_controls::wire::Dispatch>,
+    ) -> Self {
+        if controls.is_some() != self.controls.is_some() {
+            self.client = Self::http_client(controls.is_some());
+        }
+        self.controls = controls;
         self
     }
     pub fn shard_count(&self) -> usize {
@@ -299,13 +322,53 @@ impl ShardRunner for HttpShardRunner {
     }
 
     async fn run_detailed(&self, sql: &str, shard: Option<ScanShard>) -> Result<ShardRun> {
+        if crate::query_controls::runtime::current().is_some() && self.controls.is_none() {
+            return Err(controlled_shard_error(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+        // Construct/box once before adding timer/branch frames. The native
+        // HTTP send/response future is large even on legacy v1; embedding it
+        // in both arms can overflow a caller's executor stack.
+        let future = Box::pin(self.send_detailed(sql, shard));
+        if let Some(controls) = &self.controls {
+            let deadline = controls.deadline();
+            if tokio::time::Instant::now() >= deadline {
+                return Err(controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT));
+            }
+            let result = tokio::time::timeout_at(deadline, future).await;
+            // Includes response pump, Arrow decode, and late-ready success.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT));
+            }
+            result.map_err(|_| controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT))?
+        } else {
+            future.await
+        }
+    }
+}
+fn controlled_shard_error(status: reqwest::StatusCode) -> anyhow::Error {
+    ShardError {
+        status,
+        url: "internal-v2".into(),
+        body: "controlled shard unavailable".into(),
+    }
+    .into()
+}
+impl HttpShardRunner {
+    async fn send_detailed(&self, sql: &str, shard: Option<ScanShard>) -> Result<ShardRun> {
         // No shard ⇒ whole-table fallback, sent to peer 0 as shard {0,1}.
         let (index, count) = shard.map_or((0, 1), |s| (s.index, s.count));
         let peer = self
             .peers
             .get(index)
             .with_context(|| format!("shard {index} has no peer (have {})", self.peers.len()))?;
-        let url = format!("{}/api/v1/sql/shard", peer.trim_end_matches('/'));
+        let path = if self.controls.is_some() {
+            crate::query_controls::wire::PATH
+        } else {
+            "/api/v1/sql/shard"
+        };
+        let url = format!("{}{path}", peer.trim_end_matches('/'));
         let mut body = serde_json::json!({
             "query": sql,
             "shard": { "index": index, "count": count },
@@ -329,7 +392,17 @@ impl ShardRunner for HttpShardRunner {
                 }),
             };
         }
-        if let Some(tenant) = &self.tenant {
+        if let Some(controls) = &self.controls {
+            if self.auth.as_deref().is_none_or(|t| t.trim().is_empty()) {
+                return Err(controlled_shard_error(
+                    reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                ));
+            }
+            let context = controls
+                .context()
+                .map_err(|_| controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT))?;
+            body["controls"] = serde_json::to_value(context)?;
+        } else if let Some(tenant) = &self.tenant {
             body["tenant"] = serde_json::json!(tenant);
         }
         let mut rb = self.client.post(&url).json(&body);
@@ -351,7 +424,22 @@ impl ShardRunner for HttpShardRunner {
         if !trace_headers.is_empty() {
             rb = rb.headers(trace_headers);
         }
-        let resp = rb.send().await.with_context(|| format!("POST {url}"))?;
+        if let Some(controls) = &self.controls {
+            let remaining = controls
+                .deadline()
+                .saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT));
+            }
+            rb = rb.timeout(remaining);
+        }
+        let resp = rb.send().await.map_err(|error| {
+            if self.controls.is_some() && error.is_timeout() {
+                controlled_shard_error(reqwest::StatusCode::GATEWAY_TIMEOUT)
+            } else {
+                anyhow::Error::new(error).context(format!("POST {url}"))
+            }
+        })?;
         // A shard worker's own refusal (413 row-ceiling breaker, 400 bad query,
         // 429 budget, 503 memory pool) is a statement ABOUT THE QUERY or its
         // moment, not a server fault. Carry
@@ -359,23 +447,48 @@ impl ShardRunner for HttpShardRunner {
         // single-node deployment would — `error_for_status()` erases it, which
         // surfaced every breaker 413 to clients as an opaque 500.
         let status = resp.status();
+        if self.controls.is_some() && status.is_redirection() {
+            // 3xx is not rejected by error_for_status. Refuse before Arrow/body
+            // handling; never expose Location or classify this as retryable.
+            return Err(controlled_shard_error(
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = if self.controls.is_some() {
+                // Do not reflect private context or arbitrary remote diagnostics.
+                "controlled shard refused".into()
+            } else {
+                resp.text().await.unwrap_or_default()
+            };
             return Err(ShardError { status, url, body }.into());
         }
+        let decode_error = |e: anyhow::Error| {
+            if self.controls.is_some() {
+                controlled_shard_error(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+            } else {
+                e
+            }
+        };
         let scan = decode_shard_scan_header(
             resp.headers()
                 .get("x-siglake-scan")
                 .map(|header| header.as_bytes()),
-        )?;
+        )
+        .map_err(decode_error)?;
         let totals = decode_shard_scan_stats(
             resp.headers()
                 .get("x-siglake-scan-stats")
                 .map(|header| header.as_bytes()),
-        )?;
-        let bytes = resp.bytes().await.context("read shard response")?;
+        )
+        .map_err(decode_error)?;
+        let bytes = resp
+            .bytes()
+            .await
+            .context("read shard response")
+            .map_err(decode_error)?;
         Ok(ShardRun {
-            batches: crate::format::arrow_ipc_to_batches(&bytes)?,
+            batches: crate::format::arrow_ipc_to_batches(&bytes).map_err(decode_error)?,
             totals,
             scan,
         })

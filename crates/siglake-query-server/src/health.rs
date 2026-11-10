@@ -46,6 +46,17 @@ pub async fn healthz() -> Json<HealthResponse> {
     ),
 )]
 pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadyResponse>) {
+    if let Some(authority) = &state.query_controls {
+        if authority.ready().await.is_err() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ReadyResponse {
+                    status: "not_ready".to_string(),
+                    error: Some("query_policy_unavailable".to_string()),
+                }),
+            );
+        }
+    }
     match state.ice.catalog().list_namespaces(None).await {
         Ok(_) => (
             StatusCode::OK,
@@ -58,7 +69,11 @@ pub async fn readyz(State(state): State<AppState>) -> (StatusCode, Json<ReadyRes
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ReadyResponse {
                 status: "not_ready".to_string(),
-                error: Some(format!("{e:#}")),
+                error: Some(if state.query_controls.is_some() {
+                    "catalog_unavailable".to_string()
+                } else {
+                    format!("{e:#}")
+                }),
             }),
         ),
     }
