@@ -1149,10 +1149,16 @@ fn registered_v1_blobs(table: &Table) -> Vec<(String, String, String)> {
     out
 }
 
-/// Every `.puffin` object under the warehouse, registered or not.
+/// Every `.puffin` object under the warehouse, registered or not, spelled the
+/// way metadata spells it.
+///
+/// Canonical, because `IcebergContext::open` canonicalizes the warehouse before
+/// building its `file://` URL. Where the temp dir sits behind a symlink (macOS:
+/// `/var` -> `/private/var`) the raw path names the same files differently, and
+/// every object would read as unreachable.
 fn puffin_objects(root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![std::fs::canonicalize(root).unwrap()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
