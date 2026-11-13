@@ -16,6 +16,9 @@ siglake-wal = { workspace = true }
 anyhow = { workspace = true }
 arrow-array = { workspace = true }
 async-stream = "0.3"
+# Decoding gzip OTLP/HTTP request bodies, every gzip member of them
+# (`content_encoding`).
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 redis = { workspace = true }
@@ -29,6 +32,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 simd-json = "0.14"
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
@@ -44,6 +48,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tower = { workspace = true }
 criterion = "0.5"
+# Gzipping OTLP/HTTP request bodies in the Content-Encoding tests.
+flate2 = "1"
 mimalloc = { version = "0.1", default-features = false }
 datafusion = { workspace = true }
 futures = { workspace = true }
