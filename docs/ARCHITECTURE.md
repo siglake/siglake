@@ -29,7 +29,7 @@ test workflow and does not run inside a query or compactor process.
 
 | Endpoint | What |
 |---|---|
-| `POST /v1/logs`, `POST /v1/traces` | OTLP/HTTP ingest (protobuf or JSON). Single-tenant unless a tenant claim or `ingester.trustScopeHeader` routes `X-Scope-OrgID`. |
+| `POST /v1/logs`, `POST /v1/traces` | OTLP/HTTP ingest (protobuf or JSON, optionally `Content-Encoding: gzip`; the body cap applies before and after decompression, and other codings are `415`). Single-tenant unless a tenant claim or `ingester.trustScopeHeader` routes `X-Scope-OrgID`. |
 | `POST /api/v1/_elastic/_bulk`, `…/{index}/_bulk` | Elasticsearch-compatible NDJSON bulk ingest into user indexes. |
 | `GET /_cluster/health`, `GET /api/v1/_elastic/_cluster/health` | Elasticsearch-compatible readiness probes (always `green`). |
 | Elasticsearch read APIs | `_search`, `_msearch`, scroll, `_field_caps` and `_cat` are not implemented and return `501` with a pointer to `POST /api/v1/sql`. They route, so an ES client gets an answer rather than a `404`, but no ES query API is planned and they are absent from `docs/api/openapi-ingest.yaml`. |

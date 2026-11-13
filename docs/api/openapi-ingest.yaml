@@ -632,6 +632,10 @@ paths:
         anything else — including a missing header — is decoded as protobuf.** The
         response echoes the request's format.
 
+        Either format may be sent with `Content-Encoding: gzip`, as the OTLP
+        specification requires. The body cap applies to both the compressed and the
+        decompressed bytes, and any other content coding is refused with `415`.
+
         The `x-siglake-*` and `x-scope-orgid` parameter names below are the values of
         the `INDEX_HEADER`, `COMMIT_HEADER` and `TENANT_HEADER` constants; the
         attribute needs literals, so `header_params_match_constants` pins them.
@@ -677,7 +681,7 @@ paths:
           - string
           - "null"
       requestBody:
-        description: OTLP `ExportLogsServiceRequest`.
+        description: "OTLP `ExportLogsServiceRequest`, optionally sent with `Content-Encoding: gzip`."
         content:
           application/json:
             schema:
@@ -713,7 +717,8 @@ paths:
         "400":
           description: >-
             Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header
-            value. Also `commit=force` when a remote drain consumes the mirrored WAL.
+            value, or a gzip-encoded body that is not a valid gzip stream. Also `commit=force`
+            when a remote drain consumes the mirrored WAL.
           content:
             application/json:
               schema:
@@ -733,8 +738,15 @@ paths:
         "413":
           description: >-
             Body exceeds the ingest body cap (env-tunable via
-            `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). Rejected by the framework, so the body is not the usual
-            error envelope.
+            `SIGLAKE_INGEST_MAX_BODY_BYTES`, 16 MiB by default). A gzip body is measured both as received and after
+            decompression. Rejected by the framework, so the body is not the usual error envelope.
+        "415":
+          description: "`Content-Encoding` names a coding other than `gzip` or `identity`, or more than one coding. Rejected with an empty body."
+          headers:
+            accept-encoding:
+              schema:
+                type: string
+              description: "The accepted request content coding: `gzip`."
         "429":
           description: Rate limited.
           headers:
@@ -783,8 +795,9 @@ paths:
       description: |-
         Spans are stored as events in a traces index and are queryable both through
         SQL and through the Jaeger-compatible read API on the query server.
-        Content-type handling is identical to `POST /v1/logs`: JSON only when
-        `Content-Type` contains `application/json`, protobuf otherwise.
+        Content-type and content-coding handling are identical to `POST /v1/logs`:
+        JSON only when `Content-Type` contains `application/json`, protobuf
+        otherwise, and either may be sent with `Content-Encoding: gzip`.
       operationId: post_otlp_traces
       parameters:
       - name: commit
@@ -827,7 +840,7 @@ paths:
           - string
           - "null"
       requestBody:
-        description: OTLP `ExportTraceServiceRequest`.
+        description: "OTLP `ExportTraceServiceRequest`, optionally sent with `Content-Encoding: gzip`."
         content:
           application/json:
             schema:
@@ -863,7 +876,8 @@ paths:
         "400":
           description: >-
             Undecodable body, or an invalid index, commit-mode or `X-Scope-OrgID` header
-            value. Also `commit=force` when a remote drain consumes the mirrored WAL.
+            value, or a gzip-encoded body that is not a valid gzip stream. Also `commit=force`
+            when a remote drain consumes the mirrored WAL.
           content:
             application/json:
               schema:
@@ -881,7 +895,16 @@ paths:
               schema:
                 $ref: "#/components/schemas/SiglakeErrorBody"
         "413":
-          description: Body exceeds the ingest body cap (env-tunable, 16 MiB by default).
+          description: >-
+            Body exceeds the ingest body cap (env-tunable, 16 MiB by default). A gzip body
+            is measured both as received and after decompression.
+        "415":
+          description: "`Content-Encoding` names a coding other than `gzip` or `identity`, or more than one coding. Rejected with an empty body."
+          headers:
+            accept-encoding:
+              schema:
+                type: string
+              description: "The accepted request content coding: `gzip`."
         "429":
           description: Rate limited.
           headers:

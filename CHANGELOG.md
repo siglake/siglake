@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **OTLP/HTTP gzip:** `POST /v1/logs` and `POST /v1/traces` accept
+  `Content-Encoding: gzip`, as the OTLP specification requires, so the
+  Collector's `otlphttp` exporter works with its default `compression: gzip`.
+  The ingest body cap (`SIGLAKE_INGEST_MAX_BODY_BYTES`) applies to both the
+  compressed and the decompressed bytes, and every member of a multi-member
+  gzip stream is decoded. Codings are matched case-insensitively and `x-gzip`
+  is `gzip`. A body that is not valid gzip is `400` with the usual error
+  envelope. Any other content coding, or more than one, is `415` with
+  `Accept-Encoding: gzip`, counted in `siglake_ingest_requests_total`;
+  previously it failed as an undecodable body with `400`. OTLP/gRPC
+  still refuses compressed requests; see `docs/LIMITATIONS.md`.
+
 ## 0.4.1
 
 - **Attribute lookup performance:** JSON string scanning uses vectorized quote
