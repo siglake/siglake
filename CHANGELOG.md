@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **OTLP log attributes:** a non-string `sourcetype` or `index` record
+  attribute is kept in `attributes` instead of being dropped.
+
 ## 0.4.1
 
 - **Attribute lookup performance:** JSON string scanning uses vectorized quote
