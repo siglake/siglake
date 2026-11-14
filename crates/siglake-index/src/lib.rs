@@ -649,6 +649,14 @@ impl FlatIndex {
     /// `usize` (never as a `u32` sum that could overflow), and every length is
     /// untrusted input checked against the bytes that remain.
     ///
+    /// The header counts are untrusted and would drive infallible
+    /// reservations, so before any of them the decoded heap they imply
+    /// (span table + postings buffer + term bytes) is checked against
+    /// [`v2_decode_budget`] — first as an upper bound, then exactly, once
+    /// the term lengths are known. The three reservations are fallible
+    /// (`try_reserve_exact`), so even a checked-but-unaffordable count
+    /// degrades to `None` instead of aborting.
+    ///
     /// The semantic checks (strictly-ascending UTF-8 terms, strictly-ascending
     /// in-domain postings) are made here, on untrusted bytes, returning `None`
     /// rather than reaching [`Self::validate`], which panics by design — the
@@ -665,18 +673,25 @@ impl FlatIndex {
         let n_rows: u32 = c.varint()?.try_into().ok()?;
         let n_terms: usize = c.varint()?.try_into().ok()?;
         let total_postings: usize = c.varint()?.try_into().ok()?;
-        // Cheap guard against a huge `n_terms` driving the term-length read
-        // (and the term-spans `Vec`) before any term is actually present: each
-        // term costs at least one byte for its length varint and one for its
-        // (non-empty) posting count.
-        if n_terms > c.remaining() / 2 {
+        // `total_postings` is bounded to `u32` (the resident layout's offset
+        // width) and to the bytes that remain (every posting costs at least
+        // one delta byte).
+        if total_postings > c.remaining() || u32::try_from(total_postings).is_err() {
             return None;
         }
-        // `total_postings` is untrusted and becomes a `with_capacity` below:
-        // bound it to the bytes that remain (every posting costs at least one
-        // delta byte) and to `u32` (the resident layout's offset width) so a
-        // hostile or corrupt header cannot drive an arbitrary allocation.
-        if total_postings > c.remaining() || u32::try_from(total_postings).is_err() {
+        // The decoded heap the header implies: the span table (12 B/term),
+        // the postings buffer (4 B/posting), and the term bytes — the latter
+        // upper-bounded by the bytes that remain, which tightens to the exact
+        // total once the term-length loop below has run. Checked arithmetic
+        // keeps the bound itself overflow-free. This is the guard that stands
+        // between a hostile header and the first reservation: a blob that
+        // declares more decoded bytes than it carries is refused now, not
+        // after an allocation its payload cannot survive.
+        let mut decoded_heap = n_terms
+            .checked_mul(std::mem::size_of::<TermSpan>())?
+            .checked_add(total_postings.checked_mul(std::mem::size_of::<u32>())?)?
+            .checked_add(c.remaining())?;
+        if decoded_heap > v2_decode_budget(bytes.len()) {
             return None;
         }
         // Term section: the per-term lengths, then the concatenated term
@@ -684,7 +699,10 @@ impl FlatIndex {
         // empty term for a null or empty column value, and it is the
         // dictionary's first entry. All offsets derived cumulatively in
         // `usize` (never a `u32` sum).
-        let mut terms = Vec::with_capacity(n_terms);
+        let mut terms = Vec::new();
+        if terms.try_reserve_exact(n_terms).is_err() {
+            return None;
+        }
         let mut bytes_cursor = 0usize;
         for _ in 0..n_terms {
             let term_len: usize = c.varint()?.try_into().ok()?;
@@ -700,6 +718,17 @@ impl FlatIndex {
             });
             bytes_cursor += term_len;
         }
+        // The exact bound, now that the term bytes are known: the header
+        // bound above used the bytes remaining as an upper bound for them;
+        // recompute the decoded heap with the measured term-byte total
+        // before the postings reservation uses it.
+        decoded_heap = n_terms
+            .checked_mul(std::mem::size_of::<TermSpan>())?
+            .checked_add(total_postings.checked_mul(std::mem::size_of::<u32>())?)?
+            .checked_add(bytes_cursor)?;
+        if decoded_heap > v2_decode_budget(bytes.len()) {
+            return None;
+        }
         let term_bytes = c.take(bytes_cursor)?.to_vec();
         // The v2 form must have strictly ascending UTF-8 terms in buffer
         // order.
@@ -713,10 +742,13 @@ impl FlatIndex {
             }
             last_term = Some(term);
         }
-        // Posting section: one forward decode into a buffer preallocated to
-        // the header's total, which the guard above has bounded to the bytes
-        // remaining and to `u32`, so the allocation is always affordable.
-        let mut postings = Vec::with_capacity(total_postings);
+        // Posting section: one forward decode into a buffer reserved to the
+        // header's total, which the bounds above have kept inside the decode
+        // budget and inside `u32`.
+        let mut postings = Vec::new();
+        if postings.try_reserve_exact(total_postings).is_err() {
+            return None;
+        }
         let mut postings_cursor = 0u32;
         for span in &mut terms {
             let plen: u32 = c.varint()?.try_into().ok()?;
@@ -848,6 +880,26 @@ fn decode_delta_postings(
         out.push(prev);
     }
     Some(())
+}
+
+/// The decoded-heap budget for a v2 blob of `len` bytes: the span table,
+/// postings buffer and term bytes combined may never exceed
+/// `min(4 GiB, 6 * len + 64)`.
+///
+/// Six is a ceiling on the decoded-to-wire ratio of a *valid* blob: the
+/// fattest valid shape is a one-byte term with a single posting — 17 B
+/// decoded (12 B span + 1 B term + 4 B posting) against 4 B on the wire
+/// (length, term byte, count, delta varints) — 17/4 < 6, and every other
+/// shape is lower (the ratio falls toward 1 as terms grow and toward 4 as
+/// posting lists grow). So every honest index clears the budget with
+/// headroom, while a header that inflates `n_terms` / `total_postings` past
+/// what the payload can carry is refused *before the first reservation*,
+/// not after an allocation the payload cannot survive. The 64-byte slack
+/// absorbs the fixed header, and the 4 GiB ceiling is the layout's own
+/// `u32`-offset cap.
+fn v2_decode_budget(len: usize) -> usize {
+    const CAP: usize = 4 * 1024 * 1024 * 1024;
+    len.saturating_mul(6).saturating_add(64).min(CAP)
 }
 
 impl InvertedIndex {
@@ -2078,6 +2130,29 @@ mod tests {
         assert!(out.len() < 24, "the hostile blob stays tiny");
         assert!(FlatIndex::from_bytes_v2(&out).is_none());
 
+        // A span-table reservation no payload can justify. This shape is
+        // chosen to sail past the *cheap* guards — `total_postings` equals the
+        // bytes remaining, and `n_terms` is exactly half of them — so it is
+        // the decode budget, and only the decode budget, that must refuse it.
+        // The header implies a 1,200,000-byte span table plus an
+        // 800,000-byte postings buffer from 200,016 bytes of input (a ~11x
+        // decoded-to-wire ratio, well past the 6x ceiling); without the budget
+        // guard this shape reserved its full ~2 MB before the
+        // duplicate-empty-term check returned `None`.
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, u32::MAX as u64); // n_rows: maximally permissive
+        let n_terms = 100_000usize;
+        write_varint(&mut out, n_terms as u64);
+        write_varint(&mut out, 200_000u64); // total_postings = the bytes remaining
+        for _ in 0..n_terms {
+            write_varint(&mut out, 0u64); // zero-length terms
+        }
+        out.resize(out.len() + 100_000, 0); // pad: the payload is truncated
+        assert_eq!(out.len(), 200_016, "the hostile blob stays ~200 KiB");
+        assert!(FlatIndex::from_bytes_v2(&out).is_none());
+
         // A declared total larger than the per-term counts: the decode
         // succeeds but the sum check must refuse (the blob would not
         // round-trip its own header and would over-allocate capacity).
@@ -2160,6 +2235,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The decode budget grows linearly (6× input + slack) and saturates at
+    /// the layout's own 4 GiB `u32`-offset cap without overflowing.
+    #[test]
+    fn v2_decode_budget_scales_and_caps() {
+        // No input: only the fixed-header slack.
+        assert_eq!(v2_decode_budget(0), 64);
+        // Linear region: 6× the bytes plus the 64-byte header slack.
+        assert_eq!(v2_decode_budget(1_000_000), 6_000_064);
+        // The fattest valid shape — an empty term with one posting — decodes
+        // to 16 bytes (12 B span + 4 B posting) against 3 wire bytes
+        // (length, count, delta varints): 16/3 ≈ 5.33×, under the 6× ceiling,
+        // so every honest index clears the budget with headroom.
+        assert!(16 <= v2_decode_budget(3));
+        // Saturates at the 4 GiB cap; no overflow past it.
+        let cap = 4 * 1024 * 1024 * 1024;
+        assert_eq!(v2_decode_budget(cap), cap);
+        assert_eq!(v2_decode_budget(usize::MAX), cap);
     }
 
     #[test]
