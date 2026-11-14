@@ -214,10 +214,10 @@ impl FlatIndex {
     /// Build from the map-and-vectors form. Borrows the map, so during the
     /// conversion both the map and the flat buffers are resident at once (the
     /// peak is `map + flat`); the owned form
-    /// [`From<InvertedIndex> for FlatIndex`] has the same peak but drops the
-    /// map afterward, so only the flat index stays resident. The term order is
-    /// preserved (it is the `BTreeMap` order), and the buffers are sized
-    /// exactly, so the resident charge carries no growth headroom.
+    /// [`TryFrom<InvertedIndex> for FlatIndex`] has the same peak but drops the
+    /// map afterward (on `Ok`), so only the flat index stays resident. The
+    /// term order is preserved (it is the `BTreeMap` order), and the buffers
+    /// are sized exactly, so the resident charge carries no growth headroom.
     ///
     /// Panics when the buffers would not fit the `u32`-offset layout (past
     /// 4 GiB of term bytes, postings, or span table); use
@@ -410,6 +410,10 @@ impl FlatIndex {
     /// Build directly from an iterator of rows' `raw` text, in physical order.
     /// The from-scratch path to the flat layout — no intermediate
     /// [`InvertedIndex`] — mirroring [`InvertedIndex::from_rows`].
+    ///
+    /// Panics when the buffers would not fit the `u32`-offset layout (past
+    /// 4 GiB of term bytes, postings, or span table); use
+    /// [`try_from_rows`](Self::try_from_rows) for the checked form.
     pub fn from_rows<'a, I: IntoIterator<Item = &'a str>>(rows: I) -> Self {
         Self::from_rows_with_tokenizer(rows, Tokenizer::Default)
     }
@@ -419,15 +423,40 @@ impl FlatIndex {
     /// ordinals) and flattened at the end — it avoids the *named*
     /// `InvertedIndex` intermediate, not the accumulation map; a truly
     /// allocation-light flat build is a later optimization.
+    ///
+    /// Panics when the buffers would not fit the `u32`-offset layout; use
+    /// [`try_from_rows_with_tokenizer`](Self::try_from_rows_with_tokenizer)
+    /// for the checked form.
     pub(crate) fn from_rows_with_tokenizer<'a, I: IntoIterator<Item = &'a str>>(
         rows: I,
         tokenizer: Tokenizer,
     ) -> Self {
+        Self::try_from_rows_with_tokenizer(rows, tokenizer)
+            .expect("the flat layout's buffers fit the u32 offsets")
+    }
+
+    /// [`from_rows`](Self::from_rows) with the 4 GiB `u32`-offset cap as an
+    /// `Err` instead of a panic. The `Err` carries the accumulated
+    /// [`InvertedIndex`], so a caller that needs the data can fall back to
+    /// the map form, which has no per-buffer offset cap.
+    pub fn try_from_rows<'a, I: IntoIterator<Item = &'a str>>(
+        rows: I,
+    ) -> Result<Self, InvertedIndex> {
+        Self::try_from_rows_with_tokenizer(rows, Tokenizer::Default)
+    }
+
+    /// [`try_from_rows`](Self::try_from_rows) with an explicit tokenizer.
+    /// Returns the accumulated map-form index when the flat layout cannot
+    /// represent it, so the caller can fall back to it.
+    pub(crate) fn try_from_rows_with_tokenizer<'a, I: IntoIterator<Item = &'a str>>(
+        rows: I,
+        tokenizer: Tokenizer,
+    ) -> Result<Self, InvertedIndex> {
         let mut b = IndexBuilder::with_tokenizer(tokenizer);
         for raw in rows {
             b.push_row(raw);
         }
-        FlatIndex::from(b.build())
+        FlatIndex::try_from(b.build())
     }
 
     /// Number of rows indexed (the ordinal space is `0..n_rows()`).
@@ -774,16 +803,36 @@ impl FlatIndex {
     }
 }
 
-/// Convert an owned map-form index into the flat layout. The map is moved and
-/// dropped, so only the flat index stays resident. The conversion *peak* is
-/// `map + flat` (the flat buffers are allocated at full size before the copy),
-/// the same as the borrowing [`InvertedIndex::flat`]; the value of the owned
-/// form is the steady state — the map is gone when this returns. This is the
-/// path a cache-load of a historical v1 file takes. Panics past the 4 GiB
-/// `u32`-offset cap — use [`InvertedIndex::try_flat`] for the checked form.
-impl From<InvertedIndex> for FlatIndex {
-    fn from(index: InvertedIndex) -> Self {
-        FlatIndex::from_map(&index.postings, index.n_rows)
+/// The fallible owned conversion: `Ok` when the flat layout's `u32` offsets
+/// can represent the index, `Err(original)` otherwise so the caller can fall
+/// back to the map form. The map is moved and dropped on `Ok`, so only the
+/// flat index stays resident; the conversion *peak* is `map + flat` (the flat
+/// buffers are allocated at full size before the copy), the same as the
+/// borrowing [`InvertedIndex::flat`]. This is the path a cache-load of a
+/// historical v1 file takes.
+///
+/// In a real context this effectively never fails. Every *built* index goes
+/// through the shared bloom tokenizer, which caps each row at
+/// `siglake_bloom::MAX_TOKENS_PER_ROW` (64) distinct terms, so the
+/// worst case — 64 fresh terms per row, none repeated — reaches the flat
+/// layout's caps only at large scales: the span table (`n_terms * 12 B < 4
+/// GiB`) at ~5.6M rows and the postings buffer (`total_postings < 2^32`) at
+/// ~67.1M rows. Real corpora deduplicate terms across rows, so `n_terms` and
+/// the posting total stay far below `64 * n_rows` and the boundary is much
+/// farther out. Decoded indexes carry no such guarantee (the v1/v2 decoders
+/// check only structural invariants), which is why the check lives on the
+/// conversion (`try_from_map` → `map_fits_u32`) rather than being assumed.
+///
+/// A `From` impl is deliberately absent: it would collide with the
+/// standard-library blanket `TryFrom` (via `Into`) and prevent this fallible
+/// `TryFrom` from carrying the original index as its `Error`. Callers that
+/// want the infallible form use [`InvertedIndex::flat`] (borrowing) or
+/// `FlatIndex::from_rows` (from scratch), both of which panic past the cap.
+impl TryFrom<InvertedIndex> for FlatIndex {
+    type Error = InvertedIndex;
+
+    fn try_from(index: InvertedIndex) -> Result<Self, Self::Error> {
+        FlatIndex::try_from_map(&index.postings, index.n_rows).ok_or(index)
     }
 }
 
@@ -952,9 +1001,9 @@ impl InvertedIndex {
     /// historical v1 file into the canonical form. It borrows the map, so both
     /// the map and the flat buffers are resident during the conversion (peak
     /// `map + flat`); the owned form
-    /// [`From<InvertedIndex> for FlatIndex`] has the same peak but drops the
-    /// map afterward, so only the flat index stays resident. A writer that
-    /// already has the rows should use [`FlatIndex::from_rows`]
+    /// [`TryFrom<InvertedIndex> for FlatIndex`] has the same peak but drops the
+    /// map afterward (on `Ok`), so only the flat index stays resident. A
+    /// writer that already has the rows should use [`FlatIndex::from_rows`]
     /// instead. `heap_size_bytes` on the result is the
     /// resident charge the parsed-index budgets should use once they hold the
     /// flat form.
@@ -1177,8 +1226,8 @@ impl InvertedIndex {
 }
 
 /// Parse a resident-layout index back into the map form, so the two forms stay
-/// interchangeable. The reverse of [`From<InvertedIndex> for FlatIndex`]: takes
-/// the flat index by value and drops it, so only the map form stays resident.
+/// interchangeable. The reverse of the flat conversion: takes the flat index
+/// by value and drops it, so only the map form stays resident.
 impl From<FlatIndex> for InvertedIndex {
     fn from(flat: FlatIndex) -> Self {
         let mut postings = BTreeMap::new();
@@ -1929,28 +1978,27 @@ mod tests {
 
     #[test]
     fn flat_map_construction_paths_agree() {
-        // The borrowing (`flat`), owned (`From<InvertedIndex>`), and fallible
-        // (`try_flat`) conversions must all produce the identical flat layout
-        // for the same rows: same spans, same postings, same jump table, same
-        // charge. The owned form moves the map, so any divergence from the
-        // borrowing path would show up here.
+        // The borrowing (`flat`), owned (`TryFrom<InvertedIndex>`), and
+        // fallible (`try_flat`) conversions must all produce the identical
+        // flat layout for the same rows: same spans, same postings, same jump
+        // table, same charge. The owned form moves the map, so any divergence
+        // from the borrowing path would show up here.
         let rows: Vec<String> = (0..2_000)
             .map(|r| format!("service-{} status {} row-{r:04}", r % 7, 200 + r % 3))
             .collect();
         let a = InvertedIndex::from_rows(rows.iter().map(String::as_str));
-        let b = InvertedIndex::from_rows(rows.iter().map(String::as_str));
         let c = InvertedIndex::from_rows(rows.iter().map(String::as_str));
         let by_borrow = a.flat();
         let by_try = a.try_flat().expect("a small index fits the u32 cap");
-        let by_owned = FlatIndex::from(b);
+        let by_owned = FlatIndex::try_from(c.clone()).expect("a small index fits");
         assert_eq!(by_borrow, by_try, "try_flat must equal flat");
-        assert_eq!(by_borrow, by_owned, "From<InvertedIndex> must equal flat");
+        assert_eq!(by_borrow, by_owned, "TryFrom must equal flat");
         assert_eq!(
             by_borrow.heap_size_bytes(),
             by_owned.heap_size_bytes(),
             "the charge must not depend on the construction path"
         );
-        // `a` is still usable after the borrowing conversions; `b` was moved.
+        // `a` is still usable after the borrowing conversions; `c` was cloned.
         assert_eq!(a.n_terms(), c.n_terms());
         // And the fallible form reports a fit for a small index.
         assert!(c.try_flat().is_some());
@@ -1986,6 +2034,72 @@ mod tests {
         }
         // At least one is present, so the loop above is not all-`None`.
         assert!(direct.postings("service").is_some());
+    }
+
+    #[test]
+    fn map_fits_u32_boundaries() {
+        // Synthetic size accounting for the flat layout's `u32`-offset cap:
+        // each buffer's total must fit `u32`, at the `u32::MAX` boundary, with
+        // no multi-GiB fixture. The other two arguments are set to zero so
+        // each buffer is exercised in isolation.
+        let span = std::mem::size_of::<TermSpan>();
+        // Term bytes: `u32::MAX` fits, `u32::MAX + 1` does not.
+        assert!(FlatIndex::map_fits_u32(0, u32::MAX as usize, 0));
+        assert!(!FlatIndex::map_fits_u32(0, u32::MAX as usize + 1, 0));
+        // Postings: `u32::MAX` fits, `u32::MAX + 1` does not.
+        assert!(FlatIndex::map_fits_u32(0, 0, u32::MAX as usize));
+        assert!(!FlatIndex::map_fits_u32(0, 0, u32::MAX as usize + 1));
+        // Span table: `n_terms * span` must fit `u32`.
+        assert!(FlatIndex::map_fits_u32(u32::MAX as usize / span, 0, 0));
+        assert!(!FlatIndex::map_fits_u32(u32::MAX as usize / span + 1, 0, 0));
+    }
+
+    #[test]
+    fn try_from_rows_matches_from_rows() {
+        // The fallible row builder produces the same flat layout as the
+        // panicking one for an index that fits.
+        let rows: Vec<String> = (0..1_000)
+            .map(|r| format!("host-{r:04} level info msg"))
+            .collect();
+        let direct = FlatIndex::from_rows(rows.iter().map(String::as_str));
+        let fallible =
+            FlatIndex::try_from_rows(rows.iter().map(String::as_str)).expect("a small index fits");
+        assert_eq!(direct, fallible);
+        assert_eq!(direct.to_bytes_v2(), fallible.to_bytes_v2());
+    }
+
+    #[test]
+    fn built_index_postings_are_capped_by_max_tokens_per_row() {
+        // Documents the soft cap behind `TryFrom`'s "effectively never fails":
+        // the build path shares the bloom tokenizer, which caps each row at
+        // `MAX_TOKENS_PER_ROW` distinct terms. A row offering more tokens than
+        // that contributes exactly `MAX_TOKENS_PER_ROW`, so a built index's
+        // posting total is bounded by `n_rows * MAX_TOKENS_PER_ROW`. This is a
+        // property of the *build* path, not of `InvertedIndex` (decoders do
+        // not re-check it), so it is asserted here on a built index.
+        //
+        // Each row carries 100 distinct tokens; only the first 64 are indexed.
+        let n_rows = 16usize;
+        let rows: Vec<String> = (0..n_rows)
+            .map(|_| {
+                (0..100)
+                    .map(|t| format!("tok{t:04}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let i = InvertedIndex::from_rows(rows.iter().map(String::as_str));
+        let total_postings: usize = i.terms().map(|(_, rows)| rows.len()).sum();
+        assert_eq!(
+            total_postings,
+            n_rows * siglake_bloom::MAX_TOKENS_PER_ROW,
+            "each row contributes exactly MAX_TOKENS_PER_ROW postings"
+        );
+        assert_eq!(
+            i.n_terms(),
+            siglake_bloom::MAX_TOKENS_PER_ROW,
+            "the 64 tokens dedup across rows"
+        );
     }
 
     #[test]
