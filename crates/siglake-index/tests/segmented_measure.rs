@@ -6,9 +6,10 @@
 //! here:
 //!
 //! - **size and build**: the format's cost at rest and at write time.
-//! - **residency**: `InvertedIndex::heap_size_bytes` against
-//!   `SegmentedReader::resident_bytes`. This is the number that decides whether
-//!   a 14-file text plan fits a 1 GiB parsed-index budget at all.
+//! - **estimated residency**: `InvertedIndex::heap_size_bytes` against
+//!   `SegmentedReader::resident_bytes` (both computed estimates, not measured
+//!   RSS). This is the number that decides whether a 14-file text plan fits a
+//!   1 GiB parsed-index budget at all.
 //! - **per-shape reads**: range reads and fetched bytes per lookup, from the
 //!   [`SliceSource`] counters. Local instrumentation of what a reader *asks*
 //!   for — not object-store latency, which needs a prepared round.
@@ -278,7 +279,7 @@ fn report_segmented_vs_whole_file() {
     assert_eq!(
         v2_loaded.heap_size_bytes(),
         v2.heap_size_bytes(),
-        "the decoded index must bill the same resident charge"
+        "the decoded index must bill the same estimated resident charge"
     );
 
     let open = Instant::now();
@@ -289,13 +290,13 @@ fn report_segmented_vs_whole_file() {
 
     println!(
         "\n## one file ({} rows, {} terms, {} row groups)\n\n\
-         | format | build / convert | serialized | parse / load | resident | resident B/row |\n\
+         | format | build / convert | serialized | parse / load | est. resident | est. resident B/row |\n\
          |---|---:|---:|---:|---:|---:|\n\
          | whole-file v1 (map) | {:?} | {} | {:?} | {} | {:.1} |\n\
          | whole-file v2 (flat, in-mem) | {:?} | {} | — | {} | {:.1} |\n\
          | whole-file v2 (flat, from_bytes) | — | {} | {:?} | {} | {:.1} |\n\
          | seg2 | {:?} | {} | {:?} | {} | {:.1} |\n\
-         \nserialized ratio {:.2}x · v1→v2 resident {:.1}x · v1→seg2 resident {:.0}x · \
+         \nserialized ratio {:.2}x · v1→v2 est. resident {:.1}x · v1→seg2 est. resident {:.0}x · \
          seg2 dictionary {} · postings {} · directory {}",
         whole.n_rows(),
         whole.n_terms(),
@@ -725,7 +726,7 @@ fn report_segmented_vs_whole_file() {
         );
     }
     println!(
-        "\nv1 resident working set for {files} files: {} · v2 (flat): {} · seg2: {}",
+        "\nv1 est. resident working set for {files} files: {} · v2 (flat): {} · seg2: {}",
         mib((whole.heap_size_bytes() * files) as u64),
         mib((v2.heap_size_bytes() * files) as u64),
         mib((reader.resident_bytes() * files) as u64),
