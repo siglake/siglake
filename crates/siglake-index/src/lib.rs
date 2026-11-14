@@ -469,12 +469,15 @@ impl FlatIndex {
         self.terms.len()
     }
 
-    /// Resident heap of this layout: the three vectors' *capacities*, the
-    /// jump table, plus the struct itself. Because every builder sizes the
-    /// buffers exactly, the capacity is the real allocation — no growth
-    /// headroom to bill, unlike the map form's floor. (Allocator overhead is
-    /// not counted; the figure is the byte total the buffers request, which
-    /// is what the cache budget wants.)
+    /// Estimated resident heap of this layout: the three vectors'
+    /// *capacities*, the jump table, plus the struct itself. Because every
+    /// builder sizes the buffers exactly, the capacity is the full requested
+    /// allocation — no growth headroom to bill, unlike the map form's floor.
+    /// This is a byte *estimate* for the cache budget, not a measured RSS:
+    /// allocator overhead is not counted, and it excludes the conversion's
+    /// `map + flat` peak — the flat buffers are sized fully before the copy,
+    /// so the map and the flat index are both resident at once during the
+    /// conversion (the owned form drops the map only on success).
     pub fn heap_size_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.terms.capacity() * std::mem::size_of::<TermSpan>()
@@ -978,11 +981,13 @@ impl InvertedIndex {
         self.postings.len()
     }
 
-    /// Approximate resident size of the parsed index, for bounding a cache of
+    /// Estimated resident size of the parsed index, for bounding a cache of
     /// parsed indexes by bytes: the postings and term bytes plus a fixed
-    /// allowance per dictionary entry. It ignores `BTreeMap` node slack and
-    /// `Vec` over-allocation, so it is a floor, not an exact footprint — close
-    /// enough to keep a cache under a byte budget, not a heap accounting tool.
+    /// allowance per dictionary entry. It is a *floor*, not a measured RSS —
+    /// it ignores `BTreeMap` node slack and `Vec` over-allocation — so it
+    /// understates the flat form's [`FlatIndex::heap_size_bytes`] (which bills
+    /// the full owned-buffer capacity). Close enough to keep a cache under a
+    /// byte budget, not a heap accounting tool.
     pub fn heap_size_bytes(&self) -> usize {
         const ENTRY_OVERHEAD: usize =
             std::mem::size_of::<String>() + std::mem::size_of::<Vec<u32>>();
@@ -1005,8 +1010,8 @@ impl InvertedIndex {
     /// map afterward (on `Ok`), so only the flat index stays resident. A
     /// writer that already has the rows should use [`FlatIndex::from_rows`]
     /// instead. `heap_size_bytes` on the result is the
-    /// resident charge the parsed-index budgets should use once they hold the
-    /// flat form.
+    /// estimated resident charge (the `heap_size_bytes` figure) the
+    /// parsed-index budgets should use once they hold the flat form.
     pub fn flat(&self) -> FlatIndex {
         FlatIndex::from_map(&self.postings, self.n_rows)
     }
