@@ -510,10 +510,10 @@ fn map_record_attributes<'a>(
     };
     for kv in record_attrs {
         match kv.key.as_ref() {
-            "sourcetype" => {
+            "sourcetype" if is_core_record_attr(kv) => {
                 sourcetype = kv.value.as_ref().and_then(|v| v.string_value.as_deref());
             }
-            "index" => {
+            "index" if is_core_record_attr(kv) => {
                 index = kv.value.as_ref().and_then(|v| v.string_value.as_deref());
             }
             _ => {
@@ -538,6 +538,14 @@ fn map_record_attributes<'a>(
         s
     });
     (sourcetype, index, attributes)
+}
+
+fn is_core_record_attr(kv: &KeyValue<'_>) -> bool {
+    matches!(kv.key.as_ref(), "sourcetype" | "index")
+        && kv
+            .value
+            .as_ref()
+            .is_some_and(|value| value.string_value.is_some())
 }
 
 fn has_otel_context(
@@ -572,7 +580,7 @@ fn has_otel_context(
                 && record.attributes.iter().any(|record| {
                     record.key == resource.key
                         && record.value.is_some()
-                        && !matches!(record.key.as_ref(), "sourcetype" | "index")
+                        && !is_core_record_attr(record)
                 })
         })
 }
@@ -647,7 +655,7 @@ fn write_otel_context(
                 && record.attributes.iter().any(|record| {
                     record.key == resource.key
                         && record.value.is_some()
-                        && !matches!(record.key.as_ref(), "sourcetype" | "index")
+                        && !is_core_record_attr(record)
                 })
         });
     if has_resource_context {
@@ -672,7 +680,7 @@ fn write_otel_context(
                 && record.attributes.iter().any(|record| {
                     record.key == resource.key
                         && record.value.is_some()
-                        && !matches!(record.key.as_ref(), "sourcetype" | "index")
+                        && !is_core_record_attr(record)
                 });
             if !shadowed {
                 continue;
@@ -1320,6 +1328,44 @@ mod tests {
             "core key must not duplicate into residual"
         );
         assert!(v.get("sourcetype").is_none());
+    }
+
+    #[test]
+    fn ws7_non_string_sourcetype_and_index_stay_in_residual() {
+        let json = r#"{"resourceLogs":[
+          {"resource":{"attributes":[
+             {"key":"index","value":{"stringValue":"resource-level"}}]},
+           "scopeLogs":[{"logRecords":[
+             {"timeUnixNano":"1","body":{"stringValue":"b"},
+              "attributes":[
+                {"key":"index","value":{"intValue":"7"}},
+                {"key":"sourcetype","value":{"boolValue":true}}]},
+             {"timeUnixNano":"2","body":{"stringValue":"b"},
+              "attributes":[
+                {"key":"index","value":{"stringValue":"prod"}},
+                {"key":"sourcetype","value":{"stringValue":"nginx"}}]}]}]}
+        ]}"#;
+        let mut buf = json.as_bytes().to_vec();
+        let events = otlp_logs_to_events(parse_otlp_json(&mut buf).unwrap());
+
+        assert_eq!(events[0].index, "main");
+        assert_eq!(events[0].sourcetype, "otel:logs");
+        let v: serde_json::Value =
+            serde_json::from_str(events[0].attributes.as_deref().unwrap()).unwrap();
+        assert_eq!(v["index"], 7);
+        assert_eq!(v["sourcetype"], true);
+        assert_eq!(
+            v["otel"]["resource"]["attributes"]["index"],
+            "resource-level"
+        );
+
+        assert_eq!(events[1].index, "prod");
+        assert_eq!(events[1].sourcetype, "nginx");
+        let v: serde_json::Value =
+            serde_json::from_str(events[1].attributes.as_deref().unwrap()).unwrap();
+        assert_eq!(v["index"], "resource-level");
+        assert!(v.get("sourcetype").is_none());
+        assert!(v["otel"].get("resource").is_none());
     }
 
     #[test]
