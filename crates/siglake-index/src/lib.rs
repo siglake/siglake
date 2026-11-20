@@ -29,8 +29,8 @@
 //! charges far less resident memory (no per-term `String`/`Vec` headers, no
 //! map/vector slack). It is the intended canonical resident form:
 //!
-//! - **from scratch** — [`FlatIndex::from_rows`] builds it directly, with no
-//!   intermediate map;
+//! - **from scratch** — [`FlatIndex::from_rows`] builds it from rows,
+//!   accumulating through the shared tokenizer map before flattening;
 //! - **from a v1 file** — [`InvertedIndex::flat`] converts a decoded
 //!   [`InvertedIndex`];
 //! - **on the wire** — [`FlatIndex::to_bytes_v2`] /
@@ -407,9 +407,11 @@ impl FlatIndex {
         self
     }
 
-    /// Build directly from an iterator of rows' `raw` text, in physical order.
-    /// The from-scratch path to the flat layout — no intermediate
-    /// [`InvertedIndex`] — mirroring [`InvertedIndex::from_rows`].
+    /// Build from an iterator of rows' `raw` text, in physical order — the
+    /// from-scratch entry point to the flat layout, mirroring
+    /// [`InvertedIndex::from_rows`]. It accumulates in the shared tokenizer
+    /// map and flattens at the end; only the *named* `InvertedIndex`
+    /// intermediate is avoided.
     ///
     /// Panics when the buffers would not fit the `u32`-offset layout (past
     /// 4 GiB of term bytes, postings, or span table); use
