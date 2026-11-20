@@ -67,7 +67,7 @@ const INDEX_VERSION_2: u8 = 2;
 /// few MB up to the 4 GB `u32`-offset cap. The window is bounded by the gap
 /// between *consecutive distinct-prefix* anchors: a run of terms sharing an
 /// 8-byte prefix is covered by a single anchor (deduplicated in
-/// `from_parts`), so the local binary search spans that run — still O(log n)
+/// `try_from_parts`), so the local binary search spans that run — still O(log n)
 /// in the run, just not 32 KB-bounded.
 const TARGET_WINDOW_BYTES: usize = 32 * 1024;
 
@@ -175,7 +175,7 @@ pub struct FlatIndex {
     /// anchors, but a run of terms sharing an 8-byte prefix collapses to one
     /// anchor, so consecutive anchors can be further apart and the window
     /// spans the whole run. The keys are strictly increasing (deduplicated in
-    /// `from_parts`), which is what `term_index`'s tie back-off relies on.
+    /// `try_from_parts`), which is what `term_index`'s tie back-off relies on.
     anchors: Vec<(u64, usize)>,
     n_rows: u32,
 }
@@ -230,6 +230,10 @@ impl FlatIndex {
     /// [`from_map`](Self::from_map) with the 4 GiB cap as `None` instead of a
     /// panic. The map form has no per-buffer offset cap, so a file past the
     /// flat layout's limit is the caller's signal to stay in the map form.
+    ///
+    /// The three buffers are reserved fallibly and the derived jump table is
+    /// grown fallibly ([`try_from_parts`](Self::try_from_parts)), so an
+    /// allocation failure is also `None` rather than an abort.
     pub(crate) fn try_from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Option<Self> {
         let n_terms = map.len();
         let term_bytes_total: usize = map.keys().map(String::len).sum();
@@ -237,9 +241,18 @@ impl FlatIndex {
         if !Self::map_fits_u32(n_terms, term_bytes_total, postings_total) {
             return None;
         }
-        let mut term_bytes = Vec::with_capacity(term_bytes_total);
-        let mut postings = Vec::with_capacity(postings_total);
-        let mut terms = Vec::with_capacity(n_terms);
+        let mut term_bytes = Vec::new();
+        if term_bytes.try_reserve_exact(term_bytes_total).is_err() {
+            return None;
+        }
+        let mut postings = Vec::new();
+        if postings.try_reserve_exact(postings_total).is_err() {
+            return None;
+        }
+        let mut terms = Vec::new();
+        if terms.try_reserve_exact(n_terms).is_err() {
+            return None;
+        }
         for (term, rows) in map {
             // The totals fit `u32`, so every running offset does: these are
             // unreachable tripwires, not the cap check (that is above).
@@ -257,7 +270,7 @@ impl FlatIndex {
                 postings_start,
             });
         }
-        Some(Self::from_parts(terms, postings, term_bytes, n_rows))
+        Self::try_from_parts(terms, postings, term_bytes, n_rows)
     }
 
     /// The 4 GiB `u32`-offset checks shared by the map-based constructors.
@@ -284,12 +297,17 @@ impl FlatIndex {
     /// it runs only in debug builds as a constructor tripwire — free on the
     /// release load path. An out-of-band construction (e.g. FFI) that bypasses
     /// the checked builders should call it explicitly.
-    fn from_parts(
+    ///
+    /// The derived jump table is allocated fallibly: the three owned buffers
+    /// come from the caller, so `anchors` is the only allocation here. `None`
+    /// on allocation failure, so the decode and conversion paths can propagate
+    /// it instead of aborting.
+    fn try_from_parts(
         terms: Vec<TermSpan>,
         postings: Vec<u32>,
         term_bytes: Vec<u8>,
         n_rows: u32,
-    ) -> Self {
+    ) -> Option<Self> {
         // Derive the jump table: one anchor per `TARGET_WINDOW_BYTES` of term
         // bytes, so a point lookup usually narrows to a ≤ 32 KB window (L1)
         // at any index size. The key is the term's first 8 bytes zero-padded,
@@ -314,6 +332,9 @@ impl FlatIndex {
                     prefix[..n].copy_from_slice(&term[..n]);
                     let key = u64::from_be_bytes(prefix);
                     if anchors.last().map(|(k, _)| *k) != Some(key) {
+                        if anchors.len() == anchors.capacity() {
+                            anchors.try_reserve(1).ok()?;
+                        }
                         anchors.push((key, i));
                     }
                 }
@@ -329,7 +350,7 @@ impl FlatIndex {
         if cfg!(debug_assertions) {
             index.validate();
         }
-        index
+        Some(index)
     }
 
     /// Check the layout invariants: contiguous, in-bounds, strictly ascending
@@ -554,7 +575,7 @@ impl FlatIndex {
         // which the key cannot see: when `anchors[lo-1]`'s prefix equals
         // `qkey`, the query's full term may sort *before* that anchor, so the
         // window must reach one anchor further back to include it. This is
-        // only correct because `from_parts` keeps at most one anchor per key:
+        // only correct because `try_from_parts` keeps at most one anchor per key:
         // with strictly increasing keys, "back up one anchor" is the same as
         // "back up to the last strictly-smaller key" — a lower-bound window.
         // If anchors ever carry duplicate keys again, this becomes a
@@ -687,9 +708,10 @@ impl FlatIndex {
     /// reservations, so before any of them the decoded heap they imply
     /// (span table + postings buffer + term bytes) is checked against
     /// [`v2_decode_budget`] — first as an upper bound, then exactly, once
-    /// the term lengths are known. The three reservations are fallible
-    /// (`try_reserve_exact`), so even a checked-but-unaffordable count
-    /// degrades to `None` instead of aborting.
+    /// the term lengths are known. Every allocation on this path is fallible:
+    /// the three buffers and the term-byte copy reserve with
+    /// `try_reserve_exact`, and the derived jump table grows fallibly. An
+    /// allocation failure therefore degrades to `None` instead of aborting.
     ///
     /// The semantic checks (strictly-ascending UTF-8 terms, strictly-ascending
     /// in-domain postings) are made here, on untrusted bytes, returning `None`
@@ -763,7 +785,12 @@ impl FlatIndex {
         if decoded_heap > v2_decode_budget(bytes.len()) {
             return None;
         }
-        let term_bytes = c.take(bytes_cursor)?.to_vec();
+        let term_slice = c.take(bytes_cursor)?;
+        let mut term_bytes = Vec::new();
+        if term_bytes.try_reserve_exact(term_slice.len()).is_err() {
+            return None;
+        }
+        term_bytes.extend_from_slice(term_slice);
         // The v2 form must have strictly ascending UTF-8 terms in buffer
         // order.
         let mut last_term: Option<&str> = None;
@@ -783,14 +810,23 @@ impl FlatIndex {
         if postings.try_reserve_exact(total_postings).is_err() {
             return None;
         }
+        let total_postings_u32 = u32::try_from(total_postings).ok()?;
         let mut postings_cursor = 0u32;
         for span in &mut terms {
             let plen: u32 = c.varint()?.try_into().ok()?;
             if plen == 0 || (plen as usize) > c.remaining() {
                 return None;
             }
+            // The postings buffer is reserved to the header's total, so the
+            // per-term counts must not sum past it: a larger sum would grow
+            // the `Vec` from untrusted counts (an infallible reallocation)
+            // and only be caught by the final length check.
+            let next = postings_cursor.checked_add(plen)?;
+            if next > total_postings_u32 {
+                return None;
+            }
             span.postings_start = postings_cursor;
-            postings_cursor = postings_cursor.checked_add(plen)?;
+            postings_cursor = next;
             decode_delta_postings(&mut c, n_rows, plen as usize, &mut postings)?;
         }
         // The decoded total must equal the header's: a larger declared total
@@ -804,7 +840,7 @@ impl FlatIndex {
         if c.remaining() != 0 {
             return None;
         }
-        Some(Self::from_parts(terms, postings, term_bytes, n_rows))
+        Self::try_from_parts(terms, postings, term_bytes, n_rows)
     }
 }
 
@@ -2326,6 +2362,27 @@ mod tests {
             FlatIndex::from_bytes_v2(&v2_blob(3, &[(b"abc", &[0, 2])]))
                 .and_then(|i| i.postings("abc").map(<[u32]>::to_vec)),
             Some(vec![0, 2])
+        );
+    }
+
+    /// A header that understates `total_postings` must not make the decoder
+    /// grow its preallocated postings buffer from the per-term counts.
+    #[test]
+    fn flat_v2_refuses_per_term_counts_past_the_header_total() {
+        let mut out = Vec::new();
+        out.extend_from_slice(INDEX_MAGIC);
+        out.push(INDEX_VERSION_2);
+        write_varint(&mut out, 2); // n_rows
+        write_varint(&mut out, 1); // n_terms
+        write_varint(&mut out, 1); // total_postings (understated)
+        write_varint(&mut out, 1); // term length
+        out.extend_from_slice(b"a");
+        write_varint(&mut out, 2); // term posting count
+        write_varint(&mut out, 0); // first ordinal
+        write_varint(&mut out, 1); // second ordinal
+        assert!(
+            FlatIndex::from_bytes_v2(&out).is_none(),
+            "per-term counts must stay inside the header total"
         );
     }
 
