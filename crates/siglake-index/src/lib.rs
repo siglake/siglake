@@ -219,17 +219,23 @@ impl FlatIndex {
     /// term order is preserved (it is the `BTreeMap` order), and the buffers
     /// are sized exactly, so the resident charge carries no growth headroom.
     ///
-    /// Panics when the buffers would not fit the `u32`-offset layout (past
-    /// 4 GiB of term bytes, postings, or span table); use
-    /// [`try_from_map`](Self::try_from_map) for the checked form.
+    /// Panics when the map does not fit the flat layout's capacity contract
+    /// (per-buffer `u32` offsets plus the combined 4 GiB decoded heap, with
+    /// no empty posting lists); use [`try_from_map`](Self::try_from_map) for
+    /// the checked form.
     pub(crate) fn from_map(map: &BTreeMap<String, Vec<u32>>, n_rows: u32) -> Self {
         Self::try_from_map(map, n_rows)
-            .expect("the map form's buffers fit the flat layout's u32 offsets")
+            .expect("the map form fits the flat layout's capacity contract")
     }
 
-    /// [`from_map`](Self::from_map) with the 4 GiB cap as `None` instead of a
-    /// panic. The map form has no per-buffer offset cap, so a file past the
-    /// flat layout's limit is the caller's signal to stay in the map form.
+    /// [`from_map`](Self::from_map) with the flat layout's capacity contract
+    /// as `None` instead of a panic. The map form has no per-buffer offset
+    /// cap, so a file past the flat layout's limit is the caller's signal to
+    /// stay in the map form.
+    ///
+    /// An empty posting list is also `None`: the flat layout's `validate`
+    /// requires every term to have at least one posting, and the v2 encoder
+    /// would emit a posting count of zero that both decoders reject.
     ///
     /// The three buffers are reserved fallibly and the derived jump table is
     /// grown fallibly ([`try_from_parts`](Self::try_from_parts)), so an
@@ -238,7 +244,10 @@ impl FlatIndex {
         let n_terms = map.len();
         let term_bytes_total: usize = map.keys().map(String::len).sum();
         let postings_total: usize = map.values().map(Vec::len).sum();
-        if !Self::map_fits_u32(n_terms, term_bytes_total, postings_total) {
+        if map.values().any(Vec::is_empty) {
+            return None;
+        }
+        if !Self::map_fits_flat_layout(n_terms, term_bytes_total, postings_total) {
             return None;
         }
         let mut term_bytes = Vec::new();
@@ -273,18 +282,31 @@ impl FlatIndex {
         Self::try_from_parts(terms, postings, term_bytes, n_rows)
     }
 
-    /// The 4 GiB `u32`-offset checks shared by the map-based constructors.
-    /// The term-bytes and postings totals must fit `u32` (a running offset
-    /// fits only if the total does, and a buffer past the cap could not
-    /// round-trip through `from_bytes_v2`, which derives offsets with a
-    /// checked `u32` cursor); the span table is bounded to `u32` as well, so
-    /// all three buffers the layout is made of stay inside the offset width.
-    fn map_fits_u32(n_terms: usize, term_bytes_total: usize, postings_total: usize) -> bool {
-        u32::try_from(term_bytes_total).is_ok()
+    /// The flat layout's capacity contract, shared by the map-based
+    /// constructors and [`from_bytes_v2`](Self::from_bytes_v2).
+    ///
+    /// Every buffer must fit the `u32` offset width: the term-bytes and
+    /// postings totals (a running offset fits only if the total does), and
+    /// the span table. The *combined* decoded heap must also fit the shared
+    /// 4 GiB ceiling (`V2_DECODE_CAP`), the same limit the v2 decoder
+    /// enforces: checking the components independently is not enough, since a
+    /// `u32`-sized term buffer plus one posting already exceeds the decoder's
+    /// combined budget. A valid blob's decoded-to-wire ratio is below six, so
+    /// a layout under this cap also clears the decoder's `6 * len + 64` line;
+    /// the constructor has no untrusted wire length to amplify.
+    fn map_fits_flat_layout(
+        n_terms: usize,
+        term_bytes_total: usize,
+        postings_total: usize,
+    ) -> bool {
+        let offsets_fit = u32::try_from(term_bytes_total).is_ok()
             && u32::try_from(postings_total).is_ok()
             && n_terms
                 .checked_mul(std::mem::size_of::<TermSpan>())
-                .is_some_and(|bytes| bytes <= u32::MAX as usize)
+                .is_some_and(|bytes| bytes <= u32::MAX as usize);
+        offsets_fit
+            && decoded_heap_bytes(n_terms, term_bytes_total, postings_total)
+                .is_some_and(|heap| heap <= V2_DECODE_CAP)
     }
 
     /// Assemble from already-built **sorted** buffers (term-sorted, contiguous
@@ -434,8 +456,8 @@ impl FlatIndex {
     /// map and flattens at the end; only the *named* `InvertedIndex`
     /// intermediate is avoided.
     ///
-    /// Panics when the buffers would not fit the `u32`-offset layout (past
-    /// 4 GiB of term bytes, postings, or span table); use
+    /// Panics when the map does not fit the flat layout's capacity contract
+    /// (per-buffer `u32` offsets plus the combined 4 GiB decoded heap); use
     /// [`try_from_rows`](Self::try_from_rows) for the checked form.
     pub fn from_rows<'a, I: IntoIterator<Item = &'a str>>(rows: I) -> Self {
         Self::from_rows_with_tokenizer(rows, Tokenizer::Default)
@@ -447,19 +469,19 @@ impl FlatIndex {
     /// `InvertedIndex` intermediate, not the accumulation map; a truly
     /// allocation-light flat build is a later optimization.
     ///
-    /// Panics when the buffers would not fit the `u32`-offset layout; use
-    /// [`try_from_rows_with_tokenizer`](Self::try_from_rows_with_tokenizer)
+    /// Panics when the map does not fit the flat layout's capacity contract;
+    /// use [`try_from_rows_with_tokenizer`](Self::try_from_rows_with_tokenizer)
     /// for the checked form.
     pub(crate) fn from_rows_with_tokenizer<'a, I: IntoIterator<Item = &'a str>>(
         rows: I,
         tokenizer: Tokenizer,
     ) -> Self {
         Self::try_from_rows_with_tokenizer(rows, tokenizer)
-            .expect("the flat layout's buffers fit the u32 offsets")
+            .expect("the flat layout's capacity contract")
     }
 
-    /// [`from_rows`](Self::from_rows) with the 4 GiB `u32`-offset cap as an
-    /// `Err` instead of a panic. The `Err` carries the accumulated
+    /// [`from_rows`](Self::from_rows) with the flat layout's capacity contract
+    /// as an `Err` instead of a panic. The `Err` carries the accumulated
     /// [`InvertedIndex`], so a caller that needs the data can fall back to
     /// the map form, which has no per-buffer offset cap.
     pub fn try_from_rows<'a, I: IntoIterator<Item = &'a str>>(
@@ -743,10 +765,7 @@ impl FlatIndex {
         // between a hostile header and the first reservation: a blob that
         // declares more decoded bytes than it carries is refused now, not
         // after an allocation its payload cannot survive.
-        let mut decoded_heap = n_terms
-            .checked_mul(std::mem::size_of::<TermSpan>())?
-            .checked_add(total_postings.checked_mul(std::mem::size_of::<u32>())?)?
-            .checked_add(c.remaining())?;
+        let mut decoded_heap = decoded_heap_bytes(n_terms, c.remaining(), total_postings)?;
         if decoded_heap > v2_decode_budget(bytes.len()) {
             return None;
         }
@@ -778,10 +797,7 @@ impl FlatIndex {
         // bound above used the bytes remaining as an upper bound for them;
         // recompute the decoded heap with the measured term-byte total
         // before the postings reservation uses it.
-        decoded_heap = n_terms
-            .checked_mul(std::mem::size_of::<TermSpan>())?
-            .checked_add(total_postings.checked_mul(std::mem::size_of::<u32>())?)?
-            .checked_add(bytes_cursor)?;
+        decoded_heap = decoded_heap_bytes(n_terms, bytes_cursor, total_postings)?;
         if decoded_heap > v2_decode_budget(bytes.len()) {
             return None;
         }
@@ -856,13 +872,14 @@ impl FlatIndex {
 /// through the shared bloom tokenizer, which caps each row at
 /// `siglake_bloom::MAX_TOKENS_PER_ROW` (64) distinct terms, so the
 /// worst case — 64 fresh terms per row, none repeated — reaches the flat
-/// layout's caps only at large scales: the span table (`n_terms * 12 B < 4
-/// GiB`) at ~5.6M rows and the postings buffer (`total_postings < 2^32`) at
-/// ~67.1M rows. Real corpora deduplicate terms across rows, so `n_terms` and
-/// the posting total stay far below `64 * n_rows` and the boundary is much
-/// farther out. Decoded indexes carry no such guarantee (the v1/v2 decoders
-/// check only structural invariants), which is why the check lives on the
-/// conversion (`try_from_map` → `map_fits_u32`) rather than being assumed.
+/// layout's combined decoded-heap cap only at large scales: the span table
+/// (`n_terms * 12 B`) alone at ~5.6M rows, or the postings buffer
+/// (`total_postings * 4 B`) alone at ~16.8M rows. Real corpora deduplicate
+/// terms across rows, so `n_terms` and the posting total stay far below
+/// `64 * n_rows` and the boundary is much farther out. Decoded indexes carry
+/// no such guarantee (the v1/v2 decoders check only structural invariants),
+/// which is why the check lives on the conversion
+/// (`try_from_map` → `map_fits_flat_layout`) rather than being assumed.
 ///
 /// A `From` impl is deliberately absent: it would collide with the
 /// standard-library blanket `TryFrom` (via `Into`) and prevent this fallible
@@ -985,11 +1002,26 @@ fn decode_delta_postings(
 /// headroom, while a header that inflates `n_terms` / `total_postings` past
 /// what the payload can carry is refused *before the first reservation*,
 /// not after an allocation the payload cannot survive. The 64-byte slack
-/// absorbs the fixed header, and the 4 GiB ceiling is the layout's own
-/// `u32`-offset cap.
+/// absorbs the fixed header, and the 4 GiB ceiling is the layout's combined
+/// decoded-heap cap, shared with the constructors.
 fn v2_decode_budget(len: usize) -> usize {
-    const CAP: usize = 4 * 1024 * 1024 * 1024;
-    len.saturating_mul(6).saturating_add(64).min(CAP)
+    len.saturating_mul(6).saturating_add(64).min(V2_DECODE_CAP)
+}
+
+/// The flat layout's combined decoded-heap ceiling: the span table, postings
+/// buffer and term bytes together. The v2 decoder and the map-based
+/// constructors enforce the same limit, so any layout a constructor accepts
+/// can round-trip through the v2 blob.
+const V2_DECODE_CAP: usize = 4 * 1024 * 1024 * 1024;
+
+/// The decoded heap implied by the layout sizes: the span table (12 B/term),
+/// the postings buffer (4 B/posting), and the term bytes. Checked arithmetic
+/// so an oversized synthetic count is `None`, never a wrapped sum.
+fn decoded_heap_bytes(n_terms: usize, term_bytes: usize, postings: usize) -> Option<usize> {
+    n_terms
+        .checked_mul(std::mem::size_of::<TermSpan>())?
+        .checked_add(postings.checked_mul(std::mem::size_of::<u32>())?)?
+        .checked_add(term_bytes)
 }
 
 impl InvertedIndex {
@@ -1054,11 +1086,11 @@ impl InvertedIndex {
         FlatIndex::from_map(&self.postings, self.n_rows)
     }
 
-    /// [`flat`](Self::flat) with the 4 GiB `u32`-offset cap as `None`
-    /// instead of a panic. A file past the flat layout's limit stays in the
-    /// map form, which has no per-buffer offset cap — the caller that needs
-    /// to choose between the two (a cache-load of a historical file) uses
-    /// this and falls back to keeping the map when it is `None`.
+    /// [`flat`](Self::flat) with the flat layout's capacity contract as
+    /// `None` instead of a panic. A file past the flat layout's limit stays
+    /// in the map form, which has no per-buffer offset cap — the caller that
+    /// needs to choose between the two (a cache-load of a historical file)
+    /// uses this and falls back to keeping the map when it is `None`.
     pub fn try_flat(&self) -> Option<FlatIndex> {
         FlatIndex::try_from_map(&self.postings, self.n_rows)
     }
@@ -2080,21 +2112,64 @@ mod tests {
     }
 
     #[test]
-    fn map_fits_u32_boundaries() {
-        // Synthetic size accounting for the flat layout's `u32`-offset cap:
-        // each buffer's total must fit `u32`, at the `u32::MAX` boundary, with
-        // no multi-GiB fixture. The other two arguments are set to zero so
-        // each buffer is exercised in isolation.
+    fn map_fits_flat_layout_boundaries() {
+        // Synthetic size accounting for the flat layout's capacity contract:
+        // per-buffer `u32` offsets plus the combined 4 GiB decoded heap, with
+        // no multi-GiB fixture.
+        const CAP: usize = V2_DECODE_CAP;
         let span = std::mem::size_of::<TermSpan>();
-        // Term bytes: `u32::MAX` fits, `u32::MAX + 1` does not.
-        assert!(FlatIndex::map_fits_u32(0, u32::MAX as usize, 0));
-        assert!(!FlatIndex::map_fits_u32(0, u32::MAX as usize + 1, 0));
-        // Postings: `u32::MAX` fits, `u32::MAX + 1` does not.
-        assert!(FlatIndex::map_fits_u32(0, 0, u32::MAX as usize));
-        assert!(!FlatIndex::map_fits_u32(0, 0, u32::MAX as usize + 1));
-        // Span table: `n_terms * span` must fit `u32`.
-        assert!(FlatIndex::map_fits_u32(u32::MAX as usize / span, 0, 0));
-        assert!(!FlatIndex::map_fits_u32(u32::MAX as usize / span + 1, 0, 0));
+        // Term bytes: `u32::MAX` fits as an offset, but the combined cap is
+        // tighter: the same buffer plus one span or posting already exceeds
+        // it.
+        assert!(FlatIndex::map_fits_flat_layout(0, u32::MAX as usize, 0));
+        assert!(!FlatIndex::map_fits_flat_layout(
+            0,
+            u32::MAX as usize + 1,
+            0
+        ));
+        assert!(FlatIndex::map_fits_flat_layout(
+            1,
+            u32::MAX as usize - span,
+            0
+        ));
+        assert!(!FlatIndex::map_fits_flat_layout(1, u32::MAX as usize, 0));
+        // Postings: the combined cap binds well before the `u32` count width.
+        assert!(FlatIndex::map_fits_flat_layout(0, 0, CAP / 4));
+        assert!(!FlatIndex::map_fits_flat_layout(0, 0, CAP / 4 + 1));
+        // Span table: `n_terms * span` must fit `u32` (and the combined cap).
+        assert!(FlatIndex::map_fits_flat_layout(
+            u32::MAX as usize / span,
+            0,
+            0
+        ));
+        assert!(!FlatIndex::map_fits_flat_layout(
+            u32::MAX as usize / span + 1,
+            0,
+            0
+        ));
+        // Component-wise these fit, but the combined heap does not: the
+        // decoder would reject the round-trip.
+        assert!(!FlatIndex::map_fits_flat_layout(0, u32::MAX as usize, 1));
+        assert!(!FlatIndex::map_fits_flat_layout(
+            300_000_000,
+            0,
+            300_000_000
+        ));
+        // Just inside the combined cap.
+        assert!(FlatIndex::map_fits_flat_layout(200_000_000, 0, 400_000_000));
+    }
+
+    #[test]
+    fn try_from_map_rejects_empty_posting_lists() {
+        let mut map = BTreeMap::new();
+        map.insert("a".to_string(), vec![0]);
+        map.insert("b".to_string(), Vec::new());
+        assert!(FlatIndex::try_from_map(&map, 1).is_none());
+        let index = InvertedIndex {
+            postings: map,
+            n_rows: 1,
+        };
+        assert!(FlatIndex::try_from(index).is_err());
     }
 
     #[test]
@@ -2416,7 +2491,7 @@ mod tests {
     }
 
     /// The decode budget grows linearly (6× input + slack) and saturates at
-    /// the layout's own 4 GiB `u32`-offset cap without overflowing.
+    /// the layout's combined 4 GiB decoded-heap cap without overflowing.
     #[test]
     fn v2_decode_budget_scales_and_caps() {
         // No input: only the fixed-header slack.
@@ -2428,8 +2503,8 @@ mod tests {
         // (length, count, delta varints): 16/3 ≈ 5.33×, under the 6× ceiling,
         // so every honest index clears the budget with headroom.
         assert!(16 <= v2_decode_budget(3));
-        // Saturates at the 4 GiB cap; no overflow past it.
-        let cap = 4 * 1024 * 1024 * 1024;
+        // Saturates at the shared 4 GiB cap; no overflow past it.
+        let cap = V2_DECODE_CAP;
         assert_eq!(v2_decode_budget(cap), cap);
         assert_eq!(v2_decode_budget(usize::MAX), cap);
     }
