@@ -877,8 +877,9 @@ impl FlatIndex {
 /// (`total_postings * 4 B`) alone at ~16.8M rows. Real corpora deduplicate
 /// terms across rows, so `n_terms` and the posting total stay far below
 /// `64 * n_rows` and the boundary is much farther out. Decoded indexes carry
-/// no such guarantee (the v1/v2 decoders check only structural invariants),
-/// which is why the check lives on the conversion
+/// no such guarantee: the v1 decoder checks only structural invariants, and
+/// the v2 decoder also enforces the 4 GiB decoded-heap cap, but neither caps
+/// terms per row. That is why the layout check lives on the conversion
 /// (`try_from_map` → `map_fits_flat_layout`) rather than being assumed.
 ///
 /// A `From` impl is deliberately absent: it would collide with the
@@ -1012,7 +1013,13 @@ fn v2_decode_budget(len: usize) -> usize {
 /// buffer and term bytes together. The v2 decoder and the map-based
 /// constructors enforce the same limit, so any layout a constructor accepts
 /// can round-trip through the v2 blob.
+#[cfg(target_pointer_width = "64")]
 const V2_DECODE_CAP: usize = 4 * 1024 * 1024 * 1024;
+
+/// On a 32-bit target the 4 GiB ceiling is not representable in `usize`, so
+/// it saturates to `usize::MAX`.
+#[cfg(not(target_pointer_width = "64"))]
+const V2_DECODE_CAP: usize = usize::MAX;
 
 /// The decoded heap implied by the layout sizes: the span table (12 B/term),
 /// the postings buffer (4 B/posting), and the term bytes. Checked arithmetic
