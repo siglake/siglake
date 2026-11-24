@@ -5,6 +5,12 @@
 - **OTLP log attributes:** a non-string `sourcetype` or `index` record
   attribute is kept in `attributes` instead of being dropped.
 
+- **Elasticsearch bulk timestamps:** `@timestamp` (and `timestamp`) accept
+  epoch numbers, including fractional seconds, and dates without a timezone
+  (read as UTC), as Elasticsearch's default date format does, instead of
+  falling back to ingest time. A value that still does not parse is kept in
+  `attributes` instead of being dropped.
+
 ## 0.4.1
 
 - **Attribute lookup performance:** JSON string scanning uses vectorized quote
