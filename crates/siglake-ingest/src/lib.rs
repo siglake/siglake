@@ -48,7 +48,7 @@ use axum::response::{IntoResponse, Response};
 // to stay out of the spec.
 use axum::routing::{get, MethodRouter};
 use axum::{Json, Router};
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use futures::Stream;
 use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
     LogsService, LogsServiceServer,
@@ -3001,10 +3001,12 @@ struct ParsedBulkRequest {
 
 /// ES ingest-only document mapping contract for `/_bulk`.
 ///
-/// - `@timestamp` (RFC3339) becomes [`Event::timestamp`].
-/// - Otherwise `timestamp` is used when it is RFC3339 or an epoch value, with
-///   a ms/ns heuristic: absolute values below `1e15` are treated as epoch-ms,
-///   larger values as epoch-ns.
+/// - `@timestamp` becomes [`Event::timestamp`], else `timestamp`. Each accepts
+///   RFC3339, a date or date-time without a timezone (read as UTC, like
+///   Elasticsearch's `strict_date_optional_time`), or an epoch number or
+///   numeric string, integer or fractional, read as seconds, milliseconds or
+///   nanoseconds by magnitude (see `parse_epoch_timestamp`). A value that does
+///   not parse stays in [`Event::attributes`] and ingest time is used.
 /// - `host.name` wins for [`Event::host`], then a top-level string `host`,
 ///   else `"unknown"`.
 /// - `service.name` wins for [`Event::source`], then a top-level string
@@ -3047,23 +3049,78 @@ fn es_doc_to_event(
 }
 
 fn extract_es_timestamp(doc: &mut serde_json::Map<String, Value>) -> Option<DateTime<Utc>> {
-    if let Some(ts) = extract_string_field(doc, "@timestamp") {
-        if let Ok(parsed) = DateTime::parse_from_rfc3339(&ts) {
-            return Some(parsed.with_timezone(&Utc));
-        }
-    }
-    let value = doc.remove("timestamp")?;
+    take_timestamp_field(doc, "@timestamp").or_else(|| take_timestamp_field(doc, "timestamp"))
+}
+
+/// Removes `field` from `doc` only when it parses as a timestamp, so an
+/// unparseable value stays in the residual attributes instead of being lost.
+fn take_timestamp_field(
+    doc: &mut serde_json::Map<String, Value>,
+    field: &str,
+) -> Option<DateTime<Utc>> {
+    let parsed = parse_es_timestamp(doc.get(field)?)?;
+    doc.remove(field);
+    Some(parsed)
+}
+
+/// Accepts the shapes of Elasticsearch's default `strict_date_optional_time||epoch_millis`
+/// date format: RFC 3339, a date or date-time without a timezone (read as UTC,
+/// as Elasticsearch does), and epoch numbers or numeric strings. Epoch values
+/// use the seconds / milliseconds / nanoseconds magnitude heuristic of
+/// [`parse_epoch_timestamp`] rather than Elasticsearch's milliseconds-only rule.
+fn parse_es_timestamp(value: &Value) -> Option<DateTime<Utc>> {
     match value {
-        Value::String(raw) => {
-            if let Ok(parsed) = DateTime::parse_from_rfc3339(&raw) {
-                Some(parsed.with_timezone(&Utc))
-            } else {
-                parse_epoch_timestamp(raw.parse::<i64>().ok()?)
-            }
-        }
-        Value::Number(number) => parse_epoch_timestamp(number.as_i64()?),
+        Value::String(raw) => parse_es_date_string(raw).or_else(|| {
+            raw.parse::<i64>()
+                .ok()
+                .and_then(parse_epoch_timestamp)
+                .or_else(|| raw.parse::<f64>().ok().and_then(parse_epoch_float))
+        }),
+        Value::Number(number) => match number.as_i64() {
+            Some(raw) => parse_epoch_timestamp(raw),
+            None => parse_epoch_float(number.as_f64()?),
+        },
         _ => None,
     }
+}
+
+fn parse_es_date_string(raw: &str) -> Option<DateTime<Utc>> {
+    if let Ok(parsed) = DateTime::parse_from_rfc3339(raw) {
+        return Some(parsed.with_timezone(&Utc));
+    }
+    ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M"]
+        .iter()
+        .find_map(|format| NaiveDateTime::parse_from_str(raw, format).ok())
+        .or_else(|| {
+            NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+        })
+        .map(|naive| naive.and_utc())
+}
+
+/// Fractional epoch values (e.g. Python's `time.time()`), using the same
+/// seconds / milliseconds / nanoseconds magnitude ranges as
+/// [`parse_epoch_timestamp`].
+fn parse_epoch_float(raw: f64) -> Option<DateTime<Utc>> {
+    if !raw.is_finite() {
+        return None;
+    }
+    let unit_nanos: i128 = if raw.abs() >= 1e15 {
+        1
+    } else if raw.abs() >= 1e11 {
+        1_000_000
+    } else {
+        1_000_000_000
+    };
+    let whole = raw.trunc();
+    let fraction_nanos = ((raw - whole) * unit_nanos as f64).round() as i128;
+    let total = (whole as i128)
+        .checked_mul(unit_nanos)?
+        .checked_add(fraction_nanos)?;
+    let secs = i64::try_from(total.div_euclid(1_000_000_000)).ok()?;
+    let nanos = total.rem_euclid(1_000_000_000) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos)
 }
 
 fn parse_epoch_timestamp(raw: i64) -> Option<DateTime<Utc>> {
@@ -4261,6 +4318,76 @@ mod tests {
         .unwrap();
         assert_eq!(nanos.timestamp.timestamp(), 1_700_000_000);
         assert_eq!(nanos.timestamp.timestamp_subsec_nanos(), 123_456_789);
+    }
+
+    #[test]
+    fn es_doc_mapping_accepts_epoch_and_timezone_less_at_timestamp() {
+        let at = |value: Value| {
+            es_doc_to_event(
+                serde_json::json!({ "@timestamp": value, "message": "old event" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                "logs-a",
+            )
+            .unwrap()
+        };
+        let expected = DateTime::parse_from_rfc3339("2024-06-01T12:34:56Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        for value in [
+            serde_json::json!(1_717_245_296_000_i64),
+            serde_json::json!("1717245296000"),
+            serde_json::json!("2024-06-01T12:34:56"),
+            serde_json::json!(1_717_245_296_i64),
+        ] {
+            let event = at(value.clone());
+            assert_eq!(event.timestamp, expected, "@timestamp {value}");
+            assert!(event.attributes.is_none(), "@timestamp {value} consumed");
+        }
+
+        let fractional = at(serde_json::json!(1_717_245_296.5_f64));
+        assert_eq!(fractional.timestamp.timestamp(), 1_717_245_296);
+        assert_eq!(fractional.timestamp.timestamp_subsec_millis(), 500);
+
+        let millis = at(serde_json::json!("2024-06-01T12:34:56.789"));
+        assert_eq!(millis.timestamp.timestamp(), 1_717_245_296);
+        assert_eq!(millis.timestamp.timestamp_subsec_millis(), 789);
+
+        let date_only = at(serde_json::json!("2024-06-01"));
+        assert_eq!(
+            date_only.timestamp,
+            DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
+    }
+
+    #[test]
+    fn es_doc_mapping_keeps_unparseable_at_timestamp_in_attributes() {
+        let before = Utc::now();
+        let event = es_doc_to_event(
+            serde_json::json!({ "@timestamp": "yesterday", "message": "m" })
+                .as_object()
+                .unwrap()
+                .clone(),
+            "logs-a",
+        )
+        .unwrap();
+        assert!(event.timestamp >= before);
+        let residual: Value = serde_json::from_str(event.attributes.as_deref().unwrap()).unwrap();
+        assert_eq!(residual["@timestamp"], "yesterday");
+    }
+
+    #[test]
+    fn es_bulk_request_uses_numeric_at_timestamp() {
+        let body = b"{\"index\":{}}\n{\"@timestamp\":1717245296000,\"message\":\"old event\"}\n";
+        let Ok(parsed) = parse_es_bulk_request(body, Some("test-logs")) else {
+            panic!("bulk request rejected");
+        };
+        let event = &parsed.groups["test-logs"][0];
+        assert_eq!(event.timestamp.timestamp_millis(), 1_717_245_296_000);
     }
 
     #[test]
